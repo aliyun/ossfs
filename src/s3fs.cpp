@@ -2,6 +2,7 @@
  * s3fs - FUSE-based file system backed by Amazon S3
  *
  * Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
+ * Copyright 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
