@@ -1,112 +1,100 @@
-s3fs
-====
+# ossfs
 
-s3fs allows Linux and Mac OS X to mount an S3 bucket via FUSE.
-s3fs preserves the native object format for files, allowing use of other tools like [s3cmd](http://s3tools.org/s3cmd).
+## 简介
 
-Features
---------
+ossfs 能让您在Linux/Mac OS X 系统中把Aliyun OSS bucket 挂载到本地文件系统中，您能够便捷的通过本地文件系统操作OSS 上的对象，实现数据的共享。
 
-* large subset of POSIX including reading/writing files, directories, symlinks, mode, uid/gid, and extended attributes
-* compatible with Amazon S3, Google Cloud Storage, and other S3-based object stores
-* large files via multi-part upload
-* renames via server-side copy
-* optional server-side encryption
-* data integrity via MD5 hashes
-* in-memory metadata caching
-* local disk data caching
-* user-specified regions, including Amazon GovCloud
-* authenticate via v2 or v4 signatures
+## 功能
 
-Installation
-------------
+ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
 
-Ensure you have all the dependencies:
+* 支持POSIX 文件系统的大部分功能，包括文件读写，目录，链接操作，权限，uid/gid，以及扩展属性（extended attributes）
+* 通过OSS 的multipart 功能上传大文件。
+* MD5 校验保证数据完整性。
 
-On Ubuntu 14.04:
+## 安装
+
+编译前请先安装下列依赖库：
+
+Ubuntu 14.04:
 
 ```
 sudo apt-get install automake autotools-dev g++ git libcurl4-gnutls-dev libfuse-dev libssl-dev libxml2-dev make pkg-config
 ```
 
-On CentOS 7:
+CentOS 7.0:
 
 ```
 sudo yum install automake fuse-devel gcc-c++ git libcurl-devel libxml2-devel make openssl-devel
 ```
 
-Compile from master via the following commands:
+然后您可以在github上下载源码并编译安装：
 
 ```
-git clone https://github.com/s3fs-fuse/s3fs-fuse.git
-cd s3fs-fuse
+git clone https://github.com/aliyun/ossfs-fuse.git
+cd ossfs-fuse
 ./autogen.sh
 ./configure
 make
 sudo make install
 ```
 
-Examples
---------
+## 运行
 
-Enter your S3 identity and credential in a file `/path/to/passwd`:
-
-```
-echo MYIDENTITY:MYCREDENTIAL > /path/to/passwd
-```
-
-Make sure the file has proper permissions (if you get 'permissions' error when mounting) `/path/to/passwd`:
+设置bucket name, access key/id信息，将其存放在~/.passwd-ossfs 文件中，注意这个文件的权限必须正确设置，建议设为600。
 
 ```
-chmod 600 /path/to/passwd
+echo your_bucket_name:your_key_id:your_key_secret > ~/.passwd-ossfs
+chmod 600 ~/.passwd-ossfs
 ```
 
-Run s3fs with an existing bucket `mybucket` and directory `/path/to/mountpoint`:
+将oss bucket mount到指定目录
 
 ```
-s3fs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd
+ossfs your_oss_bucket your_mount_dir -ourl=your_oss_service_url
 ```
 
-If you encounter any errors, enable debug output:
+示例
+
+将ossfs-fuse这个bucket mount到/tmp/ossfs目录下，access key id是faint，access key secret是123，oss service url是http://oss-cn-hangzhou.aliyuncs.com
 
 ```
-s3fs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd -d -d -f -o f2 -o curldbg
+echo ossfs-fuse:faint:123 > ~/.passwd-ossfs
+chmod 600 ~/.passwd-ossfs
+mkdir /tmp/ossfs
+ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
 
-You can also mount on boot by entering the following line to `/etc/fstab`:
+> 注1： ossfs的命令参数和s3fs相同，用户可以在启动ossfs时指定其他参数控制ossfs的行为，具体参见[s3fs文档](https://github.com/s3fs-fuse/s3fs-fuse/wiki/Fuse-Over-Amazon)。
+> 注2：ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当有多组信息，写入.passwd-ossfs的信息格式为：
+> your_bucket_name1:your_access_key_id1:your_access_key_secret1
+> your_bucket_name2:your_access_key_id2:your_access_key_secret2
+> ......
 
-```
-s3fs#mybucket /path/to/mountpoint fuse _netdev,allow_other 0 0
-```
+## 局限性
 
-Limitations
------------
+ossfs提供的功能和性能和本地文件系统相比，具有一些局限性。具体包括：
 
-Generally S3 cannot offer the same performance or semantics as a local file system.  More specifically:
+* 随机或者追加写文件会导致整个文件的重写。
+* 元数据操作，例如list directory，性能较差，因为需要远程访问oss服务器。
+* 文件/文件夹的rename操作不是原子的。
+* 多个客户端挂载同一个oss bucket时，依赖用户自行协调各个客户端的行为。例如避免多个客户端写同一个文件等等。
+* 不支持hard link。
 
-* random writes or appends to files require rewriting the entire file
-* metadata operations such as listing directories have poor performance due to network latency
-* [eventual consistency](https://en.wikipedia.org/wiki/Eventual_consistency) can temporarily yield stale data
-* no atomic renames of files or directories
-* no coordination between multiple clients mounting the same bucket
-* no hard links
+## 相关链接
 
-References
-----------
+* [s3fs](https://github.com/s3fs-fuse/s3fs-fuse) - 通过fuse接口，mount s3 bucket到本地文件系统。
 
-* [s3backer](https://github.com/archiecobbs/s3backer) - mount an S3 bucket as a single file
-* [s3fs-python](https://fedorahosted.org/s3fs/) - an older and less complete implementation written in Python
-* [S3Proxy](https://github.com/andrewgaul/s3proxy) - combine with s3fs to mount EMC Atmos, Microsoft Azure, and OpenStack Swift buckets
-* [s3ql](https://bitbucket.org/nikratio/s3ql/) - similar to s3fs but uses its own object format
-* [YAS3FS](https://github.com/danilop/yas3fs) - similar to s3fs but uses SNS to allow multiple clients to mount a bucket
+## 联系我们
 
-Frequently Asked Questions
---------------------------
-* [FAQ wiki page](https://github.com/s3fs-fuse/s3fs-fuse/wiki/FAQ) 
+* [阿里云OSS官方网站](http://oss.aliyun.com/)
+* [阿里云OSS官方论坛](http://bbs.aliyun.com/thread/211.html)
+* [阿里云OSS官方文档中心](http://www.aliyun.com/product/oss#Docs)
+* 阿里云官方技术支持：[提交工单](https://workorder.console.aliyun.com/#/ticket/createIndex)
 
-License
--------
+## License
 
 Copyright (C) 2010 Randy Rizun <rrizun@gmail.com>
+Copyright (C) 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>
 
 Licensed under the GNU GPL version 2
