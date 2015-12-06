@@ -1,7 +1,8 @@
 ######################################################################
-# s3fs - FUSE-based file system backed by Amazon S3
+# ossfs - FUSE-based file system backed by Aliyun OSS
 #
 # Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
+# Copyright 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -17,5 +18,5 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 ######################################################################
-dist_man1_MANS = man/s3fs.1
+dist_man1_MANS = man/ossfs.1
 

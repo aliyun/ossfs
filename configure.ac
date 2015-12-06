@@ -1,7 +1,8 @@
 ######################################################################
-# s3fs - FUSE-based file system backed by Amazon S3
+# ossfs - FUSE-based file system backed by Aliyun OSS
 #
 # Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
+# Copyright 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -20,7 +21,7 @@
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.59)
-AC_INIT(s3fs, 1.79)
+AC_INIT(ossfs, 1.79)
 AC_CONFIG_HEADER([config.h])
 
 AC_CANONICAL_SYSTEM
@@ -55,10 +56,10 @@ nettle_lib=no
 dnl
 dnl nettle library
 dnl
-AC_MSG_CHECKING([s3fs build with nettle(GnuTLS)])
+AC_MSG_CHECKING([ossfs build with nettle(GnuTLS)])
 AC_ARG_WITH(
   nettle,
-  [AS_HELP_STRING([--with-nettle], [s3fs build with nettle in GnuTLS(default no)])],
+  [AS_HELP_STRING([--with-nettle], [ossfs build with nettle in GnuTLS(default no)])],
   [
     case "${withval}" in
     yes)
@@ -77,10 +78,10 @@ AC_ARG_WITH(
 dnl
 dnl use openssl library for ssl
 dnl
-AC_MSG_CHECKING([s3fs build with OpenSSL])
+AC_MSG_CHECKING([ossfs build with OpenSSL])
 AC_ARG_WITH(
   openssl,
-  [AS_HELP_STRING([--with-openssl], [s3fs build with OpenSSL(default is no)])],
+  [AS_HELP_STRING([--with-openssl], [ossfs build with OpenSSL(default is no)])],
   [
     case "${withval}" in
     yes)
@@ -102,10 +103,10 @@ AC_ARG_WITH(
 dnl
 dnl use GnuTLS library for ssl
 dnl
-AC_MSG_CHECKING([s3fs build with GnuTLS])
+AC_MSG_CHECKING([ossfs build with GnuTLS])
 AC_ARG_WITH(
   gnutls,
-  [AS_HELP_STRING([--with-gnutls], [s3fs build with GnuTLS(default is no)])],
+  [AS_HELP_STRING([--with-gnutls], [ossfs build with GnuTLS(default is no)])],
   [
     case "${withval}" in
     yes)
@@ -132,10 +133,10 @@ AC_ARG_WITH(
 dnl
 dnl use nss library for ssl
 dnl
-AC_MSG_CHECKING([s3fs build with NSS])
+AC_MSG_CHECKING([ossfs build with NSS])
 AC_ARG_WITH(
   nss,
-  [AS_HELP_STRING([--with-nss], [s3fs build with NSS(default is no)])],
+  [AS_HELP_STRING([--with-nss], [ossfs build with NSS(default is no)])],
   [
     case "${withval}" in
     yes)
@@ -174,7 +175,7 @@ dnl this is redundant checking, but we need checking before following.
 dnl
 PKG_CHECK_MODULES([common_lib_checking], [fuse >= ${min_fuse_version} libcurl >= 7.0 libxml-2.0 >= 2.6])
 
-AC_MSG_CHECKING([compile s3fs with])
+AC_MSG_CHECKING([compile ossfs with])
 case "${auth_lib}" in
 openssl)
   AC_MSG_RESULT(OpenSSL)

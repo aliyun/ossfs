@@ -3841,8 +3841,8 @@ static int check_passwd_file_perms(void)
   }
 
   // Any local file should not have any group permissions 
-  // /etc/passwd-s3fs can have group permissions 
-  if(passwd_file != "/etc/passwd-s3fs"){
+  // /etc/passwd-ossfs can have group permissions 
+  if(passwd_file != "/etc/passwd-ossfs"){
     if( (info.st_mode & S_IRGRP) ||
         (info.st_mode & S_IWGRP) || 
         (info.st_mode & S_IXGRP)) {
@@ -3850,7 +3850,7 @@ static int check_passwd_file_perms(void)
       return EXIT_FAILURE;
     }
   }else{
-    // "/etc/passwd-s3fs" does not allow group write.
+    // "/etc/passwd-ossfs" does not allow group write.
     if((info.st_mode & S_IWGRP)){
       S3FS_PRN_EXIT("credentials file %s should not have group writable permissions.", passwd_file.c_str());
       return EXIT_FAILURE;
@@ -3985,8 +3985,8 @@ static int read_passwd_file(void)
 // 1 - from the command line  (security risk)
 // 2 - from a password file specified on the command line
 // 3 - from environment variables
-// 4 - from the users ~/.passwd-s3fs
-// 5 - from /etc/passwd-s3fs
+// 4 - from the users ~/.passwd-ossfs
+// 5 - from /etc/passwd-ossfs
 //
 static int get_access_keys(void)
 {
@@ -4050,7 +4050,7 @@ static int get_access_keys(void)
   HOME = getenv ("HOME");
   if(HOME != NULL){
      passwd_file.assign(HOME);
-     passwd_file.append("/.passwd-s3fs");
+     passwd_file.append("/.passwd-ossfs");
      ifstream PF(passwd_file.c_str());
      if(PF.good()){
        PF.close();
@@ -4067,7 +4067,7 @@ static int get_access_keys(void)
    }
 
   // 5 - from the system default location
-  passwd_file.assign("/etc/passwd-s3fs"); 
+  passwd_file.assign("/etc/passwd-ossfs"); 
   ifstream PF(passwd_file.c_str());
   if(PF.good()){
     PF.close();

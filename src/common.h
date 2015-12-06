@@ -83,10 +83,10 @@ enum s3fs_log_level{
 
 #define S3FS_LOW_LOGPRN_EXIT(fmt, ...) \
        if(foreground){ \
-         fprintf(stderr, "s3fs: " fmt "%s\n", __VA_ARGS__); \
+         fprintf(stderr, "ossfs: " fmt "%s\n", __VA_ARGS__); \
        }else{ \
-         fprintf(stderr, "s3fs: " fmt "%s\n", __VA_ARGS__); \
-         syslog(S3FS_LOG_LEVEL_TO_SYSLOG(S3FS_LOG_CRIT), "s3fs: " fmt "%s", __VA_ARGS__); \
+         fprintf(stderr, "ossfs: " fmt "%s\n", __VA_ARGS__); \
+         syslog(S3FS_LOG_LEVEL_TO_SYSLOG(S3FS_LOG_CRIT), "ossfs: " fmt "%s", __VA_ARGS__); \
        }
 
 // [NOTE]

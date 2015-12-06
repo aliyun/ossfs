@@ -1893,15 +1893,6 @@ string S3fsCurl::CalcSignature(string method, string strMD5, string content_type
   StringToSign += strMD5 + "\n";        // md5
   StringToSign += content_type + "\n";
   StringToSign += date + "\n";
-  //XXX
-#if 0
-  for(curl_slist* headers = requestHeaders; headers; headers = headers->next){
-	if(0 == strncmp(headers->data, "x-oss", 5)){
-	  StringToSign += headers->data;
-	  StringToSign += "\n";
-	}
-  }
-#endif
   StringToSign += get_canonical_headers(requestHeaders);
   StringToSign += resource;
 
@@ -3933,8 +3924,9 @@ bool MakeUrlResource(const char* realpath, string& resourcepath, string& url)
   if(!realpath){
     return false;
   }
-  resourcepath = urlEncode(service_path + bucket + realpath);
-  url          = host + resourcepath;
+  // XXX oss requires do not encode the resource.
+  resourcepath = service_path + bucket + realpath;
+  url          = host + urlEncode(resourcepath);
   return true;
 }
 
