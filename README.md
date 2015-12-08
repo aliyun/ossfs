@@ -31,8 +31,9 @@ sudo yum install automake fuse-devel gcc-c++ git libcurl-devel libxml2-devel mak
 然后您可以在github上下载源码并编译安装：
 
 ```
-git clone https://github.com/aliyun/ossfs-fuse.git
-cd ossfs-fuse
+wget https://github.com/aliyun/ossfs/archive/master.zip
+unzip master.zip
+cd ossfs-master
 ./autogen.sh
 ./configure
 make
