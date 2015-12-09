@@ -31,8 +31,8 @@ sudo yum install automake fuse-devel gcc-c++ git libcurl-devel libxml2-devel mak
 然后您可以在github上下载源码并编译安装：
 
 ```
-git clone https://github.com/aliyun/ossfs-fuse.git
-cd ossfs-fuse
+git clone git@github.com:aliyun/ossfs.git
+cd ossfs
 ./autogen.sh
 ./configure
 make
@@ -56,7 +56,7 @@ ossfs your_oss_bucket your_mount_dir -ourl=your_oss_service_url
 
 示例
 
-将ossfs-fuse这个bucket mount到/tmp/ossfs目录下，access key id是faint，access key secret是123，oss service url是http://oss-cn-hangzhou.aliyuncs.com
+将ossfs这个bucket mount到/tmp/ossfs目录下，access key id是faint，access key secret是123，oss service url是http://oss-cn-hangzhou.aliyuncs.com
 
 ```
 echo ossfs-fuse:faint:123 > ~/.passwd-ossfs
@@ -87,6 +87,7 @@ ossfs提供的功能和性能和本地文件系统相比，具有一些局限性
 
 ### 相关链接
 
+* [ossfs wiki](https://github.com/aliyun/ossfs/wiki)
 * [s3fs](https://github.com/s3fs-fuse/s3fs-fuse) - 通过fuse接口，mount s3 bucket到本地文件系统。
 
 ### 联系我们
