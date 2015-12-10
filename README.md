@@ -39,6 +39,10 @@ make
 sudo make install
 ```
 
+#### 安装包下载
+
+我们为常见的linux发行版制作了安装包，请从[这里](https://github.com/aliyun/ossfs/wiki/install)选择对应的安装包下载安装。
+
 ### 运行
 
 设置bucket name, access key/id信息，将其存放在~/.passwd-ossfs 文件中，注意这个文件的权限必须正确设置，建议设为600。
@@ -84,6 +88,10 @@ ossfs提供的功能和性能和本地文件系统相比，具有一些局限性
 * 文件/文件夹的rename操作不是原子的。
 * 多个客户端挂载同一个oss bucket时，依赖用户自行协调各个客户端的行为。例如避免多个客户端写同一个文件等等。
 * 不支持hard link。
+
+### 常见问题
+
+[FAQ](https://github.com/aliyun/ossfs/wiki/FAQ)
 
 ### 相关链接
 
