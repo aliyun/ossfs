@@ -1117,7 +1117,7 @@ void show_help (void)
     "                   disable multi-threaded operation\n"
     "\n"
     "\n"
-    "ossfs home page: <https://github.com/aliyun/ossfs-fuse>\n"
+    "ossfs home page: <https://github.com/aliyun/ossfs>\n"
   );
   return;
 }

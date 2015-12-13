@@ -16,8 +16,8 @@ chmod 600 "$S3FS_CREDENTIALS_FILE"
 
 S3PROXY_VERSION="1.4.0"
 S3PROXY_BINARY=${S3PROXY_BINARY-"s3proxy-${S3PROXY_VERSION}"}
-if [ -n "${S3PROXY_BINARY}" ] && [ ! -e "${S3PROXY_BINARY}" ]; then
-    wget "https://github.com/andrewgaul/s3proxy/releases/download/s3proxy-${S3PROXY_VERSION}/s3proxy" \
-            --quiet -O "${S3PROXY_BINARY}"
-    chmod +x "${S3PROXY_BINARY}"
-fi
+#if [ -n "${S3PROXY_BINARY}" ] && [ ! -e "${S3PROXY_BINARY}" ]; then
+    #wget "https://github.com/andrewgaul/s3proxy/releases/download/s3proxy-${S3PROXY_VERSION}/s3proxy" \
+            #--quiet -O "${S3PROXY_BINARY}"
+    #chmod +x "${S3PROXY_BINARY}"
+#fi
