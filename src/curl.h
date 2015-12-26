@@ -195,7 +195,6 @@ class S3fsCurl
     static std::string      AWSSecretAccessKey;
     static std::string      AWSAccessToken;
     static time_t           AWSAccessTokenExpire;
-    static std::string      IAM_role;
     static long             ssl_verify_hostname;
     static curltime_t       curl_times;
     static curlprogress_t   curl_progress;
@@ -321,14 +320,12 @@ class S3fsCurl
     static bool GetVerbose(void) { return S3fsCurl::is_verbose; }
     static bool SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey);
     static bool IsSetAccessKeyId(void){
-                  return (0 < S3fsCurl::IAM_role.size() || (0 < S3fsCurl::AWSAccessKeyId.size() && 0 < S3fsCurl::AWSSecretAccessKey.size()));
+                  return (0 < S3fsCurl::AWSAccessKeyId.size() && 0 < S3fsCurl::AWSSecretAccessKey.size());
                 }
     static long SetSslVerifyHostname(long value);
     static long GetSslVerifyHostname(void) { return S3fsCurl::ssl_verify_hostname; }
     static int SetMaxParallelCount(int value);
     static int GetMaxParallelCount(void) { return S3fsCurl::max_parallel_cnt; }
-    static std::string SetIAMRole(const char* role);
-    static const char* GetIAMRole(void) { return S3fsCurl::IAM_role.c_str(); }
     static bool SetMultipartSize(off_t size);
     static off_t GetMultipartSize(void) { return S3fsCurl::multipart_size; }
     static bool SetSignatureV4(bool isset) { bool bresult = S3fsCurl::is_sigv4; S3fsCurl::is_sigv4 = isset; return bresult; }

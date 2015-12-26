@@ -230,7 +230,6 @@ string           S3fsCurl::AWSAccessKeyId;
 string           S3fsCurl::AWSSecretAccessKey;
 string           S3fsCurl::AWSAccessToken;
 time_t           S3fsCurl::AWSAccessTokenExpire= 0;
-string           S3fsCurl::IAM_role;
 long             S3fsCurl::ssl_verify_hostname = 1;    // default(original code...)
 curltime_t       S3fsCurl::curl_times;
 curlprogress_t   S3fsCurl::curl_progress;
@@ -984,13 +983,6 @@ long S3fsCurl::SetSslVerifyHostname(long value)
   return old;
 }
 
-string S3fsCurl::SetIAMRole(const char* role)
-{
-  string old = S3fsCurl::IAM_role;
-  S3fsCurl::IAM_role = role ? role : "";
-  return old;
-}
-
 bool S3fsCurl::SetMultipartSize(off_t size)
 {
   size = size * 1024 * 1024;
@@ -1294,22 +1286,6 @@ bool S3fsCurl::SetIAMCredentials(const char* response)
   S3fsCurl::AWSAccessToken       = keyval[string(IAMCRED_ACCESSTOKEN)];
   S3fsCurl::AWSAccessTokenExpire = cvtIAMExpireStringToTime(keyval[string(IAMCRED_EXPIRATION)].c_str());
 
-  return true;
-}
-
-bool S3fsCurl::CheckIAMCredentialUpdate(void)
-{
-  if(0 == S3fsCurl::IAM_role.size()){
-    return true;
-  }
-  if(time(NULL) + IAM_EXPIRE_MERGIN <= S3fsCurl::AWSAccessTokenExpire){
-    return true;
-  }
-  // update
-  S3fsCurl s3fscurl;
-  if(0 != s3fscurl.GetIAMCredentials()){
-    return false;
-  }
   return true;
 }
 
@@ -1885,14 +1861,6 @@ string S3fsCurl::CalcSignature(string method, string strMD5, string content_type
   string Signature;
   string StringToSign;
 
-  if(0 < S3fsCurl::IAM_role.size()){
-    if(!S3fsCurl::CheckIAMCredentialUpdate()){
-      S3FS_PRN_ERR("Something error occurred in checking IAM credential.");
-      return Signature;  // returns empty string, then it occures error.
-    }
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", S3fsCurl::AWSAccessToken.c_str());
-  }
-
   StringToSign += method + "\n";
   StringToSign += strMD5 + "\n";        // md5
   StringToSign += content_type + "\n";
@@ -2000,47 +1968,6 @@ int S3fsCurl::DeleteRequest(const char* tpath)
   type = REQTYPE_DELETE;
 
   return RequestPerform();
-}
-
-//
-// Get AccessKeyId/SecretAccessKey/AccessToken/Expiration by IAM role,
-// and Set these value to class valiable.
-//
-int S3fsCurl::GetIAMCredentials(void)
-{
-  S3FS_PRN_INFO3("[IAM role=%s]", S3fsCurl::IAM_role.c_str());
-
-  if(0 == S3fsCurl::IAM_role.size()){
-    S3FS_PRN_ERR("IAM role name is empty.");
-    return -EIO;
-  }
-  // at first set type for handle
-  type = REQTYPE_IAMCRED;
-
-  if(!CreateCurlHandle(true)){
-    return -EIO;
-  }
-
-  // url
-  url             = string(IAM_CRED_URL) + S3fsCurl::IAM_role;
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
-
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-
-  int result = RequestPerform();
-
-  // analizing response
-  if(0 == result && !S3fsCurl::SetIAMCredentials(bodydata->str())){
-    S3FS_PRN_ERR("Something error occurred, could not get IAM credential.");
-  }
-  delete bodydata;
-  bodydata = NULL;
-
-  return result;
 }
 
 bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_only_c, bool is_copy)
