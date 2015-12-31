@@ -80,7 +80,7 @@ issue #8 - version in configure.ac is 1.74 for release 1.75
 
 Version 1.75 -- Jan 6, 2014
 issue #1 - Using %20 instead of the plus (+) sign for encoding spaces
-issue #3 - Fixed local timezone was incorrectly being applied to IAM and Last-Modified dates.
+issue #3 - Fixed local timezone was incorrectly being applied to RAM and Last-Modified dates.
 issue #4 - Fix compilation error on MacOSX with missing const
 
 Version 1.74 -- Nov 24, 2013

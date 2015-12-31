@@ -123,7 +123,7 @@ class S3fsMultiCurl;
 //----------------------------------------------
 // class S3fsCurl
 //----------------------------------------------
-typedef std::map<std::string, std::string> iamcredmap_t;
+typedef std::map<std::string, std::string> ramcredmap_t;
 typedef std::map<std::string, std::string> sseckeymap_t;
 typedef std::list<sseckeymap_t>            sseckeylist_t;
 
@@ -168,7 +168,7 @@ class S3fsCurl
       REQTYPE_UPLOADMULTIPOST,
       REQTYPE_COPYMULTIPOST,
       REQTYPE_MULTILIST,
-      REQTYPE_IAMCRED,
+      REQTYPE_RAMCRED,
       REQTYPE_ABORTMULTIUPLOAD
     };
 
@@ -195,7 +195,7 @@ class S3fsCurl
     static std::string      OSSSecretAccessKey;
     static std::string      OSSAccessToken;
     static time_t           OSSAccessTokenExpire;
-    static std::string      IAM_role;
+    static std::string      RAM_role;
     static long             ssl_verify_hostname;
     static curltime_t       curl_times;
     static curlprogress_t   curl_progress;
@@ -260,8 +260,8 @@ class S3fsCurl
     static S3fsCurl* UploadMultipartPostRetryCallback(S3fsCurl* s3fscurl);
     static S3fsCurl* ParallelGetObjectRetryCallback(S3fsCurl* s3fscurl);
 
-    static bool ParseIAMCredentialResponse(const char* response, iamcredmap_t& keyval);
-    static bool SetIAMCredentials(const char* response);
+    static bool ParseRAMCredentialResponse(const char* response, ramcredmap_t& keyval);
+    static bool SetRAMCredentials(const char* response);
     static bool LoadEnvSseCKeys(void);
     static bool LoadEnvSseKmsid(void);
     static bool PushbackSseKeys(std::string& onekey);
@@ -274,7 +274,7 @@ class S3fsCurl
     bool ClearInternalData(void);
     std::string CalcSignature(std::string method, std::string strMD5, std::string content_type, std::string date, std::string resource);
     bool GetUploadId(std::string& upload_id);
-    int GetIAMCredentials(void);
+    int GetRAMCredentials(void);
 
     int UploadMultipartPostSetup(const char* tpath, int part_num, std::string& upload_id);
     int CopyMultipartPostRequest(const char* from, const char* to, int part_num, std::string& upload_id, headers_t& meta);
@@ -285,7 +285,7 @@ class S3fsCurl
     static bool DestroyS3fsCurl(void);
     static int ParallelMultipartUploadRequest(const char* tpath, headers_t& meta, int fd);
     static int ParallelGetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size);
-    static bool CheckIAMCredentialUpdate(void);
+    static bool CheckRAMCredentialUpdate(void);
 
     // class methods(valiables)
     static std::string LookupMimeType(std::string name);
@@ -321,14 +321,14 @@ class S3fsCurl
     static bool GetVerbose(void) { return S3fsCurl::is_verbose; }
     static bool SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey);
     static bool IsSetAccessKeyId(void){
-                  return (0 < S3fsCurl::IAM_role.size() || (0 < S3fsCurl::OSSAccessKeyId.size() && 0 < S3fsCurl::OSSSecretAccessKey.size()));
+                  return (0 < S3fsCurl::RAM_role.size() || (0 < S3fsCurl::OSSAccessKeyId.size() && 0 < S3fsCurl::OSSSecretAccessKey.size()));
                 }
     static long SetSslVerifyHostname(long value);
     static long GetSslVerifyHostname(void) { return S3fsCurl::ssl_verify_hostname; }
     static int SetMaxParallelCount(int value);
     static int GetMaxParallelCount(void) { return S3fsCurl::max_parallel_cnt; }
-    static std::string SetIAMRole(const char* role);
-    static const char* GetIAMRole(void) { return S3fsCurl::IAM_role.c_str(); }
+    static std::string SetRAMRole(const char* role);
+    static const char* GetRAMRole(void) { return S3fsCurl::RAM_role.c_str(); }
     static bool SetMultipartSize(off_t size);
     static off_t GetMultipartSize(void) { return S3fsCurl::multipart_size; }
     static bool SetSignatureV4(bool isset) { bool bresult = S3fsCurl::is_sigv4; S3fsCurl::is_sigv4 = isset; return bresult; }

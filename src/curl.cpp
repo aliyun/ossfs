@@ -194,13 +194,13 @@ const char* BodyData::str(void) const
 #define MULTIPART_SIZE              10485760          // 10MB
 #define MAX_MULTI_COPY_SOURCE_SIZE  524288000         // 500MB
 
-#define	IAM_EXPIRE_MERGIN           (20 * 60)         // update timming
-#define	IAM_CRED_URL                "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
-#define IAMCRED_ACCESSKEYID         "AccessKeyId"
-#define IAMCRED_SECRETACCESSKEY     "SecretAccessKey"
-#define IAMCRED_ACCESSTOKEN         "Token"
-#define IAMCRED_EXPIRATION          "Expiration"
-#define IAMCRED_KEYCOUNT            4
+#define	RAM_EXPIRE_MERGIN           (20 * 60)         // update timming
+#define	RAM_CRED_URL                ""
+#define RAMCRED_ACCESSKEYID         "AccessKeyId"
+#define RAMCRED_SECRETACCESSKEY     "SecretAccessKey"
+#define RAMCRED_ACCESSTOKEN         "Token"
+#define RAMCRED_EXPIRATION          "Expiration"
+#define RAMCRED_KEYCOUNT            4
 
 // [NOTICE]
 // This symbol is for libcurl under 7.23.0
@@ -230,7 +230,7 @@ string           S3fsCurl::OSSAccessKeyId;
 string           S3fsCurl::OSSSecretAccessKey;
 string           S3fsCurl::OSSAccessToken;
 time_t           S3fsCurl::OSSAccessTokenExpire= 0;
-string           S3fsCurl::IAM_role;
+string           S3fsCurl::RAM_role;
 long             S3fsCurl::ssl_verify_hostname = 1;    // default(original code...)
 curltime_t       S3fsCurl::curl_times;
 curlprogress_t   S3fsCurl::curl_progress;
@@ -984,10 +984,10 @@ long S3fsCurl::SetSslVerifyHostname(long value)
   return old;
 }
 
-string S3fsCurl::SetIAMRole(const char* role)
+string S3fsCurl::SetRAMRole(const char* role)
 {
-  string old = S3fsCurl::IAM_role;
-  S3fsCurl::IAM_role = role ? role : "";
+  string old = S3fsCurl::RAM_role;
+  S3fsCurl::RAM_role = role ? role : "";
   return old;
 }
 
@@ -1237,7 +1237,7 @@ int S3fsCurl::ParallelGetObjectRequest(const char* tpath, int fd, off_t start, s
   return result;
 }
 
-bool S3fsCurl::ParseIAMCredentialResponse(const char* response, iamcredmap_t& keyval)
+bool S3fsCurl::ParseRAMCredentialResponse(const char* response, ramcredmap_t& keyval)
 {
   if(!response){
     return false;
@@ -1249,14 +1249,14 @@ bool S3fsCurl::ParseIAMCredentialResponse(const char* response, iamcredmap_t& ke
     string::size_type pos;
     string            key;
     string            val;
-    if(string::npos != (pos = oneline.find(IAMCRED_ACCESSKEYID))){
-      key = IAMCRED_ACCESSKEYID;
-    }else if(string::npos != (pos = oneline.find(IAMCRED_SECRETACCESSKEY))){
-      key = IAMCRED_SECRETACCESSKEY;
-    }else if(string::npos != (pos = oneline.find(IAMCRED_ACCESSTOKEN))){
-      key = IAMCRED_ACCESSTOKEN;
-    }else if(string::npos != (pos = oneline.find(IAMCRED_EXPIRATION))){
-      key = IAMCRED_EXPIRATION;
+    if(string::npos != (pos = oneline.find(RAMCRED_ACCESSKEYID))){
+      key = RAMCRED_ACCESSKEYID;
+    }else if(string::npos != (pos = oneline.find(RAMCRED_SECRETACCESSKEY))){
+      key = RAMCRED_SECRETACCESSKEY;
+    }else if(string::npos != (pos = oneline.find(RAMCRED_ACCESSTOKEN))){
+      key = RAMCRED_ACCESSTOKEN;
+    }else if(string::npos != (pos = oneline.find(RAMCRED_EXPIRATION))){
+      key = RAMCRED_EXPIRATION;
     }else{
       continue;
     }
@@ -1276,38 +1276,38 @@ bool S3fsCurl::ParseIAMCredentialResponse(const char* response, iamcredmap_t& ke
   return true;
 }
 
-bool S3fsCurl::SetIAMCredentials(const char* response)
+bool S3fsCurl::SetRAMCredentials(const char* response)
 {
-  S3FS_PRN_INFO3("IAM credential response = \"%s\"", response);
+  S3FS_PRN_INFO3("RAM credential response = \"%s\"", response);
 
-  iamcredmap_t keyval;
+  ramcredmap_t keyval;
 
-  if(!ParseIAMCredentialResponse(response, keyval)){
+  if(!ParseRAMCredentialResponse(response, keyval)){
     return false;
   }
-  if(IAMCRED_KEYCOUNT != keyval.size()){
+  if(RAMCRED_KEYCOUNT != keyval.size()){
     return false;
   }
 
-  S3fsCurl::OSSAccessKeyId       = keyval[string(IAMCRED_ACCESSKEYID)];
-  S3fsCurl::OSSSecretAccessKey   = keyval[string(IAMCRED_SECRETACCESSKEY)];
-  S3fsCurl::OSSAccessToken       = keyval[string(IAMCRED_ACCESSTOKEN)];
-  S3fsCurl::OSSAccessTokenExpire = cvtIAMExpireStringToTime(keyval[string(IAMCRED_EXPIRATION)].c_str());
+  S3fsCurl::OSSAccessKeyId       = keyval[string(RAMCRED_ACCESSKEYID)];
+  S3fsCurl::OSSSecretAccessKey   = keyval[string(RAMCRED_SECRETACCESSKEY)];
+  S3fsCurl::OSSAccessToken       = keyval[string(RAMCRED_ACCESSTOKEN)];
+  S3fsCurl::OSSAccessTokenExpire = cvtRAMExpireStringToTime(keyval[string(RAMCRED_EXPIRATION)].c_str());
 
   return true;
 }
 
-bool S3fsCurl::CheckIAMCredentialUpdate(void)
+bool S3fsCurl::CheckRAMCredentialUpdate(void)
 {
-  if(0 == S3fsCurl::IAM_role.size()){
+  if(0 == S3fsCurl::RAM_role.size()){
     return true;
   }
-  if(time(NULL) + IAM_EXPIRE_MERGIN <= S3fsCurl::OSSAccessTokenExpire){
+  if(time(NULL) + RAM_EXPIRE_MERGIN <= S3fsCurl::OSSAccessTokenExpire){
     return true;
   }
   // update
   S3fsCurl s3fscurl;
-  if(0 != s3fscurl.GetIAMCredentials()){
+  if(0 != s3fscurl.GetRAMCredentials()){
     return false;
   }
   return true;
@@ -1376,8 +1376,8 @@ bool S3fsCurl::ResetHandle(void)
   curl_easy_setopt(hCurl, CURLOPT_PROGRESSDATA, hCurl);
   // curl_easy_setopt(hCurl, CURLOPT_FORBID_REUSE, 1);
 
-  if(type != REQTYPE_IAMCRED){
-    // REQTYPE_IAMCRED is always HTTP
+  if(type != REQTYPE_RAMCRED){
+    // REQTYPE_RAMCRED is always HTTP
     if(0 == S3fsCurl::ssl_verify_hostname){
       curl_easy_setopt(hCurl, CURLOPT_SSL_VERIFYHOST, 0);
     }
@@ -1668,7 +1668,7 @@ bool S3fsCurl::RemakeHandle(void)
       curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
       break;
 
-    case REQTYPE_IAMCRED:
+    case REQTYPE_RAMCRED:
       curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
       curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
       curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
@@ -1885,9 +1885,9 @@ string S3fsCurl::CalcSignature(string method, string strMD5, string content_type
   string Signature;
   string StringToSign;
 
-  if(0 < S3fsCurl::IAM_role.size()){
-    if(!S3fsCurl::CheckIAMCredentialUpdate()){
-      S3FS_PRN_ERR("Something error occurred in checking IAM credential.");
+  if(0 < S3fsCurl::RAM_role.size()){
+    if(!S3fsCurl::CheckRAMCredentialUpdate()){
+      S3FS_PRN_ERR("Something error occurred in checking RAM credential.");
       return Signature;  // returns empty string, then it occures error.
     }
     requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", S3fsCurl::OSSAccessToken.c_str());
@@ -2003,26 +2003,26 @@ int S3fsCurl::DeleteRequest(const char* tpath)
 }
 
 //
-// Get AccessKeyId/SecretAccessKey/AccessToken/Expiration by IAM role,
+// Get AccessKeyId/SecretAccessKey/AccessToken/Expiration by RAM role,
 // and Set these value to class valiable.
 //
-int S3fsCurl::GetIAMCredentials(void)
+int S3fsCurl::GetRAMCredentials(void)
 {
-  S3FS_PRN_INFO3("[IAM role=%s]", S3fsCurl::IAM_role.c_str());
+  S3FS_PRN_INFO3("[RAM role=%s]", S3fsCurl::RAM_role.c_str());
 
-  if(0 == S3fsCurl::IAM_role.size()){
-    S3FS_PRN_ERR("IAM role name is empty.");
+  if(0 == S3fsCurl::RAM_role.size()){
+    S3FS_PRN_ERR("RAM role name is empty.");
     return -EIO;
   }
   // at first set type for handle
-  type = REQTYPE_IAMCRED;
+  type = REQTYPE_RAMCRED;
 
   if(!CreateCurlHandle(true)){
     return -EIO;
   }
 
   // url
-  url             = string(IAM_CRED_URL) + S3fsCurl::IAM_role;
+  url             = string(RAM_CRED_URL) + S3fsCurl::RAM_role;
   requestHeaders  = NULL;
   responseHeaders.clear();
   bodydata        = new BodyData();
@@ -2034,8 +2034,8 @@ int S3fsCurl::GetIAMCredentials(void)
   int result = RequestPerform();
 
   // analizing response
-  if(0 == result && !S3fsCurl::SetIAMCredentials(bodydata->str())){
-    S3FS_PRN_ERR("Something error occurred, could not get IAM credential.");
+  if(0 == result && !S3fsCurl::SetRAMCredentials(bodydata->str())){
+    S3FS_PRN_ERR("Something error occurred, could not get RAM credential.");
   }
   delete bodydata;
   bodydata = NULL;

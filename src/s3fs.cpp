@@ -3650,9 +3650,9 @@ static int s3fs_check_service(void)
 {
   S3FS_PRN_INFO("check services.");
 
-  // At first time for access S3, we check IAM role if it sets.
-  if(!S3fsCurl::CheckIAMCredentialUpdate()){
-    S3FS_PRN_CRIT("Failed to check IAM role name(%s).", S3fsCurl::GetIAMRole());
+  // At first time for access S3, we check RAM role if it sets.
+  if(!S3fsCurl::CheckRAMCredentialUpdate()){
+    S3FS_PRN_CRIT("Failed to check RAM role name(%s).", S3fsCurl::GetRAMRole());
     return EXIT_FAILURE;
   }
 
@@ -4393,9 +4393,9 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       passwd_file = strchr(arg, '=') + sizeof(char);
       return 0;
     }
-    if(0 == STR2NCMP(arg, "iam_role=")){
+    if(0 == STR2NCMP(arg, "ram_role=")){
       const char* role = strchr(arg, '=') + sizeof(char);
-      S3fsCurl::SetIAMRole(role);
+      S3fsCurl::SetRAMRole(role);
       return 0;
     }
     if(0 == STR2NCMP(arg, "public_bucket=")){

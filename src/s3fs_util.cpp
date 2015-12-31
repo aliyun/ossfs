@@ -789,7 +789,7 @@ blkcnt_t get_blocks(off_t size)
   return size / 512 + 1;
 }
 
-time_t cvtIAMExpireStringToTime(const char* s)
+time_t cvtRAMExpireStringToTime(const char* s)
 {
   struct tm tm;
   if(!s){
@@ -1052,8 +1052,8 @@ void show_help (void)
     "   enable_content_md5 (default is disable)\n"
     "      - ensure data integrity during writes with MD5 hash.\n"
     "\n"
-    "   iam_role (default is no role)\n"
-    "      - set the IAM Role that will supply the credentials from the \n"
+    "   ram_role (default is no role)\n"
+    "      - set the RAM Role that will supply the credentials from the \n"
     "      instance meta-data.\n"
     "\n"
     "   noxmlns (disable registering xml name space)\n"
