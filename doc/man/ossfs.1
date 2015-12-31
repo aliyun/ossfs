@@ -68,13 +68,13 @@ this option replaces the old option use_rrs.
 Possible values: standard, standard_ia, and reduced_redundancy.
 .TP
 \fB\-o\fR use_rrs (default is disable)
-use Amazon's Reduced Redundancy Storage.
+use Aliyun's Reduced Redundancy Storage.
 this option can not be specified with use_sse.
 (can specify use_rrs=1 for old version)
 this option has been replaced by new storage_class option.
 .TP
 \fB\-o\fR use_sse (default is disable)
-Specify three type Amazon's Server-Site Encryption: SSE-OSS, SSE-C. SSE-OSS uses Aliyun OSS-managed encryption keys, SSE-C uses customer-provided encryption keys.
+Specify two type Aliyun's Server-Site Encryption: SSE-OSS, SSE-C. SSE-OSS uses Aliyun OSS-managed encryption keys, SSE-C uses customer-provided encryption keys.
 You can specify "use_sse" or "use_sse=1" enables SSE-OSS type (use_sse=1 is old type parameter).
 Case of setting SSE-C, you can specify "use_sse=custom", "use_sse=custom:<custom key file path>" or "use_sse=<custom key file path>"(only <custom key file path> specified is old type parameter).
 You can use "c" for short "custom".
@@ -226,7 +226,7 @@ Most of the generic mount options described in 'man mount' are supported (ro, rw
 There are many FUSE specific mount options that can be specified. e.g. allow_other. See the FUSE README for the full set.
 .SH NOTES
 .TP
-Maximum file size=64GB (limited by ossfs, not Amazon).
+Maximum file size=64GB (limited by ossfs, not Aliyun OSS).
 .TP
 If enabled via the "use_cache" option, ossfs automatically maintains a local cache of files in the folder specified by use_cache. Whenever ossfs needs to read or write a file on OSS, it first downloads the entire file locally to the folder specified by use_cache and operates on it. When fuse_release() is called, ossfs will re-upload the file to OSS if it has been changed. ossfs uses md5 checksums to minimize downloads from OSS.
 .TP

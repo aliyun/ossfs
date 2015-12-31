@@ -4,20 +4,20 @@
 # By default tests run against a local s3proxy instance.  To run against 
 # Aliyun OSS, specify the following variables:
 #
-# S3FS_CREDENTIALS_FILE=keyfile      s3fs format key file
+# OSSFS_CREDENTIALS_FILE=keyfile      ossfs format key file
 # TEST_BUCKET_1=bucket               Name of bucket to use 
-# S3PROXY_BINARY=""                  Leave empty 
-# S3_URL="http://s3.amazonaws.com"   Specify Amazon server
+# OSSPROXY_BINARY=""                  Leave empty 
+# OSS_URL=""   Specify OSS server
 #
 # Example: 
 #
-# S3FS_CREDENTIALS_FILE=keyfile TEST_BUCKET_1=bucket S3PROXY_BINARY="" S3_URL="http://s3.amazonaws.com" ./small-integration-test.sh
+# OSSFS_CREDENTIALS_FILE=keyfile TEST_BUCKET_1=bucket OSSPROXY_BINARY="" OSS_URL="http://oss_url" ./small-integration-test.sh
 #
 
 set -o xtrace
 set -o errexit
 
-: ${S3_URL:="http://127.0.0.1:8080"}
+: ${OSS_URL:="http://127.0.0.1:8080"}
 
 # Require root
 REQUIRE_ROOT=require-root.sh
@@ -45,19 +45,19 @@ function retry {
 }
 
 function exit_handler {
-    if [ -n "${S3PROXY_PID}" ]
+    if [ -n "${OSSPROXY_PID}" ]
     then
-        kill $S3PROXY_PID
+        kill $OSSPROXY_PID
     fi
     retry 30 fusermount -u $TEST_BUCKET_MOUNT_POINT_1
 }
 trap exit_handler EXIT
 
-if [ -n "${S3PROXY_BINARY}" ]
+if [ -n "${OSSPROXY_BINARY}" ]
 then
-    stdbuf -oL -eL java -jar "$S3PROXY_BINARY" --properties s3proxy.conf | stdbuf -oL -eL sed -u "s/^/s3proxy: /" &
+    stdbuf -oL -eL java -jar "$OSSPROXY_BINARY" --properties s3proxy.conf | stdbuf -oL -eL sed -u "s/^/s3proxy: /" &
 
-    # wait for S3Proxy to start
+    # wait for OSSProxy to start
     for i in $(seq 30);
     do
         if exec 3<>"/dev/tcp/127.0.0.1/8080";
@@ -69,7 +69,7 @@ then
         sleep 1
     done
 
-    S3PROXY_PID=$(netstat -lpnt | grep :8080 | awk '{ print $7 }' | sed -u 's|/java||')
+    OSSPROXY_PID=$(netstat -lpnt | grep :8080 | awk '{ print $7 }' | sed -u 's|/java||')
 fi
 
 # Mount the bucket
@@ -77,15 +77,15 @@ if [ ! -d $TEST_BUCKET_MOUNT_POINT_1 ]
 then
 	mkdir -p $TEST_BUCKET_MOUNT_POINT_1
 fi
-stdbuf -oL -eL $S3FS $TEST_BUCKET_1 $TEST_BUCKET_MOUNT_POINT_1 \
+stdbuf -oL -eL $OSSFS $TEST_BUCKET_1 $TEST_BUCKET_MOUNT_POINT_1 \
     -o createbucket \
     -o enable_content_md5 \
-    -o passwd_file=$S3FS_CREDENTIALS_FILE \
+    -o passwd_file=$OSSFS_CREDENTIALS_FILE \
     -o sigv2 \
     -o singlepart_copy_limit=$((10 * 1024)) \
-    -o url=${S3_URL} \
+    -o url=${OSS_URL} \
     -o use_path_request_style \
-    -o dbglevel=info -f |& stdbuf -oL -eL sed -u "s/^/s3fs: /" &
+    -o dbglevel=info -f |& stdbuf -oL -eL sed -u "s/^/ossfs: /" &
 
 retry 30 grep $TEST_BUCKET_MOUNT_POINT_1 /proc/mounts || exit 1
 

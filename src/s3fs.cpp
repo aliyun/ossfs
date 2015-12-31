@@ -1,5 +1,5 @@
 /*
- * s3fs - FUSE-based file system backed by Amazon S3
+ * s3fs - FUSE-based file system backed by Aliyun OSS
  *
  * Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
  * Copyright 2015 Haoran Yang <yangzhuodog1982@gmail.com>
