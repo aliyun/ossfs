@@ -2,7 +2,7 @@
  * ossfs - FUSE-based file system backed by Aliyun OSS
  *
  * Copyright 2007-2013 Takeshi Nakatani <ggtakec.com>
- * Copyright 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>
+ * Copyright 2015 Haoran Yang <yangzhuodog1982@gmail.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -64,8 +64,8 @@ string get_realpath(const char *path) {
 //-------------------------------------------------------------------
 // Class S3ObjList
 //-------------------------------------------------------------------
-// New class S3ObjList is base on old s3_object struct.
-// This class is for S3 compatible clients.
+// New class S3ObjList is base on old oss_object struct.
+// This class is for OSS compatible clients.
 //
 // If name is terminated by "/", it is forced dir type.
 // If name is terminated by "_$folder$", it is forced dir type.
@@ -903,7 +903,7 @@ void show_help (void)
     "      - Specify three type Amazon's Server-Site Encryption: SSE-S3,\n"
     "        SSE-C or SSE-KMS. SSE-S3 uses Aliyun OSS-managed encryption\n"
     "        keys, SSE-C uses customer-provided encryption keys, and\n"
-    "        SSE-KMS uses the master key which you manage in AWS KMS.\n"
+    "        SSE-KMS uses the master key which you manage in OSS KMS.\n"
     "        You can specify \"use_sse\" or \"use_sse=1\" enables SSE-S3\n"
     "        type(use_sse=1 is old type parameter).\n"
     "        Case of setting SSE-C, you can specify \"use_sse=custom\",\n"
@@ -919,8 +919,8 @@ void show_help (void)
     "        are encrypted by not first key. So that, you can keep all\n"
     "        SSE-C keys in file, that is SSE-C key history.\n"
     "        If you specify \"custom\"(\"c\") without file path, you\n"
-    "        need to set custom key by load_sse_c option or AWSSSECKEYS\n"
-    "        environment.(AWSSSECKEYS environment has some SSE-C keys\n"
+    "        need to set custom key by load_sse_c option or OSSSSECKEYS\n"
+    "        environment.(OSSSSECKEYS environment has some SSE-C keys\n"
     "        with \":\" separator.) This option is used to decide the\n"
     "        SSE type. So that if you do not want to encrypt a object\n"
     "        object at uploading, but you need to decrypt encrypted\n"
@@ -928,9 +928,9 @@ void show_help (void)
     "        of this option.\n"
     "        For setting SSE-KMS, specify \"use_sse=kmsid\" or\n"
     "        \"use_sse=kmsid:<kms id>\". You can use \"k\" for short \"kmsid\".\n"
-    "        If you san specify SSE-KMS type with your <kms id> in AWS\n"
+    "        If you san specify SSE-KMS type with your <kms id> in OSS\n"
     "        KMS, you can set it after \"kmsid:\"(or \"k:\"). If you\n"
-    "        specify only \"kmsid\"(\"k\"), you need to set AWSSSEKMSID\n"
+    "        specify only \"kmsid\"(\"k\"), you need to set OSSSSEKMSID\n"
     "        environment which value is <kms id>. You must be careful\n"
     "        about that you can not use the KMS id which is not same EC2\n"
     "        region.\n"
@@ -941,7 +941,7 @@ void show_help (void)
     "        If you use the custom-provided encription key at uploading, you\n"
     "        specify with \"use_sse=custom\". The file has many lines, one line\n"
     "        means one custom key. So that you can keep all SSE-C keys in file,\n"
-    "        that is SSE-C key history. AWSSSECKEYS environment is as same as this\n"
+    "        that is SSE-C key history. OSSSSECKEYS environment is as same as this\n"
     "        file contents.\n"
     "\n"
     "   public_bucket (default=\"\" which means disabled)\n"
@@ -1059,8 +1059,7 @@ void show_help (void)
     "\n"
     "   noxmlns (disable registering xml name space)\n"
     "        disable registering xml name space for response of \n"
-    "        ListBucketResult and ListVersionsResult etc. Default name \n"
-    "        space is looked up from \"http://s3.amazonaws.com/doc/2006-03-01\".\n"
+    "        ListBucketResult and ListVersionsResult etc. \n"
     "        This option should not be specified now, because ossfs looks up\n"
     "        xmlns automatically after v1.66.\n"
     "\n"
@@ -1127,7 +1126,7 @@ void show_version(void)
   printf(
   "Aliyun Open Storage Service File System V%s(commit:%s) with %s\n"
   "Copyright (C) 2010 Randy Rizun <rrizun@gmail.com>\n"
-  "Copyright (C) 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>\n"
+  "Copyright (C) 2015 Haoran Yang <yangzhuodog1982@gmail.com>\n"
   "License GPL2: GNU GPL version 2 <http://gnu.org/licenses/gpl.html>\n"
   "This is free software: you are free to change and redistribute it.\n"
   "There is NO WARRANTY, to the extent permitted by law.\n",

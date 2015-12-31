@@ -2,7 +2,7 @@
 
 #
 # By default tests run against a local s3proxy instance.  To run against 
-# Amazon S3, specify the following variables:
+# Aliyun OSS, specify the following variables:
 #
 # S3FS_CREDENTIALS_FILE=keyfile      s3fs format key file
 # TEST_BUCKET_1=bucket               Name of bucket to use 

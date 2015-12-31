@@ -226,10 +226,10 @@ std::string      S3fsCurl::ssekmsid            = "";
 sse_type_t       S3fsCurl::ssetype             = SSE_DISABLE;
 bool             S3fsCurl::is_content_md5      = false;
 bool             S3fsCurl::is_verbose          = false;
-string           S3fsCurl::AWSAccessKeyId;
-string           S3fsCurl::AWSSecretAccessKey;
-string           S3fsCurl::AWSAccessToken;
-time_t           S3fsCurl::AWSAccessTokenExpire= 0;
+string           S3fsCurl::OSSAccessKeyId;
+string           S3fsCurl::OSSSecretAccessKey;
+string           S3fsCurl::OSSAccessToken;
+time_t           S3fsCurl::OSSAccessTokenExpire= 0;
 string           S3fsCurl::IAM_role;
 long             S3fsCurl::ssl_verify_hostname = 1;    // default(original code...)
 curltime_t       S3fsCurl::curl_times;
@@ -857,7 +857,7 @@ bool S3fsCurl::FinalCheckSse(void)
 {
   if(SSE_DISABLE == S3fsCurl::ssetype){
     S3fsCurl::ssekmsid.erase();
-  }else if(SSE_S3 == S3fsCurl::ssetype){
+  }else if(SSE_OSS == S3fsCurl::ssetype){
     S3fsCurl::ssekmsid.erase();
   }else if(SSE_C == S3fsCurl::ssetype){
     if(0 == S3fsCurl::sseckeys.size()){
@@ -883,7 +883,7 @@ bool S3fsCurl::FinalCheckSse(void)
                                                                                                                                                    
 bool S3fsCurl::LoadEnvSseCKeys(void)
 {
-  char* envkeys = getenv("AWSSSECKEYS");
+  char* envkeys = getenv("OSSSSECKEYS");
   if(NULL == envkeys){
     // nothing to do
     return true;
@@ -896,7 +896,7 @@ bool S3fsCurl::LoadEnvSseCKeys(void)
     S3fsCurl::PushbackSseKeys(onekey);
   }
   if(0 == S3fsCurl::sseckeys.size()){
-    S3FS_PRN_ERR("There is no SSE Key in environment(AWSSSECKEYS=%s).", envkeys);
+    S3FS_PRN_ERR("There is no SSE Key in environment(OSSSSECKEYS=%s).", envkeys);
     return false;
   }
   return true;
@@ -904,7 +904,7 @@ bool S3fsCurl::LoadEnvSseCKeys(void)
 
 bool S3fsCurl::LoadEnvSseKmsid(void)
 {
-  char* envkmsid = getenv("AWSSSEKMSID");
+  char* envkmsid = getenv("OSSSSEKMSID");
   if(NULL == envkmsid){
     // nothing to do
     return true;
@@ -969,8 +969,8 @@ bool S3fsCurl::SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey
   if(!AccessKeyId || '\0' == AccessKeyId[0] || !SecretAccessKey || '\0' == SecretAccessKey[0]){
     return false;
   }
-  AWSAccessKeyId     = AccessKeyId;
-  AWSSecretAccessKey = SecretAccessKey;
+  OSSAccessKeyId     = AccessKeyId;
+  OSSSecretAccessKey = SecretAccessKey;
   return true;
 }
 
@@ -1289,10 +1289,10 @@ bool S3fsCurl::SetIAMCredentials(const char* response)
     return false;
   }
 
-  S3fsCurl::AWSAccessKeyId       = keyval[string(IAMCRED_ACCESSKEYID)];
-  S3fsCurl::AWSSecretAccessKey   = keyval[string(IAMCRED_SECRETACCESSKEY)];
-  S3fsCurl::AWSAccessToken       = keyval[string(IAMCRED_ACCESSTOKEN)];
-  S3fsCurl::AWSAccessTokenExpire = cvtIAMExpireStringToTime(keyval[string(IAMCRED_EXPIRATION)].c_str());
+  S3fsCurl::OSSAccessKeyId       = keyval[string(IAMCRED_ACCESSKEYID)];
+  S3fsCurl::OSSSecretAccessKey   = keyval[string(IAMCRED_SECRETACCESSKEY)];
+  S3fsCurl::OSSAccessToken       = keyval[string(IAMCRED_ACCESSTOKEN)];
+  S3fsCurl::OSSAccessTokenExpire = cvtIAMExpireStringToTime(keyval[string(IAMCRED_EXPIRATION)].c_str());
 
   return true;
 }
@@ -1302,7 +1302,7 @@ bool S3fsCurl::CheckIAMCredentialUpdate(void)
   if(0 == S3fsCurl::IAM_role.size()){
     return true;
   }
-  if(time(NULL) + IAM_EXPIRE_MERGIN <= S3fsCurl::AWSAccessTokenExpire){
+  if(time(NULL) + IAM_EXPIRE_MERGIN <= S3fsCurl::OSSAccessTokenExpire){
     return true;
   }
   // update
@@ -1890,7 +1890,7 @@ string S3fsCurl::CalcSignature(string method, string strMD5, string content_type
       S3FS_PRN_ERR("Something error occurred in checking IAM credential.");
       return Signature;  // returns empty string, then it occures error.
     }
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", S3fsCurl::AWSAccessToken.c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", S3fsCurl::OSSAccessToken.c_str());
   }
 
   StringToSign += method + "\n";
@@ -1900,8 +1900,8 @@ string S3fsCurl::CalcSignature(string method, string strMD5, string content_type
   StringToSign += get_canonical_headers(requestHeaders);
   StringToSign += resource;
 
-  const void* key            = S3fsCurl::AWSSecretAccessKey.data();
-  int key_len                = S3fsCurl::AWSSecretAccessKey.size();
+  const void* key            = S3fsCurl::OSSSecretAccessKey.data();
+  int key_len                = S3fsCurl::OSSSecretAccessKey.size();
   const unsigned char* sdata = reinterpret_cast<const unsigned char*>(StringToSign.data());
   int sdata_len              = StringToSign.size();
   unsigned char* md          = NULL;
@@ -1990,7 +1990,7 @@ int S3fsCurl::DeleteRequest(const char* tpath)
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("DELETE", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
@@ -2045,7 +2045,7 @@ int S3fsCurl::GetIAMCredentials(void)
 
 bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_only_c, bool is_copy)
 {
-  if(SSE_S3 == ssetype){
+  if(SSE_OSS == ssetype){
     if(!is_only_c){
       requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption", "AES256");
     }
@@ -2066,13 +2066,8 @@ bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_o
     }
 
   }else if(SSE_KMS == ssetype){
-    if(!is_only_c){
-      if(ssevalue.empty()){
-        ssevalue = S3fsCurl::GetSseKmsId();
-      }
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption", "aws:kms");
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-aws-kms-key-id", ssevalue.c_str());
-    }
+	// Do not support KMS
+	return false;
   }
   return true;
 }
@@ -2122,7 +2117,7 @@ bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* 
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("HEAD", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
@@ -2224,7 +2219,7 @@ int S3fsCurl::PutHeadRequest(const char* tpath, headers_t& meta, bool is_copy)
 	  //XXX
 	  //requestHeaders = curl_slist_sort_insert(requestHeaders, string(key + ":" + value).c_str());
       // Only copy mode.
-      if(is_copy && !AddSseRequestHead(SSE_S3, value, false, true)){
+      if(is_copy && !AddSseRequestHead(SSE_OSS, value, false, true)){
         S3FS_PRN_WARN("Failed to insert SSE-S3 header.");
       }
     }else if(key == "x-oss-server-side-encryption-customer-algorithm"){
@@ -2266,7 +2261,7 @@ int S3fsCurl::PutHeadRequest(const char* tpath, headers_t& meta, bool is_copy)
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", "", ContentType, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2378,7 +2373,7 @@ int S3fsCurl::PutRequest(const char* tpath, headers_t& meta, int fd)
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", strMD5, ContentType, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2446,7 +2441,7 @@ int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("GET", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2521,7 +2516,7 @@ int S3fsCurl::CheckBucket(void)
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("GET", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2536,7 +2531,7 @@ int S3fsCurl::CheckBucket(void)
 
   int result = RequestPerform();
   if (result != 0) {
-    S3FS_PRN_ERR("Check bucket failed, S3 response: %s", (bodydata ? bodydata->str() : ""));
+    S3FS_PRN_ERR("Check bucket failed, OSS response: %s", (bodydata ? bodydata->str() : ""));
   }
   return result;
 }
@@ -2571,7 +2566,7 @@ int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("GET", "", "", date, (resource + "/"));
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2590,9 +2585,9 @@ int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
 //
 // Example :
 //   POST /example-object?uploads HTTP/1.1
-//   Host: example-bucket.s3.amazonaws.com
+//   Host: example-bucket.oss-cn-hangzhou.aliyuncs.com
 //   Date: Mon, 1 Nov 2010 20:34:56 GMT
-//   Authorization: AWS VGhpcyBtZXNzYWdlIHNpZ25lZCBieSBlbHZpbmc=
+//   Authorization: OSS VGhpcyBtZXNzYWdlIHNpZ25lZCBieSBlbHZpbmc=
 //
 int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, string& upload_id, bool is_copy)
 {
@@ -2630,7 +2625,7 @@ int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, string
       requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
     }else if(key == "x-oss-server-side-encryption"){
       // Only copy mode.
-      if(is_copy && !AddSseRequestHead(SSE_S3, value, false, true)){
+      if(is_copy && !AddSseRequestHead(SSE_OSS, value, false, true)){
         S3FS_PRN_WARN("Failed to insert SSE-S3 header.");
       }
     }else if(key == "x-oss-server-side-encryption-customer-algorithm"){
@@ -2674,7 +2669,7 @@ int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, string
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("POST", "", contype, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2760,7 +2755,7 @@ int S3fsCurl::CompleteMultipartPostRequest(const char* tpath, string& upload_id,
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("POST", "", contype, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2809,7 +2804,7 @@ int S3fsCurl::MultipartListRequest(string& body)
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("GET", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -2858,7 +2853,7 @@ int S3fsCurl::AbortMultipartUpload(const char* tpath, string& upload_id)
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("DELETE", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
@@ -2872,17 +2867,17 @@ int S3fsCurl::AbortMultipartUpload(const char* tpath, string& upload_id)
 
 //
 // PUT /ObjectName?partNumber=PartNumber&uploadId=UploadId HTTP/1.1
-// Host: BucketName.s3.amazonaws.com
+// Host: BucketName.oss-cn-hangzhou.aliyuncs.com
 // Date: date
 // Content-Length: Size
 // Authorization: Signature
 //
 // PUT /my-movie.m2ts?partNumber=1&uploadId=VCVsb2FkIElEIGZvciBlbZZpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZR HTTP/1.1
-// Host: example-bucket.s3.amazonaws.com
+// Host: example-bucket.oss-cn-hangzhou.aliyuncs.com
 // Date:  Mon, 1 Nov 2010 20:34:56 GMT
 // Content-Length: 10485760
 // Content-MD5: pUNXr/BjKK5G2UKvaRRrOA==
-// Authorization: AWS VGhpcyBtZXNzYWdlIHNpZ25lZGGieSRlbHZpbmc=
+// Authorization: OSS VGhpcyBtZXNzYWdlIHNpZ25lZGGieSRlbHZpbmc=
 //
 
 int S3fsCurl::UploadMultipartPostSetup(const char* tpath, int part_num, string& upload_id)
@@ -2938,7 +2933,7 @@ int S3fsCurl::UploadMultipartPostSetup(const char* tpath, int part_num, string& 
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", strMD5, "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -3034,7 +3029,7 @@ int S3fsCurl::CopyMultipartPostRequest(const char* from, const char* to, int par
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", "", ContentType, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + AWSAccessKeyId + ":" + Signature).c_str());
+	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
@@ -3757,7 +3752,7 @@ bool AdditionalHeader::Dump(void) const
 //
 // curl_slist_sort_insert
 // This function is like curl_slist_append function, but this adds data by a-sorting.
-// Because AWS signature needs sorted header.
+// Because OSS signature needs sorted header.
 //
 struct curl_slist* curl_slist_sort_insert(struct curl_slist* list, const char* data)
 {

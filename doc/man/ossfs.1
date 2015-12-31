@@ -49,12 +49,12 @@ All ossfs options must given in the form where "opt" is:
  <option_name>=<option_value>
 .TP
 \fB\-o\fR default_acl (default="private")
-the default canned acl to apply to all written S3 objects, e.g., "public-read".
+the default canned acl to apply to all written OSS objects, e.g., "public-read".
 Any created files will have this canned acl.
 Any updated files will also have this canned acl applied!
 .TP
 \fB\-o\fR retries (default="2")
-number of times to retry a failed S3 transaction.
+number of times to retry a failed OSS transaction.
 .TP
 \fB\-o\fR use_cache (default="" which means disabled)
 local folder to use for local file cache.
@@ -74,8 +74,8 @@ this option can not be specified with use_sse.
 this option has been replaced by new storage_class option.
 .TP
 \fB\-o\fR use_sse (default is disable)
-Specify three type Amazon's Server-Site Encryption: SSE-S3, SSE-C or SSE-KMS. SSE-S3 uses Amazon S3-managed encryption keys, SSE-C uses customer-provided encryption keys, and SSE-KMS uses the master key which you manage in AWS KMS.
-You can specify "use_sse" or "use_sse=1" enables SSE-S3 type (use_sse=1 is old type parameter).
+Specify three type Amazon's Server-Site Encryption: SSE-OSS, SSE-C. SSE-OSS uses Aliyun OSS-managed encryption keys, SSE-C uses customer-provided encryption keys.
+You can specify "use_sse" or "use_sse=1" enables SSE-OSS type (use_sse=1 is old type parameter).
 Case of setting SSE-C, you can specify "use_sse=custom", "use_sse=custom:<custom key file path>" or "use_sse=<custom key file path>"(only <custom key file path> specified is old type parameter).
 You can use "c" for short "custom".
 The custom key file must be 600 permission. The file can have some lines, each line is one SSE-C key.
@@ -170,14 +170,14 @@ ossfs makes file for downloading, and uploading and caching files.
 If the disk free space is smaller than this value, ossfs do not use diskspace as possible in exchange for the performance.
 .TP
 \fB\-o\fR url (default="http://oss-cn-hangzhou.aliyuncs.com")
-sets the url to use to access Amazon S3. If you want to use HTTPS, then you can set url=https://oss-cn-hangzhou.aliyuncs.com
+sets the url to use to access Aliyun OSS. If you want to use HTTPS, then you can set url=https://oss-cn-hangzhou.aliyuncs.com
 .TP
 \fB\-o\fR endpoint (default="oss-cn-hangzhou")
 sets the endpoint to use.
 If this option is not specified, ossfs uses HangZhou region as the default.
 If the ossfs could not connect to the region specified by this option, ossfs could not run.
 But if you do not specify this option, and if you can not connect with the default region, ossfs will retry to automatically connect to the other region.
-So ossfs can know the correct region name, because ossfs can find it in an error from the S3 server.
+So ossfs can know the correct region name, because ossfs can find it in an error from the OSS server.
 .TP
 \fB\-o\fR mp_umask (default is "0000")
 sets umask for the mount point directory.
@@ -197,20 +197,20 @@ Because ossfs always checks MD5 when uploading large object, this option does no
 set the IAM Role that will supply the credentials from the instance meta-data.
 .TP
 \fB\-o\fR noxmlns - disable registing xml name space.
-disable registing xml name space for response of ListBucketResult and ListVersionsResult etc. Default name space is looked up from "http://s3.amazonaws.com/doc/2006-03-01".
+disable registing xml name space for response of ListBucketResult and ListVersionsResult etc. 
 This option should not be specified now, because ossfs looks up xmlns automatically after v1.66.
 .TP
 \fB\-o\fR nocopyapi - for other incomplete compatibility object storage.
-For a distributed object storage which is compatibility S3 API without PUT(copy api).
+For a distributed object storage which is compatibility OSS API without PUT(copy api).
 If you set this option, ossfs do not use PUT with "x-oss-copy-source"(copy api). Because traffic is increased 2-3 times by this option, we do not recommend this.
 .TP
 \fB\-o\fR norenameapi - for other incomplete compatibility object storage.
-For a distributed object storage which is compatibility S3 API without PUT(copy api).
+For a distributed object storage which is compatibility OSS API without PUT(copy api).
 This option is a subset of nocopyapi option. The nocopyapi option does not use copy-api for all command(ex. chmod, chown, touch, mv, etc), but this option does not use copy-api for only rename command(ex. mv).
 If this option is specified with nocopapi, the ossfs ignores it.
 .TP
 \fB\-o\fR use_path_request_style (use legacy API calling style)
-Enble compatibility with S3-like APIs which do not support the virtual-host request style, by using the older path request style.
+Enble compatibility with OSS-like APIs which do not support the virtual-host request style, by using the older path request style.
 .TP
 \fB\-o\fR dbglevel (default="crit")
 Set the debug message level. set value as crit(critical), err(error), warn(warning), info(information) to debug level. default debug level is critical.
@@ -228,13 +228,13 @@ There are many FUSE specific mount options that can be specified. e.g. allow_oth
 .TP
 Maximum file size=64GB (limited by ossfs, not Amazon).
 .TP
-If enabled via the "use_cache" option, ossfs automatically maintains a local cache of files in the folder specified by use_cache. Whenever ossfs needs to read or write a file on S3, it first downloads the entire file locally to the folder specified by use_cache and operates on it. When fuse_release() is called, ossfs will re-upload the file to S3 if it has been changed. ossfs uses md5 checksums to minimize downloads from S3.
+If enabled via the "use_cache" option, ossfs automatically maintains a local cache of files in the folder specified by use_cache. Whenever ossfs needs to read or write a file on OSS, it first downloads the entire file locally to the folder specified by use_cache and operates on it. When fuse_release() is called, ossfs will re-upload the file to OSS if it has been changed. ossfs uses md5 checksums to minimize downloads from OSS.
 .TP
 The folder specified by use_cache is just a local cache. It can be deleted at any time. ossfs rebuilds it on demand.
 .TP
 Local file caching works by calculating and comparing md5 checksums (ETag HTTP header).
 .TP
-ossfs leverages /etc/mime.types to "guess" the "correct" content-type based on file name extension. This means that you can copy a website to S3 and serve it up directly from S3 with correct content-types!
+ossfs leverages /etc/mime.types to "guess" the "correct" content-type based on file name extension. This means that you can copy a website to OSS and serve it up directly from OSS with correct content-types!
 .SH BUGS
 Due to OSS's "eventual consistency" limitations, file creation can and will occasionally fail. Even after a successful create, subsequent reads can fail for an indeterminate time, even after one or more successful reads. Create and read enough files and you will eventually encounter this failure. This is not a flaw in ossfs and it is not something a FUSE wrapper like ossfs can work around. The retries option does not address this issue. Your application must either tolerate or compensate for these failures, for example by retrying creates or reads.
 .SH AUTHOR

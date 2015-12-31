@@ -51,7 +51,7 @@ using namespace std;
 //------------------------------------------------
 // Symbols
 //------------------------------------------------
-#define MAX_MULTIPART_CNT   10000                   // S3 multipart max count
+#define MAX_MULTIPART_CNT   10000                   // OSS multipart max count
 
 //
 // For cache directory top path
@@ -1122,7 +1122,7 @@ int FdEntity::NoCacheLoadAndPost(off_t start, size_t size)
       // check rest size is over minimum part size
       //
       // [NOTE]
-      // If the final part size is smaller than 5MB, it is not allowed by S3 API.
+      // If the final part size is smaller than 5MB, it is not allowed by OSS API.
       // For this case, if the previous part of the final part is not over 5GB,
       // we incorporate the final part to the previous part. If the previous part
       // is over 5GB, we want to even out the last part and the previous part.
@@ -1339,7 +1339,7 @@ int FdEntity::RowFlush(const char* tpath, bool force_sync)
     /*
      * Make decision to do multi upload (or not) based upon file size
      * 
-     * According to the AWS spec:
+     * According to the OSS spec:
      *  - 1 to 10,000 parts are allowed
      *  - minimum size of parts is 5MB (expect for the last part)
      * 

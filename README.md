@@ -109,6 +109,6 @@ ossfs提供的功能和性能和本地文件系统相比，具有一些局限性
 
 Copyright (C) 2010 Randy Rizun <rrizun@gmail.com>
 
-Copyright (C) 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>
+Copyright (C) 2015 Haoran Yang <yangzhuodog1982@gmail.com>
 
 Licensed under the GNU GPL version 2

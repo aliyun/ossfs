@@ -137,7 +137,7 @@ enum storage_class_t {
 // sse type
 enum sse_type_t {
   SSE_DISABLE = 0,      // not use server side encrypting
-  SSE_S3,               // server side encrypting by S3 key
+  SSE_OSS,               // server side encrypting by OSS key
   SSE_C,                // server side encrypting by custom key
   SSE_KMS               // server side encrypting by kms id
 };
@@ -191,10 +191,10 @@ class S3fsCurl
     static sse_type_t       ssetype;
     static bool             is_content_md5;
     static bool             is_verbose;
-    static std::string      AWSAccessKeyId;
-    static std::string      AWSSecretAccessKey;
-    static std::string      AWSAccessToken;
-    static time_t           AWSAccessTokenExpire;
+    static std::string      OSSAccessKeyId;
+    static std::string      OSSSecretAccessKey;
+    static std::string      OSSAccessToken;
+    static time_t           OSSAccessTokenExpire;
     static std::string      IAM_role;
     static long             ssl_verify_hostname;
     static curltime_t       curl_times;
@@ -305,7 +305,7 @@ class S3fsCurl
     static sse_type_t SetSseType(sse_type_t type);
     static sse_type_t GetSseType(void) { return S3fsCurl::ssetype; }
     static bool IsSseDisable(void) { return (SSE_DISABLE == S3fsCurl::ssetype); }
-    static bool IsSseS3Type(void) { return (SSE_S3 == S3fsCurl::ssetype); }
+    static bool IsSseS3Type(void) { return (SSE_OSS == S3fsCurl::ssetype); }
     static bool IsSseCType(void) { return (SSE_C == S3fsCurl::ssetype); }
     static bool IsSseKmsType(void) { return (SSE_KMS == S3fsCurl::ssetype); }
     static bool FinalCheckSse(void);
@@ -321,7 +321,7 @@ class S3fsCurl
     static bool GetVerbose(void) { return S3fsCurl::is_verbose; }
     static bool SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey);
     static bool IsSetAccessKeyId(void){
-                  return (0 < S3fsCurl::IAM_role.size() || (0 < S3fsCurl::AWSAccessKeyId.size() && 0 < S3fsCurl::AWSSecretAccessKey.size()));
+                  return (0 < S3fsCurl::IAM_role.size() || (0 < S3fsCurl::OSSAccessKeyId.size() && 0 < S3fsCurl::OSSSecretAccessKey.size()));
                 }
     static long SetSslVerifyHostname(long value);
     static long GetSslVerifyHostname(void) { return S3fsCurl::ssl_verify_hostname; }

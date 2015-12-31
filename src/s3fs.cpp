@@ -2,7 +2,7 @@
  * s3fs - FUSE-based file system backed by Amazon S3
  *
  * Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
- * Copyright 2015 Haoran Yang <haoran.yanghr@alibaba-inc.com>
+ * Copyright 2015 Haoran Yang <yangzhuodog1982@gmail.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -92,7 +92,7 @@ bool pathrequeststyle             = false;
 bool is_specified_endpoint        = false;
 std::string program_name;
 std::string service_path          = "/";
-std::string host                  = "http://s3.amazonaws.com";
+std::string host                  = "";
 std::string bucket                = "";
 std::string endpoint              = "us-east-1";
 s3fs_log_level debug_level        = S3FS_LOG_CRIT;
@@ -171,7 +171,7 @@ static size_t parse_xattrs(const std::string& strxattrs, xattrs_t& xattrs);
 static std::string build_xattrs(const xattrs_t& xattrs);
 static int s3fs_utility_mode(void);
 static int s3fs_check_service(void);
-static int check_for_aws_format(void);
+static int check_for_oss_format(void);
 static int check_passwd_file_perms(void);
 static int read_passwd_file(void);
 static int get_access_keys(void);
@@ -704,10 +704,7 @@ bool get_object_sse_type(const char* path, sse_type_t& ssetype, string& ssevalue
   for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
     string key = (*iter).first;
     if(0 == strcasecmp(key.c_str(), "x-oss-server-side-encryption") && 0 == strcasecmp((*iter).second.c_str(), "AES256")){
-      ssetype  = SSE_S3;
-    }else if(0 == strcasecmp(key.c_str(), "x-oss-server-side-encryption-aws-kms-key-id")){
-      ssetype  = SSE_KMS;
-      ssevalue = (*iter).second;
+      ssetype  = SSE_OSS;
     }else if(0 == strcasecmp(key.c_str(), "x-oss-server-side-encryption-customer-key-md5")){
       ssetype  = SSE_C;
       ssevalue = (*iter).second;
@@ -1093,7 +1090,7 @@ static int s3fs_rmdir(const char* path)
   // the cache key is "dir/". So we get error only onece(delete "dir/").
 
   // check for "_$folder$" object.
-  // This processing is necessary for other S3 clients compatibility.
+  // This processing is necessary for other OSS clients compatibility.
   if(is_special_name_folder_object(strpath.c_str())){
     strpath += "_$folder$";
     result   = s3fscurl.DeleteRequest(strpath.c_str());
@@ -3674,13 +3671,6 @@ static int s3fs_check_service(void)
         // not specified endpoint, so try to connect to expected region.
         S3FS_PRN_CRIT("Could not connect wrong region %s, so retry to connect region %s.", endpoint.c_str(), expectregion.c_str());
         endpoint = expectregion;
-        if(S3fsCurl::IsSignatureV4()){
-            if(host == "http://s3.amazonaws.com"){
-                host = "http://s3-" + endpoint + ".amazonaws.com";
-            }else if(host == "https://s3.amazonaws.com"){
-                host = "https://s3-" + endpoint + ".amazonaws.com";
-            }
-        }
 
         // retry to check with new endpoint
         s3fscurl.DestroyCurlHandle();
@@ -3742,14 +3732,14 @@ static int s3fs_check_service(void)
 // Return:  1 - OK(could read and set accesskey etc.)
 //          0 - NG(could not read)
 //         -1 - Should shoutdown immidiatly
-static int check_for_aws_format(void)
+static int check_for_oss_format(void)
 {
   size_t first_pos = string::npos;
   string line;
   bool   got_access_key_id_line = 0;
   bool   got_secret_key_line = 0;
-  string str1 ("AWSAccessKeyId=");
-  string str2 ("AWSSecretKey=");
+  string str1 ("OSSAccessKeyId=");
+  string str2 ("OSSSecretKey=");
   size_t found;
   string AccessKeyId;
   string SecretAccesskey;
@@ -3887,7 +3877,7 @@ static int read_passwd_file(void)
   size_t first_pos = string::npos;
   size_t last_pos = string::npos;
   bool default_found = 0;
-  int aws_format;
+  int oss_format;
 
   // if you got here, the password file
   // exists and is readable by the
@@ -3896,10 +3886,10 @@ static int read_passwd_file(void)
     return EXIT_FAILURE;
   }
 
-  aws_format = check_for_aws_format();
-  if(1 == aws_format){
+  oss_format = check_for_oss_format();
+  if(1 == oss_format){
      return EXIT_SUCCESS;
-  }else if(-1 == aws_format){
+  }else if(-1 == oss_format){
      return EXIT_FAILURE;
   }
 
@@ -4014,33 +4004,33 @@ static int get_access_keys(void)
   }
 
   // 3  - environment variables
-  char* AWSACCESSKEYID     = getenv("AWSACCESSKEYID");
-  char* AWSSECRETACCESSKEY = getenv("AWSSECRETACCESSKEY");
-  if(AWSACCESSKEYID != NULL || AWSSECRETACCESSKEY != NULL){
-    if( (AWSACCESSKEYID == NULL && AWSSECRETACCESSKEY != NULL) ||
-        (AWSACCESSKEYID != NULL && AWSSECRETACCESSKEY == NULL) ){
-      S3FS_PRN_EXIT("if environment variable AWSACCESSKEYID is set then AWSSECRETACCESSKEY must be set too.");
+  char* OSSACCESSKEYID     = getenv("OSSACCESSKEYID");
+  char* OSSSECRETACCESSKEY = getenv("OSSSECRETACCESSKEY");
+  if(OSSACCESSKEYID != NULL || OSSSECRETACCESSKEY != NULL){
+    if( (OSSACCESSKEYID == NULL && OSSSECRETACCESSKEY != NULL) ||
+        (OSSACCESSKEYID != NULL && OSSSECRETACCESSKEY == NULL) ){
+      S3FS_PRN_EXIT("if environment variable OSSACCESSKEYID is set then OSSSECRETACCESSKEY must be set too.");
       return EXIT_FAILURE;
     }
-    if(!S3fsCurl::SetAccessKey(AWSACCESSKEYID, AWSSECRETACCESSKEY)){
+    if(!S3fsCurl::SetAccessKey(OSSACCESSKEYID, OSSSECRETACCESSKEY)){
       S3FS_PRN_EXIT("if one access key is specified, both keys need to be specified.");
       return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
   }
 
-  // 3a - from the AWS_CREDENTIAL_FILE environment variable
-  char * AWS_CREDENTIAL_FILE;
-  AWS_CREDENTIAL_FILE = getenv("AWS_CREDENTIAL_FILE");
-  if(AWS_CREDENTIAL_FILE != NULL){
-    passwd_file.assign(AWS_CREDENTIAL_FILE);
+  // 3a - from the OSS_CREDENTIAL_FILE environment variable
+  char * OSS_CREDENTIAL_FILE;
+  OSS_CREDENTIAL_FILE = getenv("OSS_CREDENTIAL_FILE");
+  if(OSS_CREDENTIAL_FILE != NULL){
+    passwd_file.assign(OSS_CREDENTIAL_FILE);
     if(passwd_file.size() > 0){
       ifstream PF(passwd_file.c_str());
       if(PF.good()){
          PF.close();
          return read_passwd_file();
       }else{
-        S3FS_PRN_EXIT("AWS_CREDENTIAL_FILE: \"%s\" is not readable.", passwd_file.c_str());
+        S3FS_PRN_EXIT("OSS_CREDENTIAL_FILE: \"%s\" is not readable.", passwd_file.c_str());
         return EXIT_FAILURE;
       }
     }
@@ -4290,22 +4280,22 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     // use_sse=file                   Set Server Side Encrypting type to Custom key(SSE-C) and load custom keys
     // use_sse=custom(c):file
     // use_sse=custom(c)              Set Server Side Encrypting type to Custom key(SSE-C)
-    // use_sse=kmsid(k):kms-key-id    Set Server Side Encrypting type to AWS Key Management key id(SSE-KMS) and load KMS id
-    // use_sse=kmsid(k)               Set Server Side Encrypting type to AWS Key Management key id(SSE-KMS)
+    // use_sse=kmsid(k):kms-key-id    Set Server Side Encrypting type to OSS Key Management key id(SSE-KMS) and load KMS id
+    // use_sse=kmsid(k)               Set Server Side Encrypting type to OSS Key Management key id(SSE-KMS)
     //
     // load_sse_c=file                Load Server Side Encrypting custom keys
     //
-    // AWSSSECKEYS                    Loaing Environment for Server Side Encrypting custom keys
-    // AWSSSEKMSID                    Loaing Environment for Server Side Encrypting Key id
+    // OSSSSECKEYS                    Loaing Environment for Server Side Encrypting custom keys
+    // OSSSSEKMSID                    Loaing Environment for Server Side Encrypting Key id
     //
     if(0 == STR2NCMP(arg, "use_sse")){
       if(0 == strcmp(arg, "use_sse") || 0 == strcmp(arg, "use_sse=1")){ // use_sse=1 is old type paraemter
-        // sse type is SSE_S3
+        // sse type is SSE_OSS
         if(!S3fsCurl::IsSseDisable() && !S3fsCurl::IsSseS3Type()){
           S3FS_PRN_EXIT("already set SSE another type, so confrict use_sse option or environment.");
           return -1;
         }
-        S3fsCurl::SetSseType(SSE_S3);
+        S3fsCurl::SetSseType(SSE_OSS);
 
       }else if(0 == strcmp(arg, "use_sse=kmsid") || 0 == strcmp(arg, "use_sse=k")){
         // sse type is SSE_KMS with out kmsid(expecting id is loaded by environment)
@@ -4766,7 +4756,6 @@ int main(int argc, char* argv[])
 
   // Check to see if the bucket name contains periods and https (SSL) is
   // being used. This is a known limitation:
-  // http://docs.amazonwebservices.com/AmazonS3/latest/dev/
   // The Developers Guide suggests that either use HTTP of for us to write
   // our own certificate verification logic.
   // For now, this will be unsupported unless we get a request for it to
