@@ -5,4 +5,4 @@
 # chkconfig: 2345 90 10
 # description: Activates/Deactivates ossfs configured to start at boot time.
 
-ossfs your_bucket your_mountpoint -ourl=http://oss-cn-hangzhou.aliyuncs.com -oallow_other
+ossfs your_bucket your_mountpoint -ourl=your_url -oallow_other
