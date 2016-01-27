@@ -111,6 +111,8 @@ class StatCache
     // Add stat cache
     bool AddStat(std::string& key, headers_t& meta, bool forcedir = false);
 
+	bool IncSize(const std::string& key, ssize_t sz);
+
     // Delete stat cache
     bool DelStat(const char* key);
     bool DelStat(std::string& key) {

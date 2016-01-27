@@ -44,6 +44,7 @@
 #include "s3fs.h"
 #include "s3fs_util.h"
 #include "string_util.h"
+#include "cache.h"
 #include "curl.h"
 
 using namespace std;
@@ -276,6 +277,7 @@ bool PageList::Compress(void)
         fdpage_list_t::iterator biter = iter;
         --biter;
         (*biter)->bytes += (*iter)->bytes;
+        delete *iter;
         iter = pages.erase(iter);
       }else{
         is_last_loaded = (*iter)->loaded;
@@ -322,6 +324,7 @@ bool PageList::Resize(size_t size, bool is_loaded)
         ++iter;
       }else{
         if(size <= static_cast<size_t>((*iter)->offset)){
+          delete *iter;
           iter = pages.erase(iter);
         }else{
           (*iter)->bytes = size - static_cast<size_t>((*iter)->offset);
@@ -1543,6 +1546,12 @@ ssize_t FdEntity::Write(const char* bytes, off_t start, size_t size)
       mp_start += mp_size;
       mp_size   = 0;
     }
+  }
+
+  // Update the stat cache.
+  bool success = StatCache::getStatCacheData()->IncSize(path, wsize);
+  if (!success) {
+	  S3FS_PRN_ERR("failed to update file size in stat cache(path=%s, size=%ld).", path.c_str(), wsize);
   }
   return wsize;
 }

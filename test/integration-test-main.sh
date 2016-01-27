@@ -14,6 +14,8 @@ ALT_TEST_TEXT_FILE=test-s3fs-ALT.txt
 TEST_TEXT_FILE_LENGTH=15
 BIG_FILE=big-file-s3fs.txt
 BIG_FILE_LENGTH=$((25 * 1024 * 1024))
+CUR_DIR=`pwd`
+TEST_BUCKET_MOUNT_POINT_1=$1
 
 function mk_test_file {
     if [ $# == 0 ]; then
@@ -408,6 +410,11 @@ function test_mtime_file {
     fi
 }
 
+function test_file_size_in_stat_cache {
+    echo "Testing file size in stat cache..."
+    python $CUR_DIR/stat_cache_test.py $TEST_BUCKET_MOUNT_POINT_1
+}
+
 function run_all_tests {
     test_append_file
     test_truncate_file
@@ -429,11 +436,10 @@ function run_all_tests {
     test_symlink
     test_extended_attributes
     test_mtime_file
+    test_file_size_in_stat_cache
 }
 
 # Mount the bucket
-CUR_DIR=`pwd`
-TEST_BUCKET_MOUNT_POINT_1=$1
 if [ "$TEST_BUCKET_MOUNT_POINT_1" == "" ]; then
     echo "Mountpoint missing"
     exit 1

@@ -52,7 +52,7 @@
 using namespace std;
 
 static const std::string empty_payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-static const std::string kOssfsVersion = "1.7.9.1";
+static const std::string kOssfsVersion = "1.7.9.3";
 
 //-------------------------------------------------------------------
 // Utilities

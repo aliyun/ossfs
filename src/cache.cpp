@@ -299,6 +299,25 @@ bool StatCache::AddStat(std::string& key, headers_t& meta, bool forcedir)
   return true;
 }
 
+bool StatCache::IncSize(const std::string& key, ssize_t sz)
+{
+	pthread_mutex_lock(&StatCache::stat_cache_lock);
+
+	stat_cache_t::iterator iter = stat_cache.find(key);
+	bool found = iter != stat_cache.end();
+	if (found) {
+		stat_cache_entry* entry = iter->second;
+		entry->stbuf.st_size += sz;
+		S3FS_PRN_INFO3(
+				"Update file size in stat cache. [path=%s][size=%ld][delta=%ld]", 
+				key.c_str(), entry->stbuf.st_size, sz);
+	}
+
+	pthread_mutex_unlock(&StatCache::stat_cache_lock);
+
+	return found;
+}
+
 bool StatCache::AddNoObjectCache(string& key)
 {
   if(!IsCacheNoObject){
