@@ -1,0 +1,8 @@
+#! /bin/bash
+#
+# ossfs      Automount Aliyun OSS Bucket in the specified direcotry.
+#
+# chkconfig: 2345 90 10
+# description: Activates/Deactivates ossfs configured to start at boot time.
+
+ossfs your_bucket your_mountpoint -ourl=your_url -oallow_other
