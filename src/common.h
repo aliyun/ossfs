@@ -21,6 +21,7 @@
 #ifndef S3FS_COMMON_H_
 #define S3FS_COMMON_H_
 
+#include <sys/stat.h>
 #include "../config.h"
 
 //
@@ -143,6 +144,7 @@ extern std::string    mount_prefix;
 extern std::string    endpoint;
 extern s3fs_log_level debug_level;
 extern const char*    s3fs_log_nest[S3FS_LOG_NEST_MAX];
+extern mode_t gDefaultPermission;
 
 #endif // S3FS_COMMON_H_
 

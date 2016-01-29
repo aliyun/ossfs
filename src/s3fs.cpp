@@ -4549,6 +4549,17 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       }
       return 0;
     }
+	if (0 == STR2NCMP(arg, "default_permission=")) {
+		const char *p = strchr(arg, '=') + sizeof(char);
+		char *error = NULL;
+		mode_t m = strtol(p, &error, 8);
+		if (*error != 0 || m < 00 || m > 0777) {
+			printf("Illegal default permission: %s. It must be: 0-777.\n", p);
+			exit(EXIT_FAILURE);
+		}
+		gDefaultPermission = m;
+		return 0;
+	}
     if(0 == strcmp(arg, "sigv2")){
       S3fsCurl::SetSignatureV4(false);
       return 0;

@@ -50,6 +50,7 @@ using namespace std;
 // Global valiables
 //-------------------------------------------------------------------
 std::string mount_prefix   = "";
+mode_t gDefaultPermission = 0666;
 
 //-------------------------------------------------------------------
 // Utility
@@ -702,7 +703,7 @@ mode_t get_mode(const char *s)
 
 mode_t get_mode(headers_t& meta, const char* path, bool checkdir, bool forcedir)
 {
-  mode_t mode = 0;
+  mode_t mode = gDefaultPermission;
   bool isS3sync = false;
   headers_t::const_iterator iter;
 
@@ -1029,6 +1030,10 @@ void show_help (void)
     "\n"
     "   url (default=\"\")\n"
     "      - sets the url to use to access aliyun oss\n"
+    "\n"
+    "   default_permission (default=666)\n"
+    "      - when the file do not have permission meta, ossfs will use this \n"
+	"      defalut value.\n"
     "\n"
     "   endpoint (default=\"\")\n"
     "      - sets the endpoint to use on signature version 4\n"
