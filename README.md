@@ -62,14 +62,14 @@ ossfs your_oss_bucket your_mount_dir -ourl=your_oss_service_url
 
 ```
 echo ossfs-fuse:faint:123 > /etc/passwd-ossfs
-chmod 640 ~/.passwd-ossfs
+chmod 640 /etc/passwd-ossfs
 mkdir /tmp/ossfs
 ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
 
 > 注1：ossfs的命令参数和s3fs相同，用户可以在启动ossfs时指定其他参数控制ossfs的行为，具体参见[s3fs文档](https://github.com/s3fs-fuse/s3fs-fuse/wiki/Fuse-Over-Amazon)。
 > 
-> 注2：ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当有多组信息，写入.passwd-ossfs的信息格式为：
+> 注2：ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当有多组信息，写入passwd-ossfs的信息格式为：
 > 
 > your_bucket_name1:your_access_key_id1:your_access_key_secret1
 > 
