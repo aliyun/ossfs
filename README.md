@@ -14,7 +14,9 @@ ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
 
 ### 安装
 
-编译前请先安装下列依赖库：
+我们为常见的linux发行版制作了安装包，请从[这里](https://github.com/aliyun/ossfs/wiki/install)选择对应的安装包下载安装。
+
+如果没有找到对应的安装包，您也可以自行编译安装。编译前请先安装下列依赖库：
 
 Ubuntu 14.04:
 
@@ -39,17 +41,13 @@ make
 sudo make install
 ```
 
-#### 安装包下载
-
-我们为常见的linux发行版制作了安装包，请从[这里](https://github.com/aliyun/ossfs/wiki/install)选择对应的安装包下载安装。
-
 ### 运行
 
-设置bucket name, access key/id信息，将其存放在~/.passwd-ossfs 文件中，注意这个文件的权限必须正确设置，建议设为600。
+设置bucket name, access key/id信息，将其存放在/etc/passwd-ossfs 文件中，注意这个文件的权限必须正确设置，建议设为640。
 
 ```
-echo your_bucket_name:your_key_id:your_key_secret > ~/.passwd-ossfs
-chmod 600 ~/.passwd-ossfs
+echo your_bucket_name:your_key_id:your_key_secret > /etc/passwd-ossfs
+chmod 640 /etc/passwd-ossfs
 ```
 
 将oss bucket mount到指定目录
@@ -63,8 +61,8 @@ ossfs your_oss_bucket your_mount_dir -ourl=your_oss_service_url
 将ossfs这个bucket mount到/tmp/ossfs目录下，access key id是faint，access key secret是123，oss service url是http://oss-cn-hangzhou.aliyuncs.com
 
 ```
-echo ossfs-fuse:faint:123 > ~/.passwd-ossfs
-chmod 600 ~/.passwd-ossfs
+echo ossfs-fuse:faint:123 > /etc/passwd-ossfs
+chmod 640 ~/.passwd-ossfs
 mkdir /tmp/ossfs
 ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
