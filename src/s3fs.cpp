@@ -90,6 +90,7 @@ bool foreground                   = false;
 bool nomultipart                  = false;
 bool pathrequeststyle             = false;
 bool is_specified_endpoint        = false;
+bool noxattr                      = false;
 int  s3fs_init_deferred_exit_status = 0;
 std::string program_name;
 std::string service_path          = "/";
@@ -2957,6 +2958,11 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
 static int s3fs_setxattr(const char* path, const char* name, const char* value, size_t size, int flags)
 #endif
 {
+  if (noxattr) {
+    S3FS_PRN_WARN("XATTR DISABLED: [path=%s][name=%s][value=%p][size=%zu][flags=%d]", path, name, value, size, flags);
+    return 0;
+  }
+
   S3FS_PRN_INFO("[path=%s][name=%s][value=%p][size=%zu][flags=%d]", path, name, value, size, flags);
 
   if((value && 0 == size) || (!value && 0 < size)){
@@ -3047,6 +3053,11 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
 static int s3fs_getxattr(const char* path, const char* name, char* value, size_t size)
 #endif
 {
+  if (noxattr) {
+    S3FS_PRN_WARN("XATTR DISABLED: [path=%s][name=%s][value=%p][size=%zu]", path, name, value, size);
+    return -ENOATTR;
+  }
+
   S3FS_PRN_INFO("[path=%s][name=%s][value=%p][size=%zu]", path, name, value, size);
 
   if(!path || !name){
@@ -4260,6 +4271,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == strcmp(arg, "nomultipart")){
       nomultipart = true;
+      return 0;
+    }
+    if(0 == strcmp(arg, "noxattr")){
+      noxattr = true;
       return 0;
     }
     // old format for storage_class
