@@ -1,4 +1,11 @@
-﻿ChangeLog for S3FS
+﻿ChangeLog for OSSFS
+------------------
+
+## v1.79.4 (3/21/2016)
+
+- Add noxattr option to disable get/set xattr
+
+ChangeLog for S3FS
 ------------------
 
 Version 1.79 -- Jul 19, 2015
