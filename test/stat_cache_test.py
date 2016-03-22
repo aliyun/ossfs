@@ -9,7 +9,7 @@ import sys
 
 mountpoint = sys.argv[1]
 
-filename = os.path.join(mountpoint, "ossfs_test_%d" % random.randint(0, 1000000))
+filename = "ossfs_test_%d" % random.randint(0, 1000000)
 data = "hello"
 f = open(filename, 'w')
 f.write(data)
