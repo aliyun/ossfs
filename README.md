@@ -1,5 +1,8 @@
 # ossfs
 
+[![Version](https://badge.fury.io/gh/aliyun%2Fossfs.svg)](https://github.com/aliyun/ossfs/releases)
+[![Build Status](https://travis-ci.org/aliyun/ossfs.svg?branch=master)](https://travis-ci.org/aliyun/ossfs?branch=master)
+
 ### 简介
 
 ossfs 能让您在Linux/Mac OS X 系统中把Aliyun OSS bucket 挂载到本地文件系统中，您能够便捷的通过本地文件系统操作OSS 上的对象，实现数据的共享。
@@ -68,13 +71,13 @@ ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
 
 > 注1：ossfs的命令参数和s3fs相同，用户可以在启动ossfs时指定其他参数控制ossfs的行为，具体参见[s3fs文档](https://github.com/s3fs-fuse/s3fs-fuse/wiki/Fuse-Over-Amazon)。
-> 
+>
 > 注2：ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当有多组信息，写入passwd-ossfs的信息格式为：
-> 
+>
 > your_bucket_name1:your_access_key_id1:your_access_key_secret1
-> 
+>
 > your_bucket_name2:your_access_key_id2:your_access_key_secret2
-> 
+>
 > ......
 
 ### 局限性
