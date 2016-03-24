@@ -1872,11 +1872,11 @@ FdEntity* FdManager::ExistOpen(const char* path, int existfd, bool ignore_existf
         if(0 == strcmp((*iter).second->GetPath(), path)){
           ent = (*iter).second;
           ent->Dup();
+          break;
         }else{
           // found fd, but it is used another file(file descriptor is recycled)
           // so returns NULL.
         }
-        break;
       }
     }
   }
