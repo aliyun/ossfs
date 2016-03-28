@@ -52,7 +52,6 @@
 using namespace std;
 
 static const std::string empty_payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-static const std::string kOssfsVersion = "1.7.9.3";
 
 //-------------------------------------------------------------------
 // Utilities
@@ -1693,7 +1692,7 @@ bool S3fsCurl::RemakeHandle(void)
 int S3fsCurl::RequestPerform(void)
 {
   // Add the user-agent info
-  static const string kUserAgentInfo = "aliyun-sdk-http/1.0()/ossfs" + kOssfsVersion;
+  static const string kUserAgentInfo = "aliyun-sdk-http/1.0()/ossfs" + VERSION;
   requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", kUserAgentInfo.c_str());
   if(IS_S3FS_LOG_DBG()){
     char* ptr_url = NULL;
