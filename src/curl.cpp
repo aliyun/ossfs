@@ -1692,7 +1692,7 @@ bool S3fsCurl::RemakeHandle(void)
 int S3fsCurl::RequestPerform(void)
 {
   // Add the user-agent info
-  static const string kUserAgentInfo = "aliyun-sdk-http/1.0()/ossfs" + VERSION;
+  static const string kUserAgentInfo = "aliyun-sdk-http/1.0()/ossfs" + string(VERSION);
   requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", kUserAgentInfo.c_str());
   if(IS_S3FS_LOG_DBG()){
     char* ptr_url = NULL;
