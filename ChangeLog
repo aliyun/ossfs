@@ -1,6 +1,10 @@
 ﻿ChangeLog for OSSFS
 ------------------
 
+## v1.79.6 (3/29/2016)
+
+- Add the missing User-Agent in multi-head request
+
 ## v1.79.5 (3/29/2016)
 
 - Setup travis CI
