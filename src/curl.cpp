@@ -238,6 +238,7 @@ mimes_t          S3fsCurl::mimeTypes;
 int              S3fsCurl::max_parallel_cnt    = 5;              // default
 off_t            S3fsCurl::multipart_size      = MULTIPART_SIZE; // default
 bool             S3fsCurl::is_sigv4            = true;           // default
+const string     S3fsCurl::skUserAgent = "aliyun-sdk-http/1.0()/ossfs" + string(VERSION);
 
 //-------------------------------------------------------------------
 // Class methods for S3fsCurl
@@ -1692,8 +1693,7 @@ bool S3fsCurl::RemakeHandle(void)
 int S3fsCurl::RequestPerform(void)
 {
   // Add the user-agent info
-  static const string kUserAgentInfo = "aliyun-sdk-http/1.0()/ossfs" + string(VERSION);
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", kUserAgentInfo.c_str());
+  requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", skUserAgent.c_str());
   if(IS_S3FS_LOG_DBG()){
     char* ptr_url = NULL;
     curl_easy_getinfo(hCurl, CURLINFO_EFFECTIVE_URL , &ptr_url);
@@ -2113,6 +2113,7 @@ bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* 
   string date    = get_date_rfc850();
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
+  requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", skUserAgent.c_str());
 
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("HEAD", "", "", date, resource);
