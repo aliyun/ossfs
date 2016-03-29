@@ -1,6 +1,6 @@
 # ossfs
 
-[![Version](https://badge.fury.io/gh/aliyun%2Fossfs.svg)](https://github.com/aliyun/ossfs/releases)
+[![Version](https://badge.fury.io/gh/aliyun%2Fossfs.svg)][releases]
 [![Build Status](https://travis-ci.org/aliyun/ossfs.svg?branch=master)](https://travis-ci.org/aliyun/ossfs?branch=master)
 
 ### 简介
@@ -17,7 +17,36 @@ ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
 
 ### 安装
 
-我们为常见的linux发行版制作了安装包，请从[这里](https://github.com/aliyun/ossfs/wiki/install)选择对应的安装包下载安装。
+#### 预编译的安装包
+
+我们为常见的linux发行版制作了安装包：
+
+- Ubuntu-14.04
+- CentOS-7.0/6.5/5.11
+
+请从[版本发布页面][releases]选择对应的安装包下载安装。
+
+- 对于Ubuntu，安装命令为：
+
+```
+sudo apt-get update
+sudo apt-get install gdebi-core
+sudo gdebi your_ossfs_package
+```
+
+- 对于CentOS6.5及以上，安装命令为：
+
+```
+sudo yum localinstall your_ossfs_package
+```
+
+- 对于CentOS5，安装命令为：
+
+```
+sudo yum localinstall your_ossfs_package --nogpgcheck
+```
+
+#### 源码安装
 
 如果没有找到对应的安装包，您也可以自行编译安装。编译前请先安装下列依赖库：
 
@@ -90,6 +119,15 @@ ossfs提供的功能和性能和本地文件系统相比，具有一些局限性
 * 多个客户端挂载同一个oss bucket时，依赖用户自行协调各个客户端的行为。例如避免多个客户端写同一个文件等等。
 * 不支持hard link。
 
+### 参与开发
+
+0. 开发流程参考：https://github.com/rockuw/oss-sdk-status#development-oss-members-only
+1. 提交代码后，确保travis CI是PASS的
+2. 每发布一个新的版本：
+  - 运行`scripts/build-pkg.py`生成相应的安装包
+  - 在[Release页面][releases]发布一个版本
+  - 将生成的安装包上传到相应的Release下面
+
 ### 常见问题
 
 [FAQ](https://github.com/aliyun/ossfs/wiki/FAQ)
@@ -113,3 +151,6 @@ Copyright (C) 2010 Randy Rizun <rrizun@gmail.com>
 Copyright (C) 2015 Haoran Yang <yangzhuodog1982@gmail.com>
 
 Licensed under the GNU GPL version 2
+
+
+[releases]: https://github.com/aliyun/ossfs/releases
