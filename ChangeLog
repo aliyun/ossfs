@@ -1,6 +1,12 @@
 ﻿ChangeLog for OSSFS
 ------------------
 
+## v1.79.5 (3/29/2016)
+
+- Setup travis CI
+- Fix a bug in fd cache lookup
+- Add script to build dist package
+
 ## v1.79.4 (3/21/2016)
 
 - Add noxattr option to disable get/set xattr
