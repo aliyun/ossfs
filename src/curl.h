@@ -204,6 +204,7 @@ class S3fsCurl
     static int              max_parallel_cnt;
     static off_t            multipart_size;
     static bool             is_sigv4;
+    static const std::string skUserAgent;
 
     // variables
     CURL*                hCurl;
