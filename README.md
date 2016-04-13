@@ -1,17 +1,19 @@
-# ossfs
+# OSSFS
 
 [![Version](https://badge.fury.io/gh/aliyun%2Fossfs.svg)][releases]
 [![Build Status](https://travis-ci.org/aliyun/ossfs.svg?branch=master)](https://travis-ci.org/aliyun/ossfs?branch=master)
 
 ### 简介
 
-ossfs 能让您在Linux/Mac OS X 系统中把Aliyun OSS bucket 挂载到本地文件系统中，您能够便捷的通过本地文件系统操作OSS 上的对象，实现数据的共享。
+ossfs 能让您在Linux/Mac OS X 系统中把Aliyun OSS bucket 挂载到本地文件
+系统中，您能够便捷的通过本地文件系统操作OSS 上的对象，实现数据的共享。
 
 ### 功能
 
 ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
 
-* 支持POSIX 文件系统的大部分功能，包括文件读写，目录，链接操作，权限，uid/gid，以及扩展属性（extended attributes）
+* 支持POSIX 文件系统的大部分功能，包括文件读写，目录，链接操作，权限，
+  uid/gid，以及扩展属性（extended attributes）
 * 通过OSS 的multipart 功能上传大文件。
 * MD5 校验保证数据完整性。
 
@@ -53,13 +55,15 @@ sudo yum localinstall your_ossfs_package --nogpgcheck
 Ubuntu 14.04:
 
 ```
-sudo apt-get install automake autotools-dev g++ git libcurl4-gnutls-dev libfuse-dev libssl-dev libxml2-dev make pkg-config
+sudo apt-get install automake autotools-dev g++ git libcurl4-gnutls-dev \
+                     libfuse-dev libssl-dev libxml2-dev make pkg-config
 ```
 
 CentOS 7.0:
 
 ```
-sudo yum install automake fuse-devel gcc-c++ git libcurl-devel libxml2-devel make openssl-devel
+sudo yum install automake gcc-c++ git libcurl-devel libxml2-devel \
+                 fuse-devel make openssl-devel
 ```
 
 然后您可以在github上下载源码并编译安装：
@@ -75,7 +79,8 @@ sudo make install
 
 ### 运行
 
-设置bucket name, access key/id信息，将其存放在/etc/passwd-ossfs 文件中，注意这个文件的权限必须正确设置，建议设为640。
+设置bucket name, access key/id信息，将其存放在/etc/passwd-ossfs 文件中，
+注意这个文件的权限必须正确设置，建议设为640。
 
 ```
 echo your_bucket_name:your_key_id:your_key_secret > /etc/passwd-ossfs
@@ -88,9 +93,11 @@ chmod 640 /etc/passwd-ossfs
 ossfs your_oss_bucket your_mount_dir -ourl=your_oss_service_url
 ```
 
-示例
+#### 示例
 
-将ossfs这个bucket mount到/tmp/ossfs目录下，access key id是faint，access key secret是123，oss service url是http://oss-cn-hangzhou.aliyuncs.com
+将ossfs这个bucket mount到/tmp/ossfs目录下，access key id是faint，
+access key secret是123，oss service url是
+`http://oss-cn-hangzhou.aliyuncs.com`
 
 ```
 echo ossfs-fuse:faint:123 > /etc/passwd-ossfs
@@ -99,15 +106,30 @@ mkdir /tmp/ossfs
 ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
 
-> 注1：ossfs的命令参数和s3fs相同，用户可以在启动ossfs时指定其他参数控制ossfs的行为，具体参见[s3fs文档](https://github.com/s3fs-fuse/s3fs-fuse/wiki/Fuse-Over-Amazon)。
->
-> 注2：ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当有多组信息，写入passwd-ossfs的信息格式为：
->
-> your_bucket_name1:your_access_key_id1:your_access_key_secret1
->
-> your_bucket_name2:your_access_key_id2:your_access_key_secret2
->
-> ......
+#### 常用设置
+
+- 使用`ossfs --version`来查看当前版本，使用`ossfs -h`来查看可用的参数
+- 如果使用ossfs的机器是阿里云ECS，可以使用内网域名来**避免流量收费**和
+  **提高速度**：
+
+        ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou-internal.aliyuncs.com
+
+- 在linux系统中，[updatedb][updatedb]会定期地扫描文件系统，如果不想
+  ossfs的挂载目录被扫描，可参考[FAQ][FAQ-updatedb]设置跳过挂载目录
+- 如果你没有使用[eCryptFs][ecryptfs]等需要[XATTR][xattr]的文件系统，可
+  以通过添加`-o noxattr`参数来提升性能
+- ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当
+  有多组信息，写入passwd-ossfs的信息格式为：
+
+        bucket1:access_key_id1:access_key_secret1
+        bucket2:access_key_id2:access_key_secret2
+
+#### 高级设置
+
+- 可以添加`-f -d`参数来让ossfs运行在前台并输出debug日志
+- 可以使用`-o kernel_cache`参数让ossfs能够利用文件系统的page cache，如
+  果你有多台机器挂载到同一个bucket，并且要求强一致性，请**不要**使用此
+  选项
 
 ### 局限性
 
@@ -118,6 +140,8 @@ ossfs提供的功能和性能和本地文件系统相比，具有一些局限性
 * 文件/文件夹的rename操作不是原子的。
 * 多个客户端挂载同一个oss bucket时，依赖用户自行协调各个客户端的行为。例如避免多个客户端写同一个文件等等。
 * 不支持hard link。
+* 不适合用在高并发读/写的场景，这样会让系统的load升高
+* 由于没有利用keepalive特性，可能会导致很多TIME_WAIT的连接
 
 ### 参与开发
 
@@ -154,3 +178,7 @@ Licensed under the GNU GPL version 2
 
 
 [releases]: https://github.com/aliyun/ossfs/releases
+[updatedb]: http://linux.die.net/man/8/updatedb
+[faq-updatedb]: https://github.com/aliyun/ossfs/wiki/FAQ
+[ecryptfs]: http://ecryptfs.org/
+[xattr]: http://man7.org/linux/man-pages/man7/xattr.7.html
