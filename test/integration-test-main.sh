@@ -484,6 +484,7 @@ then
   rm -f $TEST_TEXT_FILE
 fi
 
+rm -rf *
 run_all_tests
 
 # Unmount the bucket
