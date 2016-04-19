@@ -301,7 +301,7 @@ function test_list_many_files {
         exit 1
     fi
 
-    rm_test_dir $dir
+    rm -rf $dir
 }
 
 function test_remove_nonempty_directory {
