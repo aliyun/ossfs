@@ -289,7 +289,7 @@ function test_list_many_files {
 
     dir="many_files"
     count=256
-    mk_test_dir($dir)
+    mk_test_dir $dir
 
     for x in $(seq $count); do
         touch $dir/file-$x
@@ -301,7 +301,7 @@ function test_list_many_files {
         exit 1
     fi
 
-    rm_test_dir($dir)
+    rm_test_dir $dir
 }
 
 function test_remove_nonempty_directory {
