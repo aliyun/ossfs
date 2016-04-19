@@ -1,6 +1,11 @@
 ﻿ChangeLog for OSSFS
 ------------------
 
+## v1.79.7 (4/19/2016)
+
+- Change object default permission to 777
+- Add curl handler pool to reuse connections (#24)
+
 ## v1.79.6 (3/29/2016)
 
 - Add the missing User-Agent in multi-head request
