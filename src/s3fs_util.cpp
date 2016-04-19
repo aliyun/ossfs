@@ -50,7 +50,7 @@ using namespace std;
 // Global valiables
 //-------------------------------------------------------------------
 std::string mount_prefix   = "";
-mode_t gDefaultPermission = 0666;
+mode_t gDefaultPermission = 0777;
 
 //-------------------------------------------------------------------
 // Utility
@@ -1031,7 +1031,7 @@ void show_help (void)
     "   url (default=\"\")\n"
     "      - sets the url to use to access aliyun oss\n"
     "\n"
-    "   default_permission (default=666)\n"
+    "   default_permission (default=777)\n"
     "      - when the file do not have permission meta, ossfs will use this \n"
 	"      defalut value.\n"
     "\n"
