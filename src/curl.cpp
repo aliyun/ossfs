@@ -199,7 +199,7 @@ bool CurlHandlerPool::Init()
   }
 
   mHandlers = new CURL*[mMaxHandlers](); // this will init the array to 0
-  for (int i = 0; i < mMaxHandlers; ++i) {
+  for (int i = 0; i < mMaxHandlers; ++i, ++mIndex) {
     mHandlers[i] = curl_easy_init();
     if (!mHandlers[i]) {
       S3FS_PRN_ERR("Init curl handlers pool failed");
@@ -213,10 +213,10 @@ bool CurlHandlerPool::Init()
 
 bool CurlHandlerPool::Destroy()
 {
-  for (int i = 0; i < mMaxHandlers; ++i) {
-    if (mHandlers[i]) {
-      curl_easy_cleanup(mHandlers[i]);
-    }
+  assert(mIndex >= -1 && mIndex < mMaxHandlers);
+
+  for (int i = 0; i <= mIndex; ++i) {
+    curl_easy_cleanup(mHandlers[i]);
   }
   delete[] mHandlers;
 
