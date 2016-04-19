@@ -47,18 +47,30 @@ function rm_test_file {
 }
 
 function mk_test_dir {
-    mkdir ${TEST_DIR}
+    if [ $# == 0 ]; then
+        dir=${TEST_DIR}
+    else
+        dir=$1
+    fi
 
-    if [ ! -d ${TEST_DIR} ]; then
-        echo "Directory ${TEST_DIR} was not created"
+    mkdir $dir
+
+    if [ ! -d $dir ]; then
+        echo "Directory $dir was not created"
         exit 1
     fi
 }
 
 function rm_test_dir {
-    rmdir ${TEST_DIR}
-    if [ -e $TEST_DIR ]; then
-        echo "Could not remove the test directory, it still exists: ${TEST_DIR}"
+    if [ $# == 0 ]; then
+        dir=${TEST_DIR}
+    else
+        dir=$1
+    fi
+
+    rmdir $dir
+    if [ -e $dir ]; then
+        echo "Could not remove the test directory, it still exists: $dir"
         exit 1
     fi
 }
@@ -272,6 +284,26 @@ function test_list {
     rm_test_dir
 }
 
+function test_list_many_files {
+    echo "Testing list many files"
+
+    dir="many_files"
+    count=256
+    mk_test_dir $dir
+
+    for x in $(seq $count); do
+        touch $dir/file-$x
+    done
+
+    file_cnt=$(ls -1 $dir | wc -l)
+    if [ $file_cnt != $count ]; then
+        echo "Expected $count files but got $file_cnt"
+        exit 1
+    fi
+
+    rm -rf $dir
+}
+
 function test_remove_nonempty_directory {
     echo "Testing removing a non-empty directory"
     mk_test_dir
@@ -425,6 +457,7 @@ function run_all_tests {
     test_chmod
     test_chown
     test_list
+    test_list_many_files
     # XXX: Haoran: Do not know why this case failed in script but passed by manually run.
     #test_remove_nonempty_directory
     # TODO: broken: https://github.com/s3fs-fuse/s3fs-fuse/issues/145
@@ -451,6 +484,7 @@ then
   rm -f $TEST_TEXT_FILE
 fi
 
+rm -rf *
 run_all_tests
 
 # Unmount the bucket
