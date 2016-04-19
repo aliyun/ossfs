@@ -203,6 +203,9 @@ bool CurlHandlerPool::Init()
     mHandlers[i] = curl_easy_init();
     if (!mHandlers[i]) {
       S3FS_PRN_ERR("Init curl handlers pool failed");
+      for (--i; i >= 0; --i) {
+        curl_easy_cleanup(mHandlers[i]);
+      }
       return false;
     }
   }
@@ -248,19 +251,19 @@ CURL* CurlHandlerPool::GetHandler()
 
 void CurlHandlerPool::ReturnHandler(CURL* h)
 {
-  bool clear = false;
+  bool needCleanup = true;
 
   assert(mIndex >= -1 && mIndex < mMaxHandlers);
 
   pthread_mutex_lock(&mLock);
   if (mIndex < mMaxHandlers - 1) {
     mHandlers[++mIndex] = h;
-    clear = true;
+    needCleanup = false;
     S3FS_PRN_DBG("Return handler to pool: %d", mIndex);
   }
   pthread_mutex_unlock(&mLock);
 
-  if (!clear) {
+  if (needCleanup) {
     S3FS_PRN_INFO("Pool full: destroy the handler");
     curl_easy_cleanup(h);
   }
