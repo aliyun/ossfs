@@ -131,6 +131,7 @@ class CurlHandlerPool
 public:
   CurlHandlerPool(int maxHandlers)
     : mMaxHandlers(maxHandlers)
+    , mHandlers(NULL)
     , mIndex(maxHandlers - 1)
   {
     assert(maxHandlers > 0);
