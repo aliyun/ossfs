@@ -198,14 +198,12 @@ bool CurlHandlerPool::Init()
     return false;
   }
 
-  mHandlers = new CURL*[mMaxHandlers];
+  mHandlers = new CURL*[mMaxHandlers](); // this will init the array to 0
   for (int i = 0; i < mMaxHandlers; ++i) {
     mHandlers[i] = curl_easy_init();
     if (!mHandlers[i]) {
       S3FS_PRN_ERR("Init curl handlers pool failed");
-      for (--i; i >= 0; --i) {
-        curl_easy_cleanup(mHandlers[i]);
-      }
+      Destroy();
       return false;
     }
   }
@@ -216,7 +214,9 @@ bool CurlHandlerPool::Init()
 bool CurlHandlerPool::Destroy()
 {
   for (int i = 0; i < mMaxHandlers; ++i) {
-    curl_easy_cleanup(mHandlers[i]);
+    if (mHandlers[i]) {
+      curl_easy_cleanup(mHandlers[i]);
+    }
   }
   delete[] mHandlers;
 
