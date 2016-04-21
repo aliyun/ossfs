@@ -114,7 +114,7 @@ function test_truncate_file {
 
 function test_truncate_empty_file {
     echo "Testing truncate empty file ..."
-    # Write a small test file
+    # Write an empty test file
     touch ${TEST_TEXT_FILE}
 
     # Truncate the file to 1024 length
