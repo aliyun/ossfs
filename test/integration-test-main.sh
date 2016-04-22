@@ -102,7 +102,7 @@ function test_truncate_file {
  
     # Truncate file to 0 length.  This should trigger open(path, O_RDWR | O_TRUNC...)
     : > ${TEST_TEXT_FILE}
-  
+
     # Verify file is zero length
     if [ -s ${TEST_TEXT_FILE} ]
     then
@@ -112,6 +112,24 @@ function test_truncate_file {
     rm_test_file
 }
 
+function test_truncate_empty_file {
+    echo "Testing truncate empty file ..."
+    # Write an empty test file
+    touch ${TEST_TEXT_FILE}
+
+    # Truncate the file to 1024 length
+    t_size=1024
+    truncate ${TEST_TEXT_FILE} -s $t_size
+
+    # Verify file is zero length
+    size=$(stat -c %s ${TEST_TEXT_FILE})
+    if [ $t_size -ne $size ]
+    then
+        echo "error: expected ${TEST_TEXT_FILE} to be $t_size length, got $size"
+        exit 1
+    fi
+    rm_test_file
+}
 
 function test_mv_file {
     echo "Testing mv file function ..."
@@ -450,6 +468,7 @@ function test_file_size_in_stat_cache {
 function run_all_tests {
     test_append_file
     test_truncate_file
+    test_truncate_empty_file
     test_mv_file
     test_mv_directory
     test_redirects
