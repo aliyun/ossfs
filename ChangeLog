@@ -1,6 +1,10 @@
 ﻿ChangeLog for OSSFS
 ------------------
 
+## v1.79.8 (4/222016)
+
+- Fix a bug when truncating an empty file (#27)
+
 ## v1.79.7 (4/19/2016)
 
 - Change object default permission to 777
