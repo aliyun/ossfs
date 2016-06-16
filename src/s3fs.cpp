@@ -97,7 +97,7 @@ std::string service_path          = "/";
 std::string host                  = "";
 std::string bucket                = "";
 std::string endpoint              = "us-east-1";
-s3fs_log_level debug_level        = S3FS_LOG_CRIT;
+s3fs_log_level debug_level        = S3FS_LOG_ERR;
 const char*    s3fs_log_nest[S3FS_LOG_NEST_MAX] = {"", "  ", "    ", "      "};
 
 //-------------------------------------------------------------------
@@ -3305,62 +3305,15 @@ static int s3fs_removexattr(const char* path, const char* name)
   return 0;
 }
    
-// s3fs_init calls this function to exit cleanly from the fuse event loop.
-//
-// There's no way to pass an exit status to the high-level event loop API, so 
-// this function stores the exit value in a global for main()
-static void s3fs_exit_fuseloop(int exit_status) {
-    S3FS_PRN_ERR("Exiting FUSE event loop due to errors\n");
-    s3fs_init_deferred_exit_status = exit_status;
-    struct fuse_context *ctx = fuse_get_context();
-    if (NULL != ctx) {
-        fuse_exit(ctx->fuse);
-    }
-}
-
 static void* s3fs_init(struct fuse_conn_info* conn)
 {
-  S3FS_PRN_CRIT("init v%s(commit:%s) with %s", VERSION, COMMIT_HASH_VAL, s3fs_crypt_lib_name());
-
-  // ssl init
-  if(!s3fs_init_global_ssl()){
-    S3FS_PRN_CRIT("could not initialize for ssl libraries.");
-    s3fs_exit_fuseloop(EXIT_FAILURE);
-	return NULL;
-  }
-
-  // init curl
-  if(!S3fsCurl::InitS3fsCurl("/etc/mime.types")){
-    S3FS_PRN_CRIT("Could not initiate curl library.");
-    s3fs_exit_fuseloop(EXIT_FAILURE);
-	return NULL;
-  }
-
-  if (create_bucket){
-    do_create_bucket();
-  }
-
-  // Check Bucket
-  // If the network is up, check for valid credentials and if the bucket
-  // exists. skip check if mounting a public bucket
-  if(!S3fsCurl::IsPublicBucket()){
-    int result;
-    if(EXIT_SUCCESS != (result = s3fs_check_service())){
-      s3fs_exit_fuseloop(result);
-	  return NULL;
-    }
-  }
-
   // Investigate system capabilities
   #ifndef __APPLE__
   if((unsigned int)conn->capable & FUSE_CAP_ATOMIC_O_TRUNC){
      conn->want |= FUSE_CAP_ATOMIC_O_TRUNC;
   }
   #endif
-  // cache
-  if(is_remove_cache && !FdManager::DeleteCacheDirectory()){
-    S3FS_PRN_DBG("Could not inilialize cache directory.");
-  }
+
   return NULL;
 }
 
@@ -4670,6 +4623,9 @@ int main(int argc, char* argv[])
   openlog("s3fs", LOG_PID | LOG_ODELAY | LOG_NOWAIT, LOG_USER);
   set_s3fs_log_level(debug_level);
 
+  // Announce self
+  S3FS_PRN_CRIT("init v%s(commit:%s) with %s", VERSION, COMMIT_HASH_VAL, s3fs_crypt_lib_name());
+
   // init xml2
   xmlInitParser();
   LIBXML_TEST_VERSION
@@ -4834,6 +4790,35 @@ int main(int argc, char* argv[])
     exit(EXIT_FAILURE);
   }
 
+  // Init global SSL
+  if(!s3fs_init_global_ssl()){
+    S3FS_PRN_EXIT("Could not initialize for ssl libraries.");
+    exit(EXIT_FAILURE);
+  }
+
+  // Init curl
+  if(!S3fsCurl::InitS3fsCurl("/etc/mime.types")){
+    S3FS_PRN_EXIT("Could not initialize curl library.");
+    exit(EXIT_FAILURE);
+  }
+
+  // Init OSS & check connectivity
+  if (create_bucket) {
+    do_create_bucket();
+  }
+
+  if(!S3fsCurl::IsPublicBucket()){
+    if(EXIT_SUCCESS != s3fs_check_service()) {
+      S3FS_PRN_EXIT("Check OSS service failed. Run with -f option for more details.");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  // Remove cache
+  if(is_remove_cache && !FdManager::DeleteCacheDirectory()){
+    S3FS_PRN_DBG("Could not inilialize cache directory.");
+  }
+
   s3fs_oper.getattr   = s3fs_getattr;
   s3fs_oper.readlink  = s3fs_readlink;
   s3fs_oper.mknod     = s3fs_mknod;
@@ -4871,11 +4856,6 @@ int main(int argc, char* argv[])
   s3fs_oper.getxattr    = s3fs_getxattr;
   s3fs_oper.listxattr   = s3fs_listxattr;
   s3fs_oper.removexattr = s3fs_removexattr;
-
-  if(!s3fs_init_global_ssl()){
-    S3FS_PRN_EXIT("could not initialize for ssl libraries.");
-    exit(EXIT_FAILURE);
-  }
 
   // set signal handler for debugging
   if(!set_s3fs_usr2_handler()){
