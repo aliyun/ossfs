@@ -26,7 +26,7 @@ ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
 - Ubuntu-14.04
 - CentOS-7.0/6.5/5.11
 
-请从[版本发布页面][releases]选择对应的安装包下载安装。
+请从[版本发布页面][releases]选择对应的安装包下载安装，建议选择最新版本。
 
 - 对于Ubuntu，安装命令为：
 
@@ -83,27 +83,26 @@ sudo make install
 注意这个文件的权限必须正确设置，建议设为640。
 
 ```
-echo your_bucket_name:your_key_id:your_key_secret > /etc/passwd-ossfs
+echo my-bucket:my-access-key-id:my-access-key-secret > /etc/passwd-ossfs
 chmod 640 /etc/passwd-ossfs
 ```
 
 将oss bucket mount到指定目录
 
 ```
-ossfs your_oss_bucket your_mount_dir -ourl=your_oss_service_url
+ossfs my-bucket my-mount-point -ourl=my-oss-endpoint
 ```
 
 #### 示例
 
-将ossfs这个bucket mount到/tmp/ossfs目录下，access key id是faint，
-access key secret是123，oss service url是
-`http://oss-cn-hangzhou.aliyuncs.com`
+将`my-bucket`这个bucket挂载到`/tmp/ossfs`目录下，AccessKeyId是`faint`，
+AccessKeySecret是`123`，oss endpoint是`http://oss-cn-hangzhou.aliyuncs.com`
 
 ```
-echo ossfs-fuse:faint:123 > /etc/passwd-ossfs
+echo my-bucket:faint:123 > /etc/passwd-ossfs
 chmod 640 /etc/passwd-ossfs
 mkdir /tmp/ossfs
-ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
+ossfs my-bucket /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
 
 #### 常用设置
@@ -112,7 +111,7 @@ ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 - 如果使用ossfs的机器是阿里云ECS，可以使用内网域名来**避免流量收费**和
   **提高速度**：
 
-        ossfs ossfs-fuse /tmp/ossfs -ourl=http://oss-cn-hangzhou-internal.aliyuncs.com
+        ossfs my-bucket /tmp/ossfs -ourl=http://oss-cn-hangzhou-internal.aliyuncs.com
 
 - 在linux系统中，[updatedb][updatedb]会定期地扫描文件系统，如果不想
   ossfs的挂载目录被扫描，可参考[FAQ][FAQ-updatedb]设置跳过挂载目录
