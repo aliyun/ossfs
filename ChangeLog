@@ -1,7 +1,11 @@
 ﻿ChangeLog for OSSFS
 ------------------
 
-## v1.79.8 (4/222016)
+## v1.79.9 (6/17/2016)
+
+- Print to stderr when check OSS fails (#31)
+
+## v1.79.8 (4/22/2016)
 
 - Fix a bug when truncating an empty file (#27)
 
