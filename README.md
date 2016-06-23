@@ -92,7 +92,6 @@ chmod 640 /etc/passwd-ossfs
 ```
 ossfs my-bucket my-mount-point -ourl=my-oss-endpoint
 ```
-
 #### 示例
 
 将`my-bucket`这个bucket挂载到`/tmp/ossfs`目录下，AccessKeyId是`faint`，
@@ -123,12 +122,31 @@ ossfs my-bucket /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
         bucket1:access_key_id1:access_key_secret1
         bucket2:access_key_id2:access_key_secret2
 
+- 生产环境中推荐使用[supervisor][supervisor]来启动并监控ossfs进程，使
+  用方法见[FAQ][faq-supervisor]
+
 #### 高级设置
 
 - 可以添加`-f -d`参数来让ossfs运行在前台并输出debug日志
 - 可以使用`-o kernel_cache`参数让ossfs能够利用文件系统的page cache，如
   果你有多台机器挂载到同一个bucket，并且要求强一致性，请**不要**使用此
   选项
+
+### 遇到错误
+
+遇到错误不要慌:) 按如下步骤进行排查：
+
+1. 如果有打印错误信息，尝试阅读并理解它
+2. 查看`/var/log/syslog`或者`/var/log/messages`中有无相关信息
+
+        grep 's3fs' /var/log/syslog
+        grep 'ossfs' /var/log/syslog
+
+3. 重新挂载ossfs，打开debug log：
+
+        ossfs ... -o dbglevel=debug -f -d > /tmp/fs.log 2>&1
+
+    然后重复你出错的操作，出错后将`/tmp/fs.log`保留，自己查看或者发给我
 
 ### 局限性
 
@@ -180,3 +198,5 @@ Licensed under the GNU GPL version 2
 [faq-updatedb]: https://github.com/aliyun/ossfs/wiki/FAQ
 [ecryptfs]: http://ecryptfs.org/
 [xattr]: http://man7.org/linux/man-pages/man7/xattr.7.html
+[supervisor]: http://supervisord.org/
+[faq-supervisor]: https://github.com/aliyun/ossfs/wiki/FAQ#18
