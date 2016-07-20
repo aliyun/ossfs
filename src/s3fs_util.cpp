@@ -729,11 +729,7 @@ mode_t get_mode(headers_t& meta, const char* path, bool checkdir, bool forcedir)
             if(strConType == "application/x-directory"){
               mode |= S_IFDIR;
             }else if(path && 0 < strlen(path) && '/' == path[strlen(path) - 1]){
-              if(strConType == "binary/octet-stream" || strConType == "application/octet-stream"){
-                mode |= S_IFDIR;
-              }else{
-                mode |= S_IFREG;
-              }
+              mode |= S_IFDIR;
             }else{
               mode |= S_IFREG;
             }
