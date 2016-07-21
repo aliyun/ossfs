@@ -104,6 +104,13 @@ mkdir /tmp/ossfs
 ossfs my-bucket /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
 
+卸载bucket:
+
+```bash
+umount /tmp/ossfs # root user
+fusermount -u /tmp/ossfs # non-root user
+```
+
 #### 常用设置
 
 - 使用`ossfs --version`来查看当前版本，使用`ossfs -h`来查看可用的参数
