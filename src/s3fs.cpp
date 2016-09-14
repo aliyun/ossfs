@@ -4230,6 +4230,11 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       noxattr = true;
       return 0;
     }
+    if(0 == STR2NCMP(arg, "thread_num=")){
+      int numThread = static_cast<int>(s3fs_strtoofft(strchr(arg, '=') + sizeof(char)));
+      S3fsCurl::SetThreadNum(numThread);
+      return 0;
+    }
     // old format for storage_class
     if(0 == strcmp(arg, "use_rrs") || 0 == STR2NCMP(arg, "use_rrs=")){
       off_t rrs = 1;

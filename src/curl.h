@@ -21,6 +21,15 @@
 #define S3FS_CURL_H_
 
 #include <cassert>
+#include <vector>
+#include <deque>
+#include <tr1/memory>
+#include <tr1/functional>
+
+extern "C" {
+#include <semaphore.h>
+#include <pthread.h>
+}
 
 //----------------------------------------------
 // Symbols
@@ -152,6 +161,172 @@ private:
 };
 
 //----------------------------------------------
+// class Notifier
+//----------------------------------------------
+class Notifier
+{
+public:
+    Notifier()
+    {
+	const int kValue = 0;
+        int r = sem_init(&mSem, 0, kValue);
+        assert(r == 0);
+    }
+
+    ~Notifier()
+    {
+        int r = sem_destroy(&mSem);
+        assert(r == 0);
+    }
+
+    void Wait()
+    {
+        int r = sem_wait(&mSem);
+        assert(r == 0);
+    }
+
+    void Notify()
+    {
+        int r = sem_post(&mSem);
+        assert(r == 0);
+    }
+
+private:
+    sem_t mSem;
+};
+
+typedef std::tr1::shared_ptr<Notifier> NotifierPtr;
+
+//----------------------------------------------
+// class Mutex
+//----------------------------------------------
+class Mutex
+{
+public:
+    Mutex(): mMutex()
+    {
+        int r = pthread_mutex_init(&mMutex, NULL);
+	assert(r == 0);
+    }
+
+    ~Mutex()
+    {
+        int r = pthread_mutex_destroy(&mMutex);
+        assert(r == 0);
+    }
+
+    void Lock()
+    {
+        int r = pthread_mutex_lock(&mMutex);
+        assert(r == 0);
+    }
+
+    void Unlock()
+    {
+        int r = pthread_mutex_unlock(&mMutex);
+        assert(r == 0);
+    }
+
+private:
+    pthread_mutex_t mMutex;
+};
+
+//----------------------------------------------
+// class ScopedLock
+//----------------------------------------------
+class ScopedLock
+{
+public:
+    ScopedLock(Mutex* mutex): mMutex(mutex)
+    {
+        mMutex->Lock();
+    }
+
+    ~ScopedLock()
+    {
+        mMutex->Unlock();
+    }
+
+private:
+    Mutex* mMutex;
+};
+
+//----------------------------------------------
+// class MessageQueue
+//----------------------------------------------
+template <typename T>
+class MessageQueue
+{
+public:
+    MessageQueue() {}
+
+    void Enqueue(const T& item)
+    {
+        {
+            ScopedLock lock(&mMutex);
+            mQueue.push_back(item);
+        }
+        mNotifier.Notify();
+    }
+
+    T Dequeue()
+    {
+        mNotifier.Wait();
+
+        ScopedLock lock(&mMutex);
+        T item = mQueue.front();
+        mQueue.pop_front();
+        return item;
+    }
+
+private:
+    Notifier mNotifier;
+    Mutex mMutex;
+    std::deque<T> mQueue;
+};
+
+class S3fsCurl;
+
+//----------------------------------------------
+// class ThreadPool
+//----------------------------------------------
+class ThreadPool
+{
+public:
+    typedef std::tr1::function<void ()> FuncT;
+
+    ThreadPool(int numThreads)
+        : mNumThreads(numThreads)
+    {
+        assert(numThreads > 0);
+    }
+
+    bool Init();
+    bool Destroy();
+
+    void Enqueue(const FuncT& func);
+
+    static void* HelperFunc(void* context);
+
+private:
+    struct Item {
+	bool mExit;
+	FuncT mFunc;
+
+        Item(): mExit(false) {}
+        Item(const FuncT& func): mExit(false), mFunc(func) {}
+        Item(bool e): mExit(e) {}
+    };
+
+    void DoWork();
+
+private:
+    int mNumThreads;
+    std::vector<pthread_t> mThreads;
+    MessageQueue<Item> mQueue;
+};
+
+//----------------------------------------------
 // class S3fsCurl
 //----------------------------------------------
 typedef std::map<std::string, std::string> ramcredmap_t;
@@ -209,6 +384,8 @@ class S3fsCurl
     static bool             is_initglobal_done;
     static CurlHandlerPool* sCurlPool;
     static int              sCurlPoolSize;
+    static ThreadPool*      sThreadPool;
+    static int              sThreadPoolSize;
     static CURLSH*          hCurlShare;
     static bool             is_cert_check;
     static bool             is_dns_cache;
@@ -310,6 +487,8 @@ class S3fsCurl
     bool GetUploadId(std::string& upload_id);
     int GetRAMCredentials(void);
 
+    void UploadSinglePart(const char* path, std::string& uploadID, size_t part,
+                          const NotifierPtr& notifier, std::string* etag);
     int UploadMultipartPostSetup(const char* tpath, int part_num, std::string& upload_id);
     int CopyMultipartPostRequest(const char* from, const char* to, int part_num, std::string& upload_id, headers_t& meta);
 
@@ -367,6 +546,7 @@ class S3fsCurl
     static off_t GetMultipartSize(void) { return S3fsCurl::multipart_size; }
     static bool SetSignatureV4(bool isset) { bool bresult = S3fsCurl::is_sigv4; S3fsCurl::is_sigv4 = isset; return bresult; }
     static bool IsSignatureV4(void) { return S3fsCurl::is_sigv4; }
+    static void SetThreadNum(int numThread) { sThreadPoolSize = numThread; }
 
     // methods
     bool CreateCurlHandle(bool force = false);
