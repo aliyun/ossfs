@@ -313,7 +313,7 @@ void ThreadPool::DoWork()
 
 void* ThreadPool::HelperFunc(void* context)
 {
-    ((ThreadPool*)context)->DoWork();
+    static_cast<ThreadPool*>(context)->DoWork();
     return NULL;
 }
 
@@ -1154,64 +1154,6 @@ int S3fsCurl::SetMaxParallelCount(int value)
   int old = S3fsCurl::max_parallel_cnt;
   S3fsCurl::max_parallel_cnt = value;
   return old;
-}
-
-bool S3fsCurl::UploadMultipartPostCallback(S3fsCurl* s3fscurl)
-{
-  if(!s3fscurl){
-    return false;
-  }
-  // check etag(md5);
-  // XXX oss etag requires upper case.
-  if(NULL == strstr(s3fscurl->headdata->str(), upper(s3fscurl->partdata.etag).c_str())){
-    return false;
-  }
-  s3fscurl->partdata.etaglist->at(s3fscurl->partdata.etagpos).assign(s3fscurl->partdata.etag);
-  s3fscurl->partdata.uploaded = true;
-
-  return true;
-}
-
-S3fsCurl* S3fsCurl::UploadMultipartPostRetryCallback(S3fsCurl* s3fscurl)
-{
-  if(!s3fscurl){
-    return NULL;
-  }
-  // parse and get part_num, upload_id.
-  string upload_id;
-  string part_num_str;
-  int    part_num;
-  if(!get_keyword_value(s3fscurl->url, "uploadId", upload_id)){
-    return NULL;
-  }
-  if(!get_keyword_value(s3fscurl->url, "partNumber", part_num_str)){
-    return NULL;
-  }
-  part_num = atoi(part_num_str.c_str());
-
-  if(s3fscurl->retry_count >= S3fsCurl::retries){
-    S3FS_PRN_ERR("Over retry count(%d) limit(%s:%d).", s3fscurl->retry_count, s3fscurl->path.c_str(), part_num);
-    return NULL;
-  }
-
-  // duplicate request
-  S3fsCurl* newcurl            = new S3fsCurl(s3fscurl->IsUseAhbe());
-  newcurl->partdata.etaglist   = s3fscurl->partdata.etaglist;
-  newcurl->partdata.etagpos    = s3fscurl->partdata.etagpos;
-  newcurl->partdata.fd         = s3fscurl->partdata.fd;
-  newcurl->partdata.startpos   = s3fscurl->b_partdata_startpos;
-  newcurl->partdata.size       = s3fscurl->b_partdata_size;
-  newcurl->b_partdata_startpos = s3fscurl->b_partdata_startpos;
-  newcurl->b_partdata_size     = s3fscurl->b_partdata_size;
-  newcurl->retry_count         = s3fscurl->retry_count + 1;
-
-  // setup new curl object
-  if(0 != newcurl->UploadMultipartPostSetup(s3fscurl->path.c_str(), part_num, upload_id)){
-    S3FS_PRN_ERR("Could not duplicate curl object(%s:%d).", s3fscurl->path.c_str(), part_num);
-    delete newcurl;
-    return NULL;
-  }
-  return newcurl;
 }
 
 typedef tr1::shared_ptr<S3fsCurl> S3fsCurlPtr;

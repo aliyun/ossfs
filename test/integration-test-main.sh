@@ -268,13 +268,14 @@ function test_chmod {
 
 function test_chown {
     echo "Testing chown file function ..."
+    id
 
     # create the test file again
     mk_test_file
 
     ORIGINAL_PERMISSIONS=$(stat --format=%u:%g $TEST_TEXT_FILE)
 
-    chown 1000:1000 $TEST_TEXT_FILE;
+    chown 1234:1234 $TEST_TEXT_FILE;
 
     # if they're the same, we have a problem.
     if [ $(stat --format=%u:%g $TEST_TEXT_FILE) == $ORIGINAL_PERMISSIONS ]
