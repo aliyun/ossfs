@@ -99,7 +99,7 @@ function test_truncate_file {
     echo "Testing truncate file ..."
     # Write a small test file
     echo "${TEST_TEXT}" > ${TEST_TEXT_FILE}
- 
+
     # Truncate file to 0 length.  This should trigger open(path, O_RDWR | O_TRUNC...)
     : > ${TEST_TEXT_FILE}
 
@@ -269,12 +269,15 @@ function test_chmod {
 function test_chown {
     echo "Testing chown file function ..."
 
+    # show current user id
+    id
+
     # create the test file again
     mk_test_file
 
     ORIGINAL_PERMISSIONS=$(stat --format=%u:%g $TEST_TEXT_FILE)
 
-    chown 1000:1000 $TEST_TEXT_FILE;
+    chown 1234:1234 $TEST_TEXT_FILE;
 
     # if they're the same, we have a problem.
     if [ $(stat --format=%u:%g $TEST_TEXT_FILE) == $ORIGINAL_PERMISSIONS ]
