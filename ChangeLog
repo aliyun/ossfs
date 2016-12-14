@@ -1,6 +1,10 @@
 ﻿ChangeLog for OSSFS
 ------------------
 
+## v1.80.0 (12/14/2016)
+
+- Relax dir object content-type (#34)
+
 ## v1.79.9 (6/17/2016)
 
 - Print to stderr when check OSS fails (#31)
