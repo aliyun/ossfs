@@ -27,9 +27,11 @@ docker_images = {
     'centos7.0:test':'reg.docker.alibaba-inc.com/ossfs-centos7.0:test',
     'ubuntu14.04:dev':'reg.docker.alibaba-inc.com/ossfs-ubuntu14.04:dev',
     'ubuntu14.04:test':'reg.docker.alibaba-inc.com/ossfs-ubuntu14.04:test',
+    'ubuntu16.04:dev':'reg.docker.alibaba-inc.com/xuensheng/ossfs-ubuntu16.04:dev',
+    'ubuntu16.04:test':'reg.docker.alibaba-inc.com/xuensheng/ossfs-ubuntu16.04:test',
 }
 
-os_list = ['centos5.11', 'centos6.5', 'centos7.0', 'ubuntu14.04']
+os_list = ['centos5.11', 'centos6.5', 'centos7.0', 'ubuntu14.04', 'ubuntu16.04']
 working_dir = '/tmp/ossfs'
 dest_dir = '/var/ossfs'
 ossfs_source_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -134,7 +136,7 @@ def command_build_package_centos5():
     f.write('source ~/.bashrc\n')
     f.write('export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/lib64/pkgconfig/\n')
     command_build_package(f, install_dir)
-    f.write('fpm -s dir -t rpm -n ossfs -v %s -C %s -p ossfs_VERSION_centos5.11_ARCH.rpm  -d "curl-devel" -d "libxml2 >= 2.6" -d "openssl-devel >= 0.9" --after-install /root/post_action.sh --after-upgrade /root/post_action.sh' % (ossfs_version, install_dir))
+    f.write('fpm -s dir -t rpm -n ossfs -v %s -C %s -p ossfs_VERSION_centos5.11_ARCH.rpm  -d "curl-devel" -d "libxml2 >= 2.6" -d "openssl >= 0.9" --after-install /root/post_action.sh --after-upgrade /root/post_action.sh' % (ossfs_version, install_dir))
     f.close()
 
 def command_test_package_centos5():
@@ -164,7 +166,7 @@ def command_build_package_centos65():
     f.write('#!/bin/bash\n')
     f.write('export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/lib64/pkgconfig/\n')
     command_build_package(f, install_dir)
-    f.write('fpm -s dir -t rpm -n ossfs -v %s -C %s -p ossfs_VERSION_centos6.5_ARCH.rpm  -d "libcurl >= 7.0" -d "libxml2 >= 2.6" -d "openssl-devel >= 0.9" --after-install /root/post_action.sh --after-upgrade /root/post_action.sh' % (ossfs_version, install_dir))
+    f.write('fpm -s dir -t rpm -n ossfs -v %s -C %s -p ossfs_VERSION_centos6.5_ARCH.rpm  -d "libcurl >= 7.0" -d "libxml2 >= 2.6" -d "openssl >= 0.9" --after-install /root/post_action.sh --after-upgrade /root/post_action.sh' % (ossfs_version, install_dir))
     f.close()
 
 def command_test_package_centos65():
@@ -212,29 +214,29 @@ def command_test_package_centos70():
     command_test_package(f)
     f.close()
 
-def command_build_package_ubuntu1404():
+def command_build_package_ubuntu(version):
     """
     Generate the build package script running in docker container
     """
     cmd_dir = os.path.join(working_dir, 'command')
     install_dir = '/tmp/ossfs_install'
-    f = open(os.path.join(cmd_dir, 'build_package_ubuntu1404.sh'), 'w')
+    f = open(os.path.join(cmd_dir, 'build_package_%s.sh' % version), 'w')
     f.write('#!/bin/bash\n')
     command_build_package(f, install_dir)
-    f.write('fpm -s dir -t deb -n ossfs -v %s -C %s -p ossfs_VERSION_ubuntu14.04_ARCH.deb -d "fuse >= 2.8.4" -d "libcurl3-gnutls >= 7.0" -d "libxml2 >= 2.6" -d "libssl-dev >= 0.9"\n' % (ossfs_version, install_dir))
+    f.write('fpm -s dir -t deb -n ossfs -v %s -C %s -p ossfs_VERSION_%s_ARCH.deb -d "fuse >= 2.8.4" -d "libcurl3-gnutls >= 7.0" -d "libxml2 >= 2.6" -d "libssl-dev >= 0.9"\n' % (ossfs_version, install_dir, version))
     f.close()
 
-def command_test_package_ubuntu1404():
+def command_test_package_ubuntu(version):
     """
     Generate the test package script running in docker container
     """
-    pkg_list = glob.glob(os.path.join(working_dir, 'package/*ubuntu14.04*'))
+    pkg_list = glob.glob(os.path.join(working_dir, 'package/*%s*' % version))
     if not pkg_list:
-        raise RuntimeError("Can not found ubuntu14.04 package! May be build fail?")
+        raise RuntimeError("Can not found %s package! May be build fail?" % version)
     pkg = ntpath.basename(pkg_list[0])
     cmd_dir = os.path.join(working_dir, 'command')
     test_dir = os.path.join(dest_dir, 'source/test')
-    f = open(os.path.join(cmd_dir, 'test_package_ubuntu1404.sh'), 'w')
+    f = open(os.path.join(cmd_dir, 'test_package_%s.sh' % version), 'w')
     f.write('#!/bin/bash\n')
     f.write('gdebi -n %s/package/%s\n' % (dest_dir,pkg))
     command_test_package(f)
@@ -300,17 +302,33 @@ def build_package():
             print "============================="
             print "build ubuntu14.04 package ..."
             print "============================="
-            command_build_package_ubuntu1404()
+            command_build_package_ubuntu(os_name)
             container_name = 'ossfs_%s'%random_string(5)
-            docker_run(container_name, dev_image, volumes, '/bin/bash %s/command/build_package_ubuntu1404.sh'%dest_dir)
+            docker_run(container_name, dev_image, volumes, '/bin/bash %s/command/build_package_ubuntu14.04.sh'%dest_dir)
 
             # test package
             print "============================"
             print "test ubuntu14.04 package ..."
             print "============================"
-            command_test_package_ubuntu1404()
+            command_test_package_ubuntu(os_name)
             container_name = 'ossfs_%s'%random_string(5)
-            docker_run(container_name, test_image, volumes, '/bin/bash %s/command/test_package_ubuntu1404.sh'%dest_dir)
+            docker_run(container_name, test_image, volumes, '/bin/bash %s/command/test_package_ubuntu14.04.sh'%dest_dir)
+        elif os_name == 'ubuntu16.04':
+            # build package
+            print "============================="
+            print "build ubuntu16.04 package ..."
+            print "============================="
+            command_build_package_ubuntu(os_name)
+            container_name = 'ossfs_%s'%random_string(5)
+            docker_run(container_name, dev_image, volumes, '/bin/bash %s/command/build_package_ubuntu16.04.sh'%dest_dir)
+
+            # test package
+            print "============================"
+            print "test ubuntu16.04 package ..."
+            print "============================"
+            command_test_package_ubuntu(os_name)
+            container_name = 'ossfs_%s'%random_string(5)
+            docker_run(container_name, test_image, volumes, '/bin/bash %s/command/test_package_ubuntu16.04.sh'%dest_dir)
 
 if __name__ == '__main__':
     build_package()
