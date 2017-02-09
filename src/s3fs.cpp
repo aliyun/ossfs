@@ -656,7 +656,7 @@ static int check_parent_object_access(const char* path, int mask)
 
   S3FS_PRN_DBG("[path=%s]", path);
 
-  if(path == NULL || 0 == strcmp(path, "/") || 0 == strcmp(path, ".")){
+  if(0 == strcmp(path, "/") || 0 == strcmp(path, ".")){
     // path is mount point.
     return 0;
   }
@@ -2125,6 +2125,11 @@ static int s3fs_flush(const char* path, struct fuse_file_info* fi)
   int result;
 
   S3FS_PRN_INFO("[path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
+
+  if (path == NULL) {
+      S3FS_PRN_WARN("Path is null");
+      return 0;
+  }
 
   int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK);
   if(0 != (result = check_parent_object_access(path, X_OK))){
