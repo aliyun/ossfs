@@ -3641,7 +3641,7 @@ static int s3fs_check_service(void)
 
   // At first time for access S3, we check RAM role if it sets.
   if(!S3fsCurl::CheckRAMCredentialUpdate()){
-    S3FS_PRN_CRIT("Failed to check RAM role name(%s).", S3fsCurl::GetRAMRole());
+    S3FS_PRN_EXIT("Failed to check RAM role name(%s). Please contact Aliyun OSS support.", S3fsCurl::GetRAMRole());
     return EXIT_FAILURE;
   }
 
@@ -3683,25 +3683,31 @@ static int s3fs_check_service(void)
     // check errors(after retrying)
     if(0 > res && responseCode != 200 && responseCode != 301){
       if(responseCode == 400){
-        S3FS_PRN_CRIT("Bad Request - result of checking service.");
+        S3FS_PRN_EXIT("bad request");
         return EXIT_FAILURE;
       }
       if(responseCode == 403){
-        S3FS_PRN_CRIT("invalid credentials - result of checking service.");
+        S3FS_PRN_EXIT("invalid credentials");
         return EXIT_FAILURE;
       }
       if(responseCode == 404){
-        S3FS_PRN_CRIT("bucket not found - result of checking service.");
+        S3FS_PRN_EXIT("bucket does not exist");
         return EXIT_FAILURE;
       }
       // unable to connect
       if(responseCode == CURLE_OPERATION_TIMEDOUT){
-        S3FS_PRN_CRIT("unable to connect bucket and timeout - result of checking service.");
+        S3FS_PRN_CRIT("connection timeout");
+        return EXIT_FAILURE;
+      }
+	  // could not resolve host
+      if(responseCode == CURLE_COULDNT_RESOLVE_HOST) {
+        S3FS_PRN_EXIT("could not resolve host. Please check your url.");
         return EXIT_FAILURE;
       }
 
       // another error
-      S3FS_PRN_CRIT("unable to connect - result of checking service.");
+      //S3FS_PRN_CRIT("unable to connect - result of checking service.");
+      S3FS_PRN_EXIT("unable to connect the url. If you use IP, please try to add option '-o use_path_request_style'");
       return EXIT_FAILURE;
     }
   }
@@ -3709,7 +3715,7 @@ static int s3fs_check_service(void)
   // make sure remote mountpath exists and is a directory
   if(mount_prefix.size() > 0){
     if(remote_mountpath_exists(mount_prefix.c_str()) != 0){
-      S3FS_PRN_CRIT("remote mountpath %s not found.", mount_prefix.c_str());
+      S3FS_PRN_EXIT("remote mountpath %s not found.", mount_prefix.c_str());
       return EXIT_FAILURE;
     }
   }
@@ -3720,7 +3726,7 @@ static int s3fs_check_service(void)
 
 // Return:  1 - OK(could read and set accesskey etc.)
 //          0 - NG(could not read)
-//         -1 - Should shoutdown immidiatly
+//         -1 - Should shoutdown immediately
 static int check_for_oss_format(void)
 {
   size_t first_pos = string::npos;
@@ -3866,6 +3872,7 @@ static int read_passwd_file(void)
   size_t first_pos = string::npos;
   size_t last_pos = string::npos;
   bool default_found = 0;
+  bool bucket_found = false;
   int oss_format;
 
   // if you got here, the password file
@@ -3946,9 +3953,15 @@ static int read_passwd_file(void)
           S3FS_PRN_EXIT("if one access key is specified, both keys need to be specified.");
           return EXIT_FAILURE;
         }
+		bucket_found = true;
         break;
       }
     }
+
+	if (!bucket_found) {
+      S3FS_PRN_EXIT("your password file has no such bucket. Please check the bucket name.");
+      return EXIT_FAILURE;
+	}
   }
   return EXIT_SUCCESS;
 }
@@ -4746,7 +4759,7 @@ int main(int argc, char* argv[])
       exit(EXIT_FAILURE);
     }
     if(!S3fsCurl::IsSetAccessKeyId()){
-      S3FS_PRN_EXIT("could not establish security credentials, check documentation.");
+      S3FS_PRN_EXIT("credentials not set. Please check your password file.");
       exit(EXIT_FAILURE);
     }
     // More error checking on the access key pair can be done
@@ -4814,7 +4827,7 @@ int main(int argc, char* argv[])
 
   if(!S3fsCurl::IsPublicBucket()){
     if(EXIT_SUCCESS != s3fs_check_service()) {
-      S3FS_PRN_EXIT("Check OSS service failed. Run with -f option for more details.");
+      //S3FS_PRN_EXIT("Check OSS service failed. Run with -f option for more details.");
       exit(EXIT_FAILURE);
     }
   }
