@@ -3650,6 +3650,8 @@ static int s3fs_check_service(void)
   if(0 > (res = s3fscurl.CheckBucket())){
     // get response code
     long responseCode = s3fscurl.GetLastResponseCode();
+    CURLcode curlCode = s3fscurl.GetCurlCode();
+    S3FS_PRN_CRIT("res = %d, curlCode = %ld", res, curlCode);
 
     // check wrong endpoint, and automatically switch endpoint
     if(responseCode == 400 && !is_specified_endpoint){
@@ -3683,7 +3685,8 @@ static int s3fs_check_service(void)
     // check errors(after retrying)
     if(0 > res && responseCode != 200 && responseCode != 301){
       if(responseCode == 400){
-        S3FS_PRN_EXIT("bad request");
+        BodyData* body = s3fscurl.GetBodyData();
+        S3FS_PRN_EXIT("bad request\n\n%s", body? body->str() : "");
         return EXIT_FAILURE;
       }
       if(responseCode == 403){
@@ -3691,23 +3694,23 @@ static int s3fs_check_service(void)
         return EXIT_FAILURE;
       }
       if(responseCode == 404){
-        S3FS_PRN_EXIT("bucket does not exist");
+        S3FS_PRN_EXIT("bucket '%s' does not exist", bucket.c_str());
         return EXIT_FAILURE;
       }
       // unable to connect
-      if(responseCode == CURLE_OPERATION_TIMEDOUT){
+      if(curlCode == CURLE_OPERATION_TIMEDOUT){
         S3FS_PRN_CRIT("connection timeout");
         return EXIT_FAILURE;
       }
+
 	  // could not resolve host
-      if(responseCode == CURLE_COULDNT_RESOLVE_HOST) {
-        S3FS_PRN_EXIT("could not resolve host. Please check your url.");
+      if(curlCode == CURLE_COULDNT_RESOLVE_HOST) {
+        S3FS_PRN_EXIT("could not resolve host '%s'. If you use IP, please try to add option '-o use_path_reqeust_style'", host.c_str());
         return EXIT_FAILURE;
       }
 
       // another error
-      //S3FS_PRN_CRIT("unable to connect - result of checking service.");
-      S3FS_PRN_EXIT("unable to connect the url. If you use IP, please try to add option '-o use_path_request_style'");
+      S3FS_PRN_EXIT("unable to connect url '%s'", host.c_str());
       return EXIT_FAILURE;
     }
   }
@@ -3959,7 +3962,7 @@ static int read_passwd_file(void)
     }
 
 	if (!bucket_found) {
-      S3FS_PRN_EXIT("your password file has no such bucket. Please check the bucket name.");
+      S3FS_PRN_EXIT("your password file has no bucket '%s'. Please check the bucket name.", bucket.c_str());
       return EXIT_FAILURE;
 	}
   }
