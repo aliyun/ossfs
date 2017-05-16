@@ -1,6 +1,11 @@
 ﻿ChangeLog for OSSFS
 ------------------
 
+## v1.80.1 (05/16/2017)
+
+- Fix noobj cache bug
+- Fix null path in flush
+
 ## v1.80.0 (12/14/2016)
 
 - Relax dir object content-type (#34)
