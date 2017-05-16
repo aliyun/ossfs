@@ -144,6 +144,8 @@ bool StatCache::GetStat(string& key, struct stat* pst, headers_t* meta, bool ove
 
   if(iter != stat_cache.end() && (*iter).second){
     stat_cache_entry* ent = (*iter).second;
+    S3FS_PRN_DBG("stat cache [path=%s][time=%jd][hit count=%lu][noobj=%d][now=%jd]",
+      strpath.c_str(), (intmax_t)(ent->cache_date), ent->hit_count, ent->noobjcache, time(NULL));
     if(!IsExpireTime|| (ent->cache_date + ExpireTime) >= time(NULL)){
       if(ent->noobjcache){
         pthread_mutex_unlock(&StatCache::stat_cache_lock);
@@ -180,7 +182,8 @@ bool StatCache::GetStat(string& key, struct stat* pst, headers_t* meta, bool ove
           (*pisforce) = ent->isforce;
         }
         ent->hit_count++;
-        ent->cache_date = time(NULL);
+        if(!IsExpireTime)
+            ent->cache_date = time(NULL);
         pthread_mutex_unlock(&StatCache::stat_cache_lock);
         return true;
       }
@@ -223,7 +226,8 @@ bool StatCache::IsNoObjectCache(string& key, bool overcheck)
     if(!IsExpireTime|| ((*iter).second->cache_date + ExpireTime) >= time(NULL)){
       if((*iter).second->noobjcache){
         // noobjcache = true means no object.
-        (*iter).second->cache_date = time(NULL);
+        if(!IsExpireTime)
+            (*iter).second->cache_date = time(NULL);
         pthread_mutex_unlock(&StatCache::stat_cache_lock);
         return true;
       }
