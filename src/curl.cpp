@@ -1798,6 +1798,7 @@ int S3fsCurl::RequestPerform(void)
 	//curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&responseHeaders); 
 	//curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback); 
     CURLcode curlCode = curl_easy_perform(hCurl);
+	SetCurlCode(curlCode);
 
     // Check result
     switch(curlCode){

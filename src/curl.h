@@ -251,6 +251,7 @@ class S3fsCurl
     BodyData*            bodydata;             // body data by WriteMemoryCallback
     BodyData*            headdata;             // header data by WriteMemoryCallback
     long                 LastResponseCode;
+    CURLcode             CurlCode;
     const unsigned char* postdata;             // use by post method and read callback function.
     int                  postdata_remaining;   // use by post method and read callback function.
     filepart             partdata;             // use by multipart upload/get object callback
@@ -375,6 +376,8 @@ class S3fsCurl
     bool AddSseRequestHead(sse_type_t ssetype, std::string& ssevalue, bool is_only_c, bool is_copy);
     bool GetResponseCode(long& responseCode);
     int RequestPerform(void);
+    void SetCurlCode(CURLcode code) { CurlCode = code; }
+    CURLcode GetCurlCode(void) { return CurlCode; }
     int DeleteRequest(const char* tpath);
     bool PreHeadRequest(const char* tpath, const char* bpath = NULL, const char* savedpath = NULL, int ssekey_pos = -1);
     bool PreHeadRequest(std::string& tpath, std::string& bpath, std::string& savedpath, int ssekey_pos = -1) {
