@@ -3690,16 +3690,18 @@ static int s3fs_check_service(void)
         return EXIT_FAILURE;
       }
       if(responseCode == 403){
-        S3FS_PRN_EXIT("invalid credentials");
+        BodyData* body = s3fscurl.GetBodyData();
+        S3FS_PRN_EXIT("invalid credentials\n\n%s", body? body->str() : "");
         return EXIT_FAILURE;
       }
       if(responseCode == 404){
-        S3FS_PRN_EXIT("bucket '%s' does not exist", bucket.c_str());
+        BodyData* body = s3fscurl.GetBodyData();
+        S3FS_PRN_EXIT("bucket '%s' does not exist\n\n%s", bucket.c_str(), body? body->str() : "");
         return EXIT_FAILURE;
       }
       // unable to connect
       if(curlCode == CURLE_OPERATION_TIMEDOUT){
-        S3FS_PRN_CRIT("connection timeout");
+        S3FS_PRN_CRIT("connection timeout: %s", host.c_str());
         return EXIT_FAILURE;
       }
 
