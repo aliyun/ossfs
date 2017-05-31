@@ -2491,8 +2491,12 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     // reset(initialize) curl object
     s3fscurl.DestroyCurlHandle();
 
-    if (check_content_only)
-      break;
+    if (check_content_only) {
+	  if (!head.IsEmpty()) {
+		  break;
+	  }
+	  query_maxkey = "max-keys=1000";
+	}
   }
   S3FS_MALLOCTRIM(0);
 
