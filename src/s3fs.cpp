@@ -2433,7 +2433,7 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     query_prefix += urlEncode(s3_realpath.substr(1));
   }
   if (check_content_only){
-    query_maxkey += "max-keys=1";
+    query_maxkey += "max-keys=2";
   }else{
     query_maxkey += "max-keys=1000";
   }
@@ -2491,12 +2491,8 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     // reset(initialize) curl object
     s3fscurl.DestroyCurlHandle();
 
-    if (check_content_only) {
-	  if (!head.IsEmpty()) {
-		  break;
-	  }
-	  query_maxkey = "max-keys=1000";
-	}
+    if (check_content_only)
+      break;
   }
   S3FS_MALLOCTRIM(0);
 
