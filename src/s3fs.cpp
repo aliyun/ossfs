@@ -2433,7 +2433,7 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     query_prefix += urlEncode(s3_realpath.substr(1));
   }
   if (check_content_only){
-    query_maxkey += "max-keys=1";
+    query_maxkey += "max-keys=2";
   }else{
     query_maxkey += "max-keys=1000";
   }
