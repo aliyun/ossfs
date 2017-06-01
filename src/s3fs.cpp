@@ -3651,7 +3651,6 @@ static int s3fs_check_service(void)
     // get response code
     long responseCode = s3fscurl.GetLastResponseCode();
     CURLcode curlCode = s3fscurl.GetCurlCode();
-    S3FS_PRN_CRIT("res = %d, curlCode = %ld", res, curlCode);
 
     // check wrong endpoint, and automatically switch endpoint
     if(responseCode == 400 && !is_specified_endpoint){
