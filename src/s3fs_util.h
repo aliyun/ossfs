@@ -113,19 +113,19 @@ bool check_exist_dir_permission(const char* dirpath);
 bool delete_files_in_dir(const char* dir, bool is_remove_own);
 
 time_t get_mtime(const char *s);
-time_t get_mtime(headers_t& meta, bool overcheck = true);
+time_t get_mtime(const headers_t& meta, bool overcheck = true);
 off_t get_size(const char *s);
-off_t get_size(headers_t& meta);
+off_t get_size(const headers_t& meta);
 mode_t get_mode(const char *s);
-mode_t get_mode(headers_t& meta, const char* path = NULL, bool checkdir = false, bool forcedir = false);
+mode_t get_mode(const headers_t& meta, const char* path = NULL, bool checkdir = false, bool forcedir = false);
 uid_t get_uid(const char *s);
-uid_t get_uid(headers_t& meta);
+uid_t get_uid(const headers_t& meta);
 gid_t get_gid(const char *s);
-gid_t get_gid(headers_t& meta);
+gid_t get_gid(const headers_t& meta);
 blkcnt_t get_blocks(off_t size);
 time_t cvtRAMExpireStringToTime(const char* s);
 time_t get_lastmodified(const char* s);
-time_t get_lastmodified(headers_t& meta);
+time_t get_lastmodified(const headers_t& meta);
 bool is_need_check_obj_detail(headers_t& meta);
 
 void show_usage(void);

@@ -427,11 +427,39 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
     (*pisforce) = false;
   }
   if(StatCache::getStatCacheData()->GetStat(strpath, pstat, pheader, overcheck, pisforce)){
+	S3FS_PRN_DBG("[path=%s] stat cache hit", path);
     return 0;
   }
   if(StatCache::getStatCacheData()->IsNoObjectCache(strpath)){
     // there is the path in the cache for no object, it is no object.
+	S3FS_PRN_DBG("[path=%s] does not exist", path);
     return -ENOENT;
+  }
+
+  FdEntity* ent;
+  if(NULL != (ent = FdManager::get()->ExistOpen(path, -1, true))) {
+    struct stat tmp_st;
+	memset(pstat, 0, sizeof(struct stat));
+	if(!convert_header_to_stat(strpath.c_str(), ent->GetMeta(), pstat, forcedir)){
+      S3FS_PRN_ERR("failed convert headers to stat[path=%s]", strpath.c_str());
+      return -ENOENT;
+	}
+    if(ent->GetStats(tmp_st)) {
+      pstat->st_size = tmp_st.st_size;
+    }
+
+    pstat->st_blksize = 4096;
+    pstat->st_blocks  = get_blocks(pstat->st_size);
+    S3FS_PRN_DBG("[path=%s] has been opened", path);
+    if(0 != StatCache::getStatCacheData()->GetCacheSize()){
+      // add into stat cache
+      if(!StatCache::getStatCacheData()->AddStat(strpath, ent->GetMeta(), forcedir)){
+        S3FS_PRN_ERR("failed adding stat cache [path=%s]", strpath.c_str());
+      }
+	}
+    FdManager::get()->Close(ent);
+
+	return 0;
   }
 
   // At first, check path
@@ -498,6 +526,7 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
     // finally, "path" object did not find. Add no object cache.
     strpath = path;  // reset original
     StatCache::getStatCacheData()->AddNoObjectCache(strpath);
+    S3FS_PRN_DBG("[path=%s] does not exist", path);
     return result;
   }
 
@@ -528,6 +557,7 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
       return -ENOENT;
     }
   }
+  S3FS_PRN_DBG("[path=%s] exists", path);
   return 0;
 }
 
@@ -754,33 +784,42 @@ static int put_headers(const char* path, headers_t& meta, bool is_copy)
   int         result;
   S3fsCurl    s3fscurl(true);
   struct stat buf;
+  bool has_opened = true;
+   
 
   S3FS_PRN_INFO2("[path=%s]", path);
 
-  // files larger than 5GB must be modified via the multipart interface
-  // *** If there is not target object(a case of move command),
-  //     get_object_attribute() returns error with initilizing buf.
-  (void)get_object_attribute(path, &buf);
-
-  if(buf.st_size >= FIVE_GB){
-    // multipart
-    if(0 != (result = s3fscurl.MultipartHeadRequest(path, buf.st_size, meta, is_copy))){
-      return result;
-    }
-  }else{
-    if(0 != (result = s3fscurl.PutHeadRequest(path, meta, is_copy))){
-      return result;
-    }
-  }
-
   FdEntity* ent = NULL;
   if(NULL == (ent = FdManager::get()->ExistOpen(path, -1, !(FdManager::get()->IsCacheDir())))){
+	has_opened = false;
     // no opened fd
     if(FdManager::get()->IsCacheDir()){
       // create cache file if be needed
       ent = FdManager::get()->Open(path, &meta, static_cast<ssize_t>(buf.st_size), -1, false, true);
     }
   }
+
+  if (has_opened) {
+	//the object has been created, but it has not been uploaded to on oss.
+    ent->SetMeta(meta);
+  } else {
+	// files larger than 5GB must be modified via the multipart interface
+	// *** If there is not target object(a case of move command),
+	//     get_object_attribute() returns error with initilizing buf.
+	(void)get_object_attribute(path, &buf);
+
+    if(buf.st_size >= FIVE_GB){
+      // multipart
+      if(0 != (result = s3fscurl.MultipartHeadRequest(path, buf.st_size, meta, is_copy))){
+        return result;
+      }
+    }else{
+      if(0 != (result = s3fscurl.PutHeadRequest(path, meta, is_copy))){
+        return result;
+      }
+    }
+  }
+
   if(ent){
     time_t mtime = get_mtime(meta);
     ent->SetMtime(mtime);
@@ -803,6 +842,7 @@ static int s3fs_getattr(const char* path, struct stat* stbuf)
   if(0 != (result = check_object_access(path, F_OK, stbuf))){
     return result;
   }
+  S3FS_PRN_DBG("[path=%s][size=%ld]", path, stbuf->st_size);
   // If has already opened fd, the st_size shuld be instead.
   // (See: Issue 241)
   if(stbuf){
@@ -814,11 +854,12 @@ static int s3fs_getattr(const char* path, struct stat* stbuf)
         stbuf->st_size = tmpstbuf.st_size;
       }
       FdManager::get()->Close(ent);
+      S3FS_PRN_DBG("[path=%s][size=%ld]", path, stbuf->st_size);
     }
     stbuf->st_blksize = 4096;
     stbuf->st_blocks  = get_blocks(stbuf->st_size);
   }
-  S3FS_PRN_DBG("[path=%s] uid=%u, gid=%u, mode=%04o", path, (unsigned int)(stbuf->st_uid), (unsigned int)(stbuf->st_gid), stbuf->st_mode);
+  S3FS_PRN_DBG("[path=%s] uid=%u, gid=%u, mode=%04o size=%ld", path, (unsigned int)(stbuf->st_uid), (unsigned int)(stbuf->st_gid), stbuf->st_mode, stbuf->st_size);
   S3FS_MALLOCTRIM(0);
 
   return result;
@@ -942,22 +983,25 @@ static int s3fs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
   }else if(0 != result){
     return result;
   }
-  result = create_file_object(path, mode, pcxt->uid, pcxt->gid);
   StatCache::getStatCacheData()->DelStat(path);
-  if(result != 0){
-    return result;
-  }
-
 
   FdEntity*   ent;
   headers_t   meta;
-  get_object_attribute(path, NULL, &meta);
-  if(NULL == (ent = FdManager::get()->Open(path, &meta, 0, -1, false, true))){
+  meta["Content-Type"]     = S3fsCurl::LookupMimeType(string(path));
+  meta["x-oss-meta-uid"]   = str(pcxt->uid);
+  meta["x-oss-meta-gid"]   = str(pcxt->gid);
+  meta["x-oss-meta-mode"]  = str(mode);
+  meta["x-oss-meta-mtime"] = str(time(NULL));
+  meta["Content-Length"] = str(0);
+  if(NULL == (ent = FdManager::get()->Open(path, &meta, 0, -1, false, true, true))){
+    S3FS_PRN_ERR("[path=%s][mode=%04o][flags=%d] open failed", path, mode, fi->flags);
     return -EIO;
   }
   fi->fh = ent->GetFd();
   S3FS_MALLOCTRIM(0);
 
+  S3FS_PRN_INFO("[path=%s][mode=%04o][flags=%d][uid=%u][gid=%u] opened",
+	path, mode, fi->flags, pcxt->uid, pcxt->gid);
   return 0;
 }
 
@@ -1179,11 +1223,13 @@ static int rename_object(const char* from, const char* to)
   meta["Content-Type"]             = S3fsCurl::LookupMimeType(string(to));
   meta["x-oss-metadata-directive"] = "REPLACE";
 
+  FdManager::get()->Rename(from, to);
+
   if(0 != (result = put_headers(to, meta, true))){
     return result;
   }
 
-  FdManager::get()->Rename(from, to);
+  //FdManager::get()->Rename(from, to);
 
   result = s3fs_unlink(from);
   StatCache::getStatCacheData()->DelStat(to);
@@ -1955,7 +2001,7 @@ static int s3fs_truncate(const char* path, off_t size)
   // Get file information
   if(0 == (result = get_object_attribute(path, NULL, &meta))){
     // Exists -> Get file(with size)
-    if(NULL == (ent = FdManager::get()->Open(path, &meta, static_cast<ssize_t>(size), -1, false, true))){
+    if(NULL == (ent = FdManager::get()->Open(path, &meta, static_cast<ssize_t>(size), -1, false, true, true))){
       S3FS_PRN_ERR("could not open file(%s): errno=%d", path, errno);
       return -EIO;
     }
@@ -1978,7 +2024,7 @@ static int s3fs_truncate(const char* path, off_t size)
     meta["x-oss-meta-uid"]   = str(pcxt->uid);
     meta["x-oss-meta-gid"]   = str(pcxt->gid);
 
-    if(NULL == (ent = FdManager::get()->Open(path, &meta, static_cast<ssize_t>(size), -1, true, true))){
+    if(NULL == (ent = FdManager::get()->Open(path, &meta, static_cast<ssize_t>(size), -1, true, true, true))){
       S3FS_PRN_ERR("could not open file(%s): errno=%d", path, errno);
       return -EIO;
     }
@@ -2028,7 +2074,7 @@ static int s3fs_open(const char* path, struct fuse_file_info* fi)
   if((unsigned int)fi->flags & O_TRUNC){
     if(0 != st.st_size){
       st.st_size = 0;
-      needs_flush = true;
+      //needs_flush = true;
     }
   }
   if(!S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)){
@@ -2038,7 +2084,7 @@ static int s3fs_open(const char* path, struct fuse_file_info* fi)
   FdEntity*   ent;
   headers_t   meta;
   get_object_attribute(path, NULL, &meta);
-  if(NULL == (ent = FdManager::get()->Open(path, &meta, static_cast<ssize_t>(st.st_size), st.st_mtime, false, true))){
+  if(NULL == (ent = FdManager::get()->Open(path, &meta, static_cast<ssize_t>(st.st_size), st.st_mtime, false, true, true))){
     return -EIO;
   }
 
@@ -2202,6 +2248,7 @@ static int s3fs_release(const char* path, struct fuse_file_info* fi)
   if(ent->GetFd() != static_cast<int>(fi->fh)){
     S3FS_PRN_WARN("different fd(%d - %llu)", ent->GetFd(), (unsigned long long)(fi->fh));
   }
+  ent->FlushAll();
   FdManager::get()->Close(ent);
 
   // check - for debug
@@ -2403,6 +2450,54 @@ static int s3fs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
   return result;
 }
 
+static int scan_fdentity_callback(const char* prefix, S3ObjList* head, const char* delimiter,
+	bool check_content_only, const string& path, const FdEntity* ent)
+{
+    S3FS_PRN_DBG("prefix: %s, path: %s", prefix, path.c_str());
+
+	size_t prefix_len = strlen(prefix);
+	if (prefix_len > 0 && strncmp(prefix, path.c_str(), prefix_len) != 0) {
+		return SCAN_CONTINUE;
+	}
+
+	string name;
+	if (delimiter) {
+		name = path.substr(0, path.find_first_of(delimiter, prefix_len));
+	} else {
+        name = path;
+	}
+
+	if (!head->insert(name.c_str(), NULL, false)){
+		return SCAN_FAILED;
+	}
+    S3FS_PRN_DBG("prefix: %s, path: %s name: %s head empty: %d", prefix, path.c_str(), name.c_str(), head->IsEmpty());
+
+	if (check_content_only)
+		return SCAN_EXIT;
+
+	return SCAN_CONTINUE;
+}
+
+static int list_objects_from_fdentity(const char* prefix, S3ObjList* head, const char* delimiter, bool check_content_only)
+{
+    if (prefix == NULL || prefix[0] == '\0') {
+		return -1;
+	}
+
+	string query_prefix(prefix);
+
+	if ('/' != query_prefix[query_prefix.length() - 1]) {
+		query_prefix += '/';
+	}
+
+	int result;
+	result = FdManager::get()->ScanFdEntity(bind(scan_fdentity_callback,
+		query_prefix.c_str(), head, delimiter, check_content_only,
+		std::tr1::placeholders::_1, std::tr1::placeholders::_2));
+
+	return result;
+}
+
 static int list_bucket(const char* path, S3ObjList& head, const char* delimiter, bool check_content_only)
 {
   int       result;
@@ -2417,6 +2512,8 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
   BodyData* body;
 
   S3FS_PRN_INFO1("[path=%s]", path);
+
+  list_objects_from_fdentity(path, &head, delimiter, check_content_only);
 
   if(delimiter && 0 < strlen(delimiter)){
     query_delimiter += "delimiter=";

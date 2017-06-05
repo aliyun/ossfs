@@ -20,6 +20,7 @@
 #ifndef FD_CACHE_H_
 #define FD_CACHE_H_
 
+#include <tr1/functional>
 #include <sys/statvfs.h>
 #include "curl.h"
 
@@ -118,7 +119,9 @@ class FdEntity
                                     // (if this is empty, does not load/save pagelist.)
     int             fd;             // file descriptor(tmp file or cache file)
     FILE*           pfile;          // file pointer(tmp file or cache file)
-    bool            is_modify;      // if file is changed, this flag is true
+    bool            is_modify;      // if file data is changed, this flag is true
+    bool            is_meta_modify; // if file meta is changed, this flag is true
+    bool            is_truncated; // if file data is truncated, this flag is true
     headers_t       orgmeta;        // original headers at opening
     size_t          size_orgmeta;   // original file size in original headers
 
@@ -126,6 +129,7 @@ class FdEntity
     etaglist_t      etaglist;       // for no cached multipart uploading when no disk space
     off_t           mp_start;       // start position for no cached multipart(write method only)
     size_t          mp_size;        // size for no cached multipart(write method only)
+	bool            is_created;
 
   private:
     static int FillFile(int fd, unsigned char byte, size_t size, off_t start);
@@ -136,12 +140,12 @@ class FdEntity
     bool SetAllStatusUnloaded(void) { return SetAllStatus(false); }
 
   public:
-    explicit FdEntity(const char* tpath = NULL, const char* cpath = NULL);
+    explicit FdEntity(const char* tpath = NULL, const char* cpath = NULL, bool created = false);
     ~FdEntity();
 
     void Close(void);
     bool IsOpen(void) const { return (-1 != fd); }
-    int Open(headers_t* pmeta = NULL, ssize_t size = -1, time_t time = -1);
+    int Open(headers_t* pmeta = NULL, ssize_t size = -1, time_t time = -1, bool truncated = false);
     bool OpenAndLoadAll(headers_t* pmeta = NULL, size_t* size = NULL, bool force_load = false);
     int Dup(void);
 
@@ -157,6 +161,10 @@ class FdEntity
     bool SetUId(uid_t uid);
     bool SetGId(gid_t gid);
     bool SetContentType(const char* path);
+	const headers_t& GetMeta() const;
+	bool SetMeta(const headers_t& meta);
+
+	bool IsCreated() const { return is_created; }
 
     int Load(off_t start = 0, size_t size = 0);                 // size=0 means loading to end
     int NoCacheLoadAndPost(off_t start = 0, size_t size = 0);   // size=0 means loading to end
@@ -164,13 +172,21 @@ class FdEntity
     int NoCacheMultipartPost(int tgfd, off_t start, size_t size);
     int NoCacheCompleteMultipartPost(void);
 
-    int RowFlush(const char* tpath, bool force_sync = false);
-    int Flush(bool force_sync = false) { return RowFlush(NULL, force_sync); }
+    int RowFlush(const char* tpath, bool force_sync = false, bool only_data = false);
+    int Flush(bool force_sync = false) { return RowFlush(NULL, force_sync, true); }
+    int FlushAll(bool force_sync = false) { return RowFlush(NULL, force_sync, false); }
 
     ssize_t Read(char* bytes, off_t start, size_t size, bool force_load = false);
     ssize_t Write(const char* bytes, off_t start, size_t size);
 };
 typedef std::map<std::string, class FdEntity*> fdent_map_t;   // key=path, value=FdEntity*
+typedef std::tr1::function<int(const std::string& path, const FdEntity* ent)> ScanCallBackFuncType;
+
+enum {
+	SCAN_FAILED = -1,
+	SCAN_CONTINUE = 0,
+	SCAN_EXIT = 1
+};
 
 //------------------------------------------------
 // class FdManager
@@ -211,11 +227,13 @@ class FdManager
     static bool IsSafeDiskSpace(const char* path, size_t size);
 
     FdEntity* GetFdEntity(const char* path, int existfd = -1);
-    FdEntity* Open(const char* path, headers_t* pmeta = NULL, ssize_t size = -1, time_t time = -1, bool force_tmpfile = false, bool is_create = true);
+    FdEntity* Open(const char* path, headers_t* pmeta = NULL, ssize_t size = -1, time_t time = -1, bool force_tmpfile = false, bool is_create = true, bool truncated = false);
     FdEntity* ExistOpen(const char* path, int existfd = -1, bool ignore_existfd = false);
     void Rename(const std::string &from, const std::string &to);
     bool Close(FdEntity* ent);
     bool ChangeEntityToTempPath(FdEntity* ent, const char* path);
+
+	int ScanFdEntity(ScanCallBackFuncType callback);
 };
 
 #endif // FD_CACHE_H_

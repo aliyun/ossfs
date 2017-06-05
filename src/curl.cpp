@@ -2396,9 +2396,10 @@ int S3fsCurl::PutRequest(const char* tpath, headers_t& meta, int fd)
       return -errno;
     }
     b_infile = file;
+    S3FS_PRN_INFO3("[tpath=%s][size=%zu]", SAFESTRPTR(tpath), st.st_size);
   }else{
     // This case is creating zero byte obejct.(calling by create_file_object())
-    S3FS_PRN_INFO3("create zero byte file object.");
+    S3FS_PRN_INFO3("[tpath=%s]create zero byte file object.", SAFESTRPTR(tpath));
   }
 
   if(!CreateCurlHandle(true)){

@@ -615,9 +615,9 @@ int FdEntity::FillFile(int fd, unsigned char byte, size_t size, off_t start)
 //------------------------------------------------
 // FdEntity methods
 //------------------------------------------------
-FdEntity::FdEntity(const char* tpath, const char* cpath)
+FdEntity::FdEntity(const char* tpath, const char* cpath, bool created)
         : is_lock_init(false), refcnt(0), path(SAFESTRPTR(tpath)), cachepath(SAFESTRPTR(cpath)),
-          fd(-1), pfile(NULL), is_modify(false), size_orgmeta(0), upload_id(""), mp_start(0), mp_size(0)
+          fd(-1), pfile(NULL), is_modify(false), is_meta_modify(false), is_truncated(false), size_orgmeta(0), upload_id(""), mp_start(0), mp_size(0), is_created(created)
 {
   try{
     pthread_mutexattr_t attr;
@@ -664,6 +664,7 @@ void FdEntity::Clear(void)
   path      = "";
   cachepath = "";
   is_modify = false;
+  is_meta_modify = false;
 }
 
 void FdEntity::Close(void)
@@ -705,14 +706,17 @@ int FdEntity::Dup(void)
 // This method does not lock fdent_lock, because FdManager::fd_manager_lock
 // is locked before calling.
 //
-int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time)
+int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time, bool truncated)
 {
-  S3FS_PRN_DBG("[path=%s][fd=%d][size=%jd][time=%jd]", path.c_str(), fd, (intmax_t)size, (intmax_t)time);
+  S3FS_PRN_DBG("FdEntity [path=%s][fd=%d][size=%jd][time=%jd][refcnt=%d]", path.c_str(), fd, (intmax_t)size, (intmax_t)time, refcnt);
 
   if(-1 != fd){
     // already opened, needs to increment refcnt.
     Dup();
-    return 0;
+	//can not return, should truncate file
+    //return 0; 
+  } else {
+	refcnt = 1;
   }
 
   bool  need_save_csf = false;  // need to save(reset) cache stat file
@@ -775,16 +779,18 @@ int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time)
 
   }else{
     // not using cache
-
-    // open temporary file
-    if(NULL == (pfile = tmpfile()) || -1 ==(fd = fileno(pfile))){
-      S3FS_PRN_ERR("failed to open tmp file. err(%d)", errno);
-      if(pfile){
-        fclose(pfile);
-        pfile = NULL;
-      }
-      return (0 == errno ? -EIO : -errno);
-    }
+	
+	if (fd == -1) {
+	  // open temporary file
+      if(NULL == (pfile = tmpfile()) || -1 ==(fd = fileno(pfile))){
+	    S3FS_PRN_ERR("failed to open tmp file. err(%d)", errno);
+	    if(pfile){
+		  fclose(pfile);
+		  pfile = NULL;
+		}
+		return (0 == errno ? -EIO : -errno);
+	  }
+	}
     if(-1 == size){
       size = 0;
       pagelist.Init(0, false);
@@ -803,6 +809,7 @@ int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time)
       fd    = -1;
       return (0 == errno ? -EIO : -errno);
     }
+    S3FS_PRN_DBG("[path=%s] truncate to %ld", path.c_str(), size);
   }
 
   // reset cache stat file
@@ -814,12 +821,14 @@ int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time)
   }
 
   // init internal data
-  refcnt    = 1;
+  //refcnt = 1;
+  is_meta_modify = false;
   is_modify = false;
+  is_truncated = truncated;
 
   // set original headers and size in it.
   if(pmeta){
-    orgmeta      = *pmeta;
+	SetMeta(*pmeta);
     size_orgmeta = static_cast<size_t>(get_size(orgmeta));
   }else{
     orgmeta.clear();
@@ -838,6 +847,17 @@ int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time)
   }
 
   return 0;
+}
+
+const headers_t& FdEntity::GetMeta() const
+{
+  for (typeof(orgmeta.begin()) iter = orgmeta.begin(); iter != orgmeta.end(); ++iter) {
+	string key = iter->first;
+	string value = iter->second;
+    S3FS_PRN_DBG("[path=%s][%s=%s]", path.c_str(), key.c_str(), value.c_str());
+  }
+  
+  return orgmeta;
 }
 
 // [NOTE]
@@ -974,6 +994,24 @@ bool FdEntity::SetContentType(const char* path)
   return true;
 }
 
+bool FdEntity::SetMeta(const headers_t& meta)
+{
+  if (meta.empty()) {
+	return false;
+  }
+
+  for (typeof(meta.begin()) iter = meta.begin(); iter != meta.end(); ++iter) {
+	if (orgmeta.find(iter->first) != meta.end()
+		&& iter->first != "x-oss-copy-source"
+		&& orgmeta[iter->first] != iter->second) {
+	  orgmeta[iter->first] = iter->second;
+	  is_meta_modify = true;
+	}
+  }
+
+  return true;
+}
+
 bool FdEntity::SetAllStatus(bool is_loaded)
 {
   S3FS_PRN_INFO3("[path=%s][fd=%d][%s]", path.c_str(), fd, is_loaded ? "loaded" : "unloaded");
@@ -1027,6 +1065,10 @@ int FdEntity::Load(off_t start, size_t size)
       }
       size_t over_size = (*iter)->bytes - need_load_size;
 
+	  if (need_load_size > 0)
+      {
+        S3FS_PRN_DBG("[path=%s][fd=%d][offset=%jd][need_load_size=%jd][over_size=%jd]",
+		  path.c_str(), fd, (intmax_t)(*iter)->offset, (intmax_t)need_load_size, (intmax_t)over_size);
       // download
       if(static_cast<size_t>(2 * S3fsCurl::GetMultipartSize()) < need_load_size && !nomultipart){ // default 20MB
         // parallel request
@@ -1047,6 +1089,7 @@ int FdEntity::Load(off_t start, size_t size)
       if(0 != result){
         break;
       }
+	  }
 
       // initialize for the area of over original size
       if(0 < over_size){
@@ -1055,7 +1098,7 @@ int FdEntity::Load(off_t start, size_t size)
           break;
         }
         // set modify flag
-        is_modify = false;
+        //is_modify = false;
       }
 
       // Set loaded flag
@@ -1295,24 +1338,44 @@ int FdEntity::NoCacheCompleteMultipartPost(void)
   return 0;
 }
 
-int FdEntity::RowFlush(const char* tpath, bool force_sync)
+int FdEntity::RowFlush(const char* tpath, bool force_sync, bool only_data)
 {
   int result;
 
-  S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d]", SAFESTRPTR(tpath), path.c_str(), fd);
+  S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d][is_modify=%d][is_meta_modify=%d][is_truncated=%d]",
+    SAFESTRPTR(tpath), path.c_str(), fd, is_modify, is_meta_modify, is_truncated);
 
   if(-1 == fd){
     return -EBADF;
   }
   AutoLock auto_lock(&fdent_lock);
 
-  if(!force_sync && !is_modify){
+  if(!force_sync && !is_modify && (only_data || !is_meta_modify || !is_truncated)){
     // nothing to update.
+    S3FS_PRN_INFO3("[tpath=%s][path=%s] no need upload", SAFESTRPTR(tpath), path.c_str());
     return 0;
+  }
+
+  if (!is_modify && is_meta_modify && !is_truncated) {
+    S3fsCurl    s3fscurl(true);
+    if (pagelist.Size() >= FIVE_GB) {
+	  result = s3fscurl.MultipartHeadRequest(path.c_str(), (off_t)pagelist.Size(), orgmeta, true);
+	} else {
+      result = s3fscurl.PutHeadRequest(path.c_str(), orgmeta, true);
+	}
+
+    S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d][is_modify=%d][is_meta_modify=%d][filesize=%ld][result=%d]",
+	  SAFESTRPTR(tpath), path.c_str(), fd, is_modify, is_meta_modify, pagelist.Size(), result);
+
+	if (result == 0)
+		is_meta_modify = false;
+	return result;
   }
 
   // If there is no loading all of the area, loading all area.
   size_t restsize = pagelist.GetTotalUnloadedPageSize();
+  S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d][filesize=%ld][unloadsize=%ld]",
+	  SAFESTRPTR(tpath), path.c_str(), fd, pagelist.Size(), restsize);
   if(0 < restsize){
     if(0 == upload_id.length()){
       // check disk space
@@ -1409,7 +1472,11 @@ int FdEntity::RowFlush(const char* tpath, bool force_sync)
 
   if(0 == result){
     is_modify = false;
+	is_meta_modify = false;
+	is_truncated = false;
   }
+
+  S3FS_PRN_DBG("tpath(%s) upload result(%d)", SAFESTRPTR(tpath), result);
   return result;
 }
 
@@ -1553,6 +1620,8 @@ ssize_t FdEntity::Write(const char* bytes, off_t start, size_t size)
   if (!success) {
 	  S3FS_PRN_ERR("failed to update file size in stat cache(path=%s, size=%ld).", path.c_str(), wsize);
   }
+  
+  S3FS_PRN_DBG("[path=%s][fd=%d][offset=%jd][size=%zu][is_modify=%d]", path.c_str(), fd, (intmax_t)start, size, is_modify);
   return wsize;
 }
 
@@ -1804,9 +1873,9 @@ FdEntity* FdManager::GetFdEntity(const char* path, int existfd)
   return NULL;
 }
 
-FdEntity* FdManager::Open(const char* path, headers_t* pmeta, ssize_t size, time_t time, bool force_tmpfile, bool is_create)
+FdEntity* FdManager::Open(const char* path, headers_t* pmeta, ssize_t size, time_t time, bool force_tmpfile, bool is_created, bool truncated)
 {
-  S3FS_PRN_DBG("[path=%s][size=%jd][time=%jd]", SAFESTRPTR(path), (intmax_t)size, (intmax_t)time);
+  S3FS_PRN_DBG("FdManager [path=%s][size=%jd][time=%jd]", SAFESTRPTR(path), (intmax_t)size, (intmax_t)time);
 
   if(!path || '\0' == path[0]){
     return NULL;
@@ -1814,12 +1883,11 @@ FdEntity* FdManager::Open(const char* path, headers_t* pmeta, ssize_t size, time
   AutoLock auto_lock(&FdManager::fd_manager_lock);
 
   fdent_map_t::iterator iter = fent.find(string(path));
-  FdEntity*             ent;
+  FdEntity* ent = NULL;
   if(fent.end() != iter){
     // found
     ent = (*iter).second;
-
-  }else if(is_create){
+  }else if(is_created){
     // not found
     string cache_path = "";
     if(!force_tmpfile && !FdManager::MakeCachePath(path, cache_path, true)){
@@ -1827,7 +1895,7 @@ FdEntity* FdManager::Open(const char* path, headers_t* pmeta, ssize_t size, time
       return NULL;
     }
     // make new obj
-    ent = new FdEntity(path, cache_path.c_str());
+    ent = new FdEntity(path, cache_path.c_str(), is_created);
 
     if(0 < cache_path.size()){
       // using cache
@@ -1840,16 +1908,17 @@ FdEntity* FdManager::Open(const char* path, headers_t* pmeta, ssize_t size, time
       // The reason why this process here, please look at the definition of the
       // comments of NOCACHE_PATH_PREFIX_FORM symbol.
       //
-      string tmppath("");
-      FdManager::MakeRandomTempPath(path, tmppath);
-      fent[tmppath] = ent;
+      //string tmppath("");
+      //FdManager::MakeRandomTempPath(path, tmppath);
+      //fent[tmppath] = ent;
+      fent[path] = ent;
     }
   }else{
     return NULL;
   }
 
   // open
-  if(-1 == ent->Open(pmeta, size, time)){
+  if(-1 == ent->Open(pmeta, size, time, truncated)){
     return NULL;
   }
   return ent;
@@ -1859,19 +1928,30 @@ FdEntity* FdManager::ExistOpen(const char* path, int existfd, bool ignore_existf
 {
   S3FS_PRN_DBG("[path=%s][fd=%d][ignore_existfd=%s]", SAFESTRPTR(path), existfd, ignore_existfd ? "true" : "false");
 
-  // search by real path
-  FdEntity* ent = Open(path, NULL, -1, -1, false, false);
+  AutoLock auto_lock(&FdManager::fd_manager_lock);
+
+  fdent_map_t::iterator iter = fent.find(string(path));
+  FdEntity* ent = NULL;
+  if (fent.end() != iter){
+    // found
+    ent = (*iter).second;
+	if (ignore_existfd || ent->GetFd() == existfd) {
+	  ent->Dup();
+      S3FS_PRN_DBG("[path=%s][fd=%d][ignore_existfd=%s] has been opened", SAFESTRPTR(path), existfd, ignore_existfd ? "true" : "false");
+	  return ent;
+	}
+  }
 
   if(!ent && (ignore_existfd || (-1 != existfd))){
+	ent = NULL;
     // search from all fdentity because of not using cache.
-    AutoLock auto_lock(&FdManager::fd_manager_lock);
-
     for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ++iter){
       if((*iter).second && (*iter).second->IsOpen() && (ignore_existfd || ((*iter).second->GetFd() == existfd))){
         // found opend fd in map
         if(0 == strcmp((*iter).second->GetPath(), path)){
           ent = (*iter).second;
           ent->Dup();
+          S3FS_PRN_DBG("[path=%s][fd=%d][ignore_existfd=%s] has been opened", SAFESTRPTR(path), existfd, ignore_existfd ? "true" : "false");
           break;
         }else{
           // found fd, but it is used another file(file descriptor is recycled)
@@ -1879,8 +1959,13 @@ FdEntity* FdManager::ExistOpen(const char* path, int existfd, bool ignore_existf
         }
       }
     }
+
+    S3FS_PRN_DBG("[path=%s][fd=%d][ignore_existfd=%s] has been opened", SAFESTRPTR(path), existfd, ignore_existfd ? "true" : "false");
+	return ent;
   }
-  return ent;
+
+  S3FS_PRN_DBG("[path=%s] has not been opened", path);
+  return NULL;
 }
 
 void FdManager::Rename(const std::string &from, const std::string &to)
@@ -1931,6 +2016,21 @@ bool FdManager::ChangeEntityToTempPath(FdEntity* ent, const char* path)
     }
   }
   return false;
+}
+
+int FdManager::ScanFdEntity(ScanCallBackFuncType callback)
+{
+  AutoLock auto_lock(&FdManager::fd_manager_lock);
+
+  int ret = SCAN_FAILED;
+  for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ++iter){
+	  int ret = callback((*iter).first, (*iter).second);
+	  if (ret != SCAN_CONTINUE) {
+		  break;
+	  }
+  }
+
+  return ret;
 }
 
 /*

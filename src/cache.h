@@ -109,7 +109,7 @@ class StatCache
     bool AddNoObjectCache(std::string& key);
 
     // Add stat cache
-    bool AddStat(std::string& key, headers_t& meta, bool forcedir = false);
+    bool AddStat(std::string& key, const headers_t& meta, bool forcedir = false);
 
 	bool IncSize(const std::string& key, ssize_t sz);
 
@@ -123,7 +123,7 @@ class StatCache
 //
 // Functions
 //
-bool convert_header_to_stat(const char* path, headers_t& meta, struct stat* pst, bool forcedir = false);
+bool convert_header_to_stat(const char* path, const headers_t& meta, struct stat* pst, bool forcedir = false);
 
 #endif // S3FS_CACHE_H_
 

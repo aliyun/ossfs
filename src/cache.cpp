@@ -244,7 +244,7 @@ bool StatCache::IsNoObjectCache(string& key, bool overcheck)
   return false;
 }
 
-bool StatCache::AddStat(std::string& key, headers_t& meta, bool forcedir)
+bool StatCache::AddStat(std::string& key, const headers_t& meta, bool forcedir)
 {
   if(CacheSize< 1){
     return true;
@@ -280,8 +280,11 @@ bool StatCache::AddStat(std::string& key, headers_t& meta, bool forcedir)
   ent->noobjcache = false;
   ent->meta.clear();
   //copy only some keys
-  for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
-    string tag   = lower(iter->first);
+  for(typeof(meta.begin()) iter = meta.begin(); iter != meta.end(); ++iter){
+	if(iter->first.empty())
+		continue;
+    string tag   = iter->first;
+    tag   = lower(tag);
     string value = iter->second;
     if(tag == "content-type"){
       ent->meta[iter->first] = value;
@@ -442,7 +445,7 @@ bool StatCache::DelStat(const char* key)
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
-bool convert_header_to_stat(const char* path, headers_t& meta, struct stat* pst, bool forcedir)
+bool convert_header_to_stat(const char* path, const headers_t& meta, struct stat* pst, bool forcedir)
 {
   if(!path || !pst){
     return false;

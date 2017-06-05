@@ -670,7 +670,7 @@ time_t get_mtime(const char *s)
   return static_cast<time_t>(s3fs_strtoofft(s));
 }
 
-time_t get_mtime(headers_t& meta, bool overcheck)
+time_t get_mtime(const headers_t& meta, bool overcheck)
 {
   headers_t::const_iterator iter;
   if(meta.end() == (iter = meta.find("x-oss-meta-mtime"))){
@@ -687,7 +687,7 @@ off_t get_size(const char *s)
   return s3fs_strtoofft(s);
 }
 
-off_t get_size(headers_t& meta)
+off_t get_size(const headers_t& meta)
 {
   headers_t::const_iterator iter;
   if(meta.end() == (iter = meta.find("Content-Length"))){
@@ -701,7 +701,7 @@ mode_t get_mode(const char *s)
   return static_cast<mode_t>(s3fs_strtoofft(s));
 }
 
-mode_t get_mode(headers_t& meta, const char* path, bool checkdir, bool forcedir)
+mode_t get_mode(const headers_t& meta, const char* path, bool checkdir, bool forcedir)
 {
   mode_t mode = gDefaultPermission;
   bool isS3sync = false;
@@ -754,7 +754,7 @@ uid_t get_uid(const char *s)
   return static_cast<uid_t>(s3fs_strtoofft(s));
 }
 
-uid_t get_uid(headers_t& meta)
+uid_t get_uid(const headers_t& meta)
 {
   headers_t::const_iterator iter;
   if(meta.end() == (iter = meta.find("x-oss-meta-uid"))){
@@ -770,7 +770,7 @@ gid_t get_gid(const char *s)
   return static_cast<gid_t>(s3fs_strtoofft(s));
 }
 
-gid_t get_gid(headers_t& meta)
+gid_t get_gid(const headers_t& meta)
 {
   headers_t::const_iterator iter;
   if(meta.end() == (iter = meta.find("x-oss-meta-gid"))){
@@ -808,7 +808,7 @@ time_t get_lastmodified(const char* s)
   return timegm(&tm); // GMT
 }
 
-time_t get_lastmodified(headers_t& meta)
+time_t get_lastmodified(const headers_t& meta)
 {
   headers_t::const_iterator iter;
   if(meta.end() == (iter = meta.find("Last-Modified"))){

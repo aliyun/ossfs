@@ -316,7 +316,7 @@ function test_list_many_files {
         touch $dir/file-$x
     done
 
-    file_cnt=$(ls -1 $dir | wc -l)
+    file_cnt=$(ls -1 $dir/file* | wc -l)
     if [ $file_cnt != $count ]; then
         echo "Expected $count files but got $file_cnt"
         exit 1
