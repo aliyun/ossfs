@@ -1,5 +1,9 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.80.2 (06/01/2017)
+
+- Fix list error when path contains multi-slash
+- Print verbose message when failed to mount ossfs
 
 ## v1.80.1 (05/16/2017)
 
