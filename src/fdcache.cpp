@@ -1364,7 +1364,7 @@ int FdEntity::RowFlush(const char* tpath, bool force_sync, bool only_data)
       result = s3fscurl.PutHeadRequest(path.c_str(), orgmeta, true);
 	}
 
-    S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d][is_modify=%d][is_meta_modify=%d][filesize=%ld][result=%d]",
+    S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d][is_modify=%d][is_meta_modify=%d][filesize=%zu][result=%d]",
 	  SAFESTRPTR(tpath), path.c_str(), fd, is_modify, is_meta_modify, pagelist.Size(), result);
 
 	if (result == 0)
@@ -1374,7 +1374,7 @@ int FdEntity::RowFlush(const char* tpath, bool force_sync, bool only_data)
 
   // If there is no loading all of the area, loading all area.
   size_t restsize = pagelist.GetTotalUnloadedPageSize();
-  S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d][filesize=%ld][unloadsize=%ld]",
+  S3FS_PRN_INFO3("[tpath=%s][path=%s][fd=%d][filesize=%zu][unloadsize=%zu]",
 	  SAFESTRPTR(tpath), path.c_str(), fd, pagelist.Size(), restsize);
   if(0 < restsize){
     if(0 == upload_id.length()){
