@@ -3,7 +3,7 @@
 [![Version](https://badge.fury.io/gh/aliyun%2Fossfs.svg)][releases]
 [![Build Status](https://travis-ci.org/aliyun/ossfs.svg?branch=master)](https://travis-ci.org/aliyun/ossfs?branch=master)
 
-### [README of English](https://github.com/aliyun/ossfs/blob/master/README.md)
+### [README of English](https://github.com/aliyun/ossfs/blob/master/README-CN.md)
 
 ## Introduction
 
