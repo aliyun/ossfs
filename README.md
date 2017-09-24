@@ -3,32 +3,34 @@
 [![Version](https://badge.fury.io/gh/aliyun%2Fossfs.svg)][releases]
 [![Build Status](https://travis-ci.org/aliyun/ossfs.svg?branch=master)](https://travis-ci.org/aliyun/ossfs?branch=master)
 
-### 简介
+### [README of English](https://github.com/aliyun/ossfs/blob/master/README.md)
 
-ossfs 能让您在Linux/Mac OS X 系统中把Aliyun OSS bucket 挂载到本地文件
-系统中，您能够便捷的通过本地文件系统操作OSS 上的对象，实现数据的共享。
+## Introduction
 
-### 功能
+The OSSFS enables you to mount Alibaba Cloud OSS buckets to a local file in Linux/Mac OS X systems. 
+In the system, you can conveniently operate on objects in OSS while using the local file system to maintain data sharing. 
 
-ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
+## Features
 
-* 支持POSIX 文件系统的大部分功能，包括文件读写，目录，链接操作，权限，
-  uid/gid，以及扩展属性（extended attributes）
-* 通过OSS 的multipart 功能上传大文件。
-* MD5 校验保证数据完整性。
+The OSSFS is built based on S3FS and has all the features of S3FS. Main features:
 
-### 安装
+* Support a majority of the POSIX file system features, including file read/write, directory, link operation, permission, 
+  uid/gid, and extended attributes). 
+* Support upload of large files through the OSS multipart feature. 
+* Support MD5 verification to ensure data integrity. 
 
-#### 预编译的安装包
+## Install OSSFS
 
-我们为常见的linux发行版制作了安装包：
+### Precompiled installer
+
+We have prepared an installer package for common Linux releases: 
 
 - Ubuntu-14.04
 - CentOS-7.0/6.5/5.11
 
-请从[版本发布页面][releases]选择对应的安装包下载安装，建议选择最新版本。
+Please select the corresponding installer on the [Version Releases Page][Releases] to download and install the tool. The latest version is recommended. 
 
-- 对于Ubuntu，安装命令为：
+- For Ubuntu systems, the installation command is: 
 
 ```
 sudo apt-get update
@@ -36,23 +38,23 @@ sudo apt-get install gdebi-core
 sudo gdebi your_ossfs_package
 ```
 
-- 对于CentOS6.5及以上，安装命令为：
+- For CentOS6.5 or above, the installation command is: 
 
 ```
 sudo yum localinstall your_ossfs_package
 ```
 
-- 对于CentOS5，安装命令为：
+- For CentOS5, the installation command is: 
 
 ```
 sudo yum localinstall your_ossfs_package --nogpgcheck
 ```
 
-#### 源码安装
+### Install by source code
 
-如果没有找到对应的安装包，您也可以自行编译安装。编译前请先安装下列依赖库：
+If you fail to find the corresponding installer package, you can also install the tool by compiling the code on your own. First install the following dependency libraries before compilation: 
 
-Ubuntu 14.04:
+Ubuntu 14.04: 
 
 ```
 sudo apt-get install automake autotools-dev g++ git libcurl4-gnutls-dev \
@@ -66,7 +68,7 @@ sudo yum install automake gcc-c++ git libcurl-devel libxml2-devel \
                  fuse-devel make openssl-devel
 ```
 
-然后您可以在github上下载源码并编译安装：
+Then you can download the source code from GitHub and compile the code for installing the tool: 
 
 ```
 git clone https://github.com/aliyun/ossfs.git
@@ -77,25 +79,25 @@ make
 sudo make install
 ```
 
-### 运行
+## Run OSSFS
 
-设置bucket name, access key/id信息，将其存放在/etc/passwd-ossfs 文件中，
-注意这个文件的权限必须正确设置，建议设为640。
+Set the bucket name, access key/ID information and save the information to the "/etc/passwd-ossfs" object. 
+Note: The ACL of this object must be set correctly. 640 is recommended. 
 
 ```
 echo my-bucket:my-access-key-id:my-access-key-secret > /etc/passwd-ossfs
 chmod 640 /etc/passwd-ossfs
 ```
 
-将oss bucket mount到指定目录
+Mount the OSS bucket to the specified directory. 
 
 ```
 ossfs my-bucket my-mount-point -ourl=my-oss-endpoint
 ```
-#### 示例
+### Example
 
-将`my-bucket`这个bucket挂载到`/tmp/ossfs`目录下，AccessKeyId是`faint`，
-AccessKeySecret是`123`，oss endpoint是`http://oss-cn-hangzhou.aliyuncs.com`
+Mount the 'my-bucket' bucket to the '/tmp/ossfs' directory and the AccessKeyId is 'faint', 
+the AccessKeySecret is '123', and the OSS endpoint is 'http://oss-cn-hangzhou.aliyuncs.com'.
 
 ```
 echo my-bucket:faint:123 > /etc/passwd-ossfs
@@ -104,94 +106,94 @@ mkdir /tmp/ossfs
 ossfs my-bucket /tmp/ossfs -ourl=http://oss-cn-hangzhou.aliyuncs.com
 ```
 
-卸载bucket:
+Unmount the bucket:
 
 ```bash
 umount /tmp/ossfs # root user
 fusermount -u /tmp/ossfs # non-root user
 ```
 
-#### 常用设置
+### Common settings
 
-- 使用`ossfs --version`来查看当前版本，使用`ossfs -h`来查看可用的参数
-- 如果使用ossfs的机器是阿里云ECS，可以使用内网域名来**避免流量收费**和
-  **提高速度**：
+- You can use 'ossfs --version' to view the current version and 'ossfs -h' to view available parameters. 
+- If you are using OSSFS on an Alibaba Cloud ECS instance, you can use the intranet domain name to **save traffic charges** and 
+  **improve speed**: 
 
         ossfs my-bucket /tmp/ossfs -ourl=http://oss-cn-hangzhou-internal.aliyuncs.com
 
-- 在linux系统中，[updatedb][updatedb]会定期地扫描文件系统，如果不想
-  ossfs的挂载目录被扫描，可参考[FAQ][FAQ-updatedb]设置跳过挂载目录
-- 如果你没有使用[eCryptFs][ecryptfs]等需要[XATTR][xattr]的文件系统，可
-  以通过添加`-o noxattr`参数来提升性能
-- ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当
-  有多组信息，写入passwd-ossfs的信息格式为：
+- In a Linux system, [updatedb][updatedb] will scan the file system on a regular basis. If you do not want the 
+  OSSFS-mounted directory to be scanned, refer to [FAQ][FAQ-updatedb] to configure skipping the mounted directory. 
+- If [eCryptFs][ecryptfs] or other systems that require [XATTR][xattr] are not used, you can improve performance by 
+  adding the '-o noxattr' parameter. 
+- The OSSFS allows you to specify multiple sets of bucket/access_key_id/access_key_secret information. When 
+  multiple sets of information are in place, the format of the information written to passwd-ossfs is: 
 
         bucket1:access_key_id1:access_key_secret1
         bucket2:access_key_id2:access_key_secret2
 
-- 生产环境中推荐使用[supervisor][supervisor]来启动并监控ossfs进程，使
-  用方法见[FAQ][faq-supervisor]
+- The [Supervisor][Supervisor] is recommended in a production environment to start and monitor the OSSFS process. For usage 
+  see [FAQ][faq-supervisor]. 
 
-#### 高级设置
+### Advanced settings
 
-- 可以添加`-f -d`参数来让ossfs运行在前台并输出debug日志
-- 可以使用`-o kernel_cache`参数让ossfs能够利用文件系统的page cache，如
-  果你有多台机器挂载到同一个bucket，并且要求强一致性，请**不要**使用此
-  选项
+- You can add the '-f -d' parameters to run the OSSFS in the foreground and output the debug log. 
+- You can use the '-o kernel_cache' parameter to enable the OSSFS to use the page cache of the file system. 
+  If you have multiple servers mounted to the same bucket and require strong consistency, **do not** use this 
+  option. 
 
-### 遇到错误
+## Errors
 
-遇到错误不要慌:) 按如下步骤进行排查：
+Do not panic in case of errors. Troubleshoot the problem following the steps below: 
 
-1. 如果有打印错误信息，尝试阅读并理解它
-2. 查看`/var/log/syslog`或者`/var/log/messages`中有无相关信息
+1. If a printing error occurs, read and understand the error message. 
+2. View '/var/log/syslog' or '/var/log/messages' to check for any related information. 
 
         grep 's3fs' /var/log/syslog
         grep 'ossfs' /var/log/syslog
 
-3. 重新挂载ossfs，打开debug log：
+3. Retry OSSFS mounting and open the debug log: 
 
         ossfs ... -o dbglevel=debug -f -d > /tmp/fs.log 2>&1
 
-    然后重复你出错的操作，出错后将`/tmp/fs.log`保留，自己查看或者发给我
+    Repeat the operation and save the '/tmp/fs.log' to check or send the file to me. 
 
-### 局限性
+## Restrictions
 
-ossfs提供的功能和性能和本地文件系统相比，具有一些局限性。具体包括：
+Compared with local file systems, OSSFS has some restrictions in provided functionality and performance. Specifically speaking: 
 
-* 随机或者追加写文件会导致整个文件的重写。
-* 元数据操作，例如list directory，性能较差，因为需要远程访问oss服务器。
-* 文件/文件夹的rename操作不是原子的。
-* 多个客户端挂载同一个oss bucket时，依赖用户自行协调各个客户端的行为。例如避免多个客户端写同一个文件等等。
-* 不支持hard link。
-* 不适合用在高并发读/写的场景，这样会让系统的load升高
+* Random or append writes to files may lead to rewrite of the entire file.
+* Metadata operations, such as list directory perform poorly because of the remote access to the OSS server.
+* The rename operations on files/folders are not atomic.
+* When multiple clients are mounted to the same OSS bucket, you have to coordinate actions of various clients on your own. For example, keep multiple clients from writing data to the same file.
+* Hard link is not supported.
+* The tool is not suitable for scenarios with highly concurrent reads/writes as it will increase the system load. 
 
-### 参与开发
+## Get involved in development
 
-0. 开发流程参考：https://github.com/rockuw/oss-sdk-status#development-oss-members-only
-1. 提交代码后，确保travis CI是PASS的
-2. 每发布一个新的版本：
-  - 运行`scripts/build-pkg.py`生成相应的安装包
-  - 在[Release页面][releases]发布一个版本
-  - 将生成的安装包上传到相应的Release下面
+0. For the development procedure, refer to: https://github.com/rockuw/oss-sdk-status#development-oss-members-only. 
+1. After the code is submitted, ensure the travis CI is in the PASS status. 
+2. Every time a new version is released: 
+  - Run 'scripts/build-pkg.py' to generate the corresponding installer package. 
+  - Release a version on the [Release Page][releases]. 
+  - Upload the generated installer package to the corresponding Release directory. 
 
-### 常见问题
+## FAQs
 
-[FAQ](https://github.com/aliyun/ossfs/wiki/FAQ)
+[FAQ](https://github.com/aliyun/ossfs/wiki/FAQ-EN)
 
-### 相关链接
+### Related
 
-* [ossfs wiki](https://github.com/aliyun/ossfs/wiki)
-* [s3fs](https://github.com/s3fs-fuse/s3fs-fuse) - 通过fuse接口，mount s3 bucket到本地文件系统。
+* [OSSFS Wiki](https://github.com/aliyun/ossfs/wiki)
+* [S3FS](https://github.com/s3fs-fuse/s3fs-fuse)- Mount the s3 bucket to the local file system through the fuse interface. 
 
-### 联系我们
+## Contact us
 
-* [阿里云OSS官方网站](http://oss.aliyun.com/)
-* [阿里云OSS官方论坛](http://bbs.aliyun.com/thread/211.html)
-* [阿里云OSS官方文档中心](http://www.aliyun.com/product/oss#Docs)
-* 阿里云官方技术支持：[提交工单](https://workorder.console.aliyun.com/#/ticket/createIndex)
+* [Alibaba Cloud OSS official website](http://oss.aliyun.com/)
+* [Alibaba Cloud OSS official forum](http://bbs.aliyun.com/thread/211.html)
+* [Alibaba Cloud OSS official documentation center](http://www.aliyun.com/product/oss#Docs)
+* Alibaba Cloud official technical support: [Submit a ticket](https://workorder.console.aliyun.com/#/ticket/createIndex)
 
-### License
+## License
 
 Copyright (C) 2010 Randy Rizun <rrizun@gmail.com>
 
@@ -207,3 +209,4 @@ Licensed under the GNU GPL version 2
 [xattr]: http://man7.org/linux/man-pages/man7/xattr.7.html
 [supervisor]: http://supervisord.org/
 [faq-supervisor]: https://github.com/aliyun/ossfs/wiki/FAQ#18
+
