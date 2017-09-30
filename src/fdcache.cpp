@@ -1893,6 +1893,17 @@ void FdManager::Rename(const std::string &from, const std::string &to)
     fent.erase(iter);
     ent->SetPath(to);
     fent[to] = ent;
+  } else {
+    for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ++iter){
+      if((*iter).second && (*iter).second->IsOpen()) {
+        // found opend fd in map
+        if(0 == strcmp((*iter).second->GetPath(), from.c_str())){
+          FdEntity* ent = (*iter).second;
+          ent->SetPath(to);
+          S3FS_PRN_DBG("rename ent[from=%s][to=%s][ent->fd=%d]", from.c_str(), to.c_str(), ent->GetFd());
+        }
+      }
+    }
   }
 }
 
