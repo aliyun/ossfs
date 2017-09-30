@@ -85,7 +85,7 @@ stdbuf -oL -eL $OSSFS $TEST_BUCKET_1 $TEST_BUCKET_MOUNT_POINT_1 \
     -o singlepart_copy_limit=$((10 * 1024)) \
     -o url=${OSS_URL} \
     -o use_path_request_style \
-    -o dbglevel=info -f |& stdbuf -oL -eL sed -u "s/^/ossfs: /" &
+    -o dbglevel=debug -f |& stdbuf -oL -eL sed -u "s/^/ossfs: /" &
 
 retry 30 grep $TEST_BUCKET_MOUNT_POINT_1 /proc/mounts || exit 1
 
