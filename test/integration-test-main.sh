@@ -469,7 +469,7 @@ function test_file_size_in_stat_cache {
 }
 
 function test_ut_ossfs {
-    echo "Testing file size in stat cache..."
+    echo "Testing ossfs python ut"
     export TEST_BUCKET_MOUNT_POINT=$TEST_BUCKET_MOUNT_POINT_1
     python $CUR_DIR/ut_test.py
 }
