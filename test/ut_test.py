@@ -55,6 +55,27 @@ class OssfsUnitTest(unittest.TestCase):
 
         self.assertEqual(len(data1), len(data2))
         self.assertEqual(data1, data2)
+    
+    def test_rename_file2(self):
+        filename1 = "%s/%s" % (self.mount_point, self.random_string(10))
+        filename2 = "%s/%s" % (self.mount_point, self.random_string(10))
+        print filename1, filename2
+
+        f = open(filename1, 'w')
+        data1 = self.random_string(1000)
+        f.write(data1)
+        f.close()
+
+        os.rename(filename1, filename2)
+        
+        f = open(filename2, 'r')
+        f.seek(0, 0)
+        data2 = f.read()
+        f.close()
+
+        self.assertEqual(len(data1), len(data2))
+        self.assertEqual(data1, data2)
+
 
 if __name__ == '__main__':
     unittest.main()
