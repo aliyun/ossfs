@@ -14,7 +14,7 @@ script:
 - modprobe fuse
 - export OSSFS=`pwd`/src/ossfs
 - make check -C test
-- tail -n 512 test/test-suite.log
+- cat test/test-suite.log
 env:
   global:
   - secure: Cq6jN5YKKqJSSvlFxdQxL958iGs3AD76gm2k+3noduawsUSkILh/mx1V9zVjX5ttLH21n4Ulh4D2KAiOuicG+9Hec0igUeC1ER6vWVYqHiuuLm58RoUtdGPIuMhBYpj76Eovip/58zl7vk3swSit/y/nUviMmtlOMy2WwLVT22H45M+nIUMFnCtObgqsRKflcehcKuLdYXYNCDRE4cDQIxVwPX9h2doxhc7v+2bssU/A2CUheTPuIPEsLvdzuXle9qcbIwg2sD3syojNLcQksH4T4YuBbY69NGSyQvCV0SzG/fvg0wnONMonzN3X13rkB5rcsiRDjzvLO4xw2iMoL6flKduetWowDrgKOlbkTO/9UWVN1YUb//eaX4PvE8r2NIJTNzWUZYnQBj9SJbSFtrWOhWhqfl3IVmnBiZTzpw5E3XdEqP/N7FTQAsNEJYA8uKgwHW2WBQMXabtcPb0p3YhI0ZX2wWuNLqfC8+5ogVaF090hmVQZvPvrsM3qMbQpak32W/nCxCMnSaasByrhLOWryLE7XdSc9tz60sCBskda2DRpGidJMRcOsUbwcRMQd3NfKf7Rf7VLm95v/nPUTFn9CE/8BUOD90RTw9vo0s87roAyYQHzGj3Z7OPxRMTXF2N7Fbb8efNzQR1MQUghRygd6BsOf3gMWDRkE1ayaHo=
