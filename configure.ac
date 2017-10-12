@@ -21,7 +21,7 @@
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.59)
-AC_INIT(ossfs, 1.80.2)
+AC_INIT(ossfs, 1.80.3)
 AC_CONFIG_HEADER([config.h])
 
 AC_CANONICAL_SYSTEM

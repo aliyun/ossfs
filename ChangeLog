@@ -1,5 +1,9 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.80.3 (12/10/2017)
+
+- Fix a rename bug
+
 ## v1.80.2 (06/01/2017)
 
 - Fix list error when path contains multi-slash
