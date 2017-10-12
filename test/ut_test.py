@@ -9,8 +9,7 @@ import time
 
 class OssfsUnitTest(unittest.TestCase):
     def setUp(self):
-        self.mount_point = os.environ.get('TEST_BUCKET_MOUNT_POINT')
-        print 'mount dir %s' % (self.mount_point)
+        pass
 
     def tearDown(self):
         pass
@@ -23,7 +22,7 @@ class OssfsUnitTest(unittest.TestCase):
         return "".join(list)
     
     def test_read_file(self):
-        filename = "%s/%s" % (self.mount_point, self.random_string(10))
+        filename = "%s" % (self.random_string(10))
         print filename
 
         f = open(filename, 'w')
@@ -39,8 +38,8 @@ class OssfsUnitTest(unittest.TestCase):
         f.close()
 
     def test_rename_file(self):
-        filename1 = "%s/%s" % (self.mount_point, self.random_string(10))
-        filename2 = "%s/%s" % (self.mount_point, self.random_string(10))
+        filename1 = "%s" % (self.random_string(10))
+        filename2 = "%s" % (self.random_string(10))
         print filename1, filename2
 
         f = open(filename1, 'w+')
@@ -57,8 +56,8 @@ class OssfsUnitTest(unittest.TestCase):
         self.assertEqual(data1, data2)
     
     def test_rename_file2(self):
-        filename1 = "%s/%s" % (self.mount_point, self.random_string(10))
-        filename2 = "%s/%s" % (self.mount_point, self.random_string(10))
+        filename1 = "%s" % (self.random_string(10))
+        filename2 = "%s" % (self.random_string(10))
         print filename1, filename2
 
         f = open(filename1, 'w')
