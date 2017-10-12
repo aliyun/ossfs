@@ -468,6 +468,12 @@ function test_file_size_in_stat_cache {
     python $CUR_DIR/stat_cache_test.py $TEST_BUCKET_MOUNT_POINT_1
 }
 
+function test_ut_ossfs {
+    echo "Testing ossfs python ut..."
+    python $CUR_DIR/ut_test.py
+}
+
+
 function run_all_tests {
     test_append_file
     test_truncate_file
@@ -492,6 +498,7 @@ function run_all_tests {
     test_extended_attributes
     test_mtime_file
     test_file_size_in_stat_cache
+    test_ut_ossfs
 }
 
 # Mount the bucket
