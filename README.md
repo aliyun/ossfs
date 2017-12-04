@@ -54,6 +54,11 @@ sudo yum localinstall your_ossfs_package --nogpgcheck
 
 If you fail to find the corresponding installer package, you can also install the tool by compiling the code on your own. First install the following dependency libraries before compilation: 
 
+MacOS:
+```
+brew install autoconf automake libtool libxml2 pkg-config
+```
+
 Ubuntu 14.04: 
 
 ```
@@ -74,7 +79,7 @@ Then you can download the source code from GitHub and compile the code for insta
 git clone https://github.com/aliyun/ossfs.git
 cd ossfs
 ./autogen.sh
-./configure
+./configure (MacOS:./configure LDFLAGS='-L/usr/local/opt/openssl/lib' CPPFLAGS='-I/usr/local/opt/openssl/include')
 make
 sudo make install
 ```
