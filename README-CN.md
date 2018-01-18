@@ -82,7 +82,7 @@ sudo make install
 ### 运行
 
 设置bucket name, access key/id信息，将其存放在/etc/passwd-ossfs 文件中，
-注意这个文件的权限必须正确设置，建议设为640。
+注意这个文件的权限必须正确设置，建议设为640。如果不使用默认的文件路径，文件权限建议设置为600。
 
 ```
 echo my-bucket:my-access-key-id:my-access-key-secret > /etc/passwd-ossfs
