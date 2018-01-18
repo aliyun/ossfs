@@ -82,7 +82,7 @@ sudo make install
 ## Run OSSFS
 
 Set the bucket name, access key/ID information and save the information to the "/etc/passwd-ossfs" object. 
-Note: The ACL of this object must be set correctly. 640 is recommended. 
+Note: The ACL of this object must be set correctly, and 640 is recommended. 600 is recommended if the password file is not the default path.
 
 ```
 echo my-bucket:my-access-key-id:my-access-key-secret > /etc/passwd-ossfs
