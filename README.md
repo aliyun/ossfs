@@ -58,6 +58,7 @@ MacOS:
 ```
 brew install autoconf automake libtool libxml2 pkg-config
 ```
+install fuse: https://github.com/osxfuse/osxfuse/releases
 
 Ubuntu 14.04: 
 
