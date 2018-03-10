@@ -21,10 +21,14 @@
 /src/.deps/
 /src/Makefile
 /src/Makefile.in
-/src/s3fs
+/src/ossfs
 /src/test_*
 /test/.deps/
 /test/Makefile
 /test/Makefile.in
 /test/*.log
 /default_commit_hash
+tags
+cscope*
+*.swp
+*.swo
