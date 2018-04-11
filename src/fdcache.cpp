@@ -671,12 +671,8 @@ void FdEntity::Close(void)
   S3FS_PRN_DBG("[path=%s][fd=%d][refcnt=%d]", path.c_str(), fd, (-1 != fd ? refcnt - 1 : refcnt));
 
   if(-1 != fd){
-    AutoLock auto_lock(&fdent_lock);
-
-    if(0 < refcnt){
-      refcnt--;
-    }
-    if(0 == refcnt){
+    if (__sync_sub_and_fetch(&refcnt, 1) == 0) {
+      AutoLock auto_lock(&fdent_lock);
       if(0 != cachepath.size()){
         CacheFileStat cfstat(path.c_str());
         if(!pagelist.Serialize(cfstat, true)){
@@ -695,8 +691,7 @@ int FdEntity::Dup(void)
   S3FS_PRN_DBG("[path=%s][fd=%d][refcnt=%d]", path.c_str(), fd, (-1 != fd ? refcnt + 1 : refcnt));
 
   if(-1 != fd){
-    AutoLock auto_lock(&fdent_lock);
-    refcnt++;
+    __sync_fetch_and_add(&refcnt, 1);
   }
   return fd;
 }
