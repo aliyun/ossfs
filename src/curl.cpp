@@ -3493,9 +3493,13 @@ int S3fsMultiCurl::MultiPerform(void)
           S3FS_PRN_ERR("curl_multi_fdset code: %d msg: %s", curlm_code, curl_multi_strerror(curlm_code));
           return -EIO;
         }
-        if(-1 == select(max_fd + 1, &r_fd, &w_fd, &e_fd, &timeout)){
-          S3FS_PRN_ERR("failed select - errno(%d)", errno);
-          return -errno;
+        if (max_fd == -1) {
+          usleep(20000);
+        } else {
+          if(-1 == select(max_fd + 1, &r_fd, &w_fd, &e_fd, &timeout)){
+            S3FS_PRN_ERR("failed select - errno(%d)", errno);
+            return -errno;
+          }
         }
       }
     }

@@ -22,6 +22,8 @@
 #define S3FS_COMMON_H_
 
 #include <sys/stat.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 #include "../config.h"
 
 //
@@ -69,7 +71,7 @@ enum s3fs_log_level{
          if(foreground){ \
            fprintf(stdout, "%s%s:%s(%d): " fmt "%s\n", S3FS_LOG_LEVEL_STRING(level), __FILE__, __func__, __LINE__, __VA_ARGS__); \
          }else{ \
-           syslog(S3FS_LOG_LEVEL_TO_SYSLOG(level), "%s:%s(%d): " fmt "%s", __FILE__, __func__, __LINE__, __VA_ARGS__); \
+           syslog(S3FS_LOG_LEVEL_TO_SYSLOG(level), "[tid-%d]%s:%s(%d): " fmt "%s", syscall(SYS_gettid), __FILE__, __func__, __LINE__, __VA_ARGS__); \
          } \
        }
 
@@ -78,7 +80,7 @@ enum s3fs_log_level{
          if(foreground){ \
            fprintf(stdout, "%s%s%s:%s(%d): " fmt "%s\n", S3FS_LOG_LEVEL_STRING(level), S3FS_LOG_NEST(nest), __FILE__, __func__, __LINE__, __VA_ARGS__); \
          }else{ \
-           syslog(S3FS_LOG_LEVEL_TO_SYSLOG(level), "%s" fmt "%s", S3FS_LOG_NEST(nest), __VA_ARGS__); \
+           syslog(S3FS_LOG_LEVEL_TO_SYSLOG(level), "[tid-%d]%s%s%s:%s(%d): " fmt "%s\n", syscall(SYS_gettid),S3FS_LOG_LEVEL_STRING(level), S3FS_LOG_NEST(nest), __FILE__, __func__, __LINE__, __VA_ARGS__); \
          } \
        }
 
