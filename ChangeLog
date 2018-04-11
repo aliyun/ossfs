@@ -1,5 +1,11 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.80.4 (11/04/2018)
+
+- fix request hang when flush the writing file
+- update acl description of user in README
+- sleep for awhile when curl_multi_fdset failed
+
 ## v1.80.3 (12/10/2017)
 
 - Fix a rename bug
