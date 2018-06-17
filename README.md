@@ -56,7 +56,8 @@ If you fail to find the corresponding installer package, you can also install th
 
 MacOS:
 ```
-brew install autoconf automake libtool libxml2 pkg-config
+brew install autoconf automake libtool libxml2 pkg-config openssl
+export PKG_CONFIG_PATH=/usr/local/opt/openssl/lib/pkgconfig
 ```
 install fuse: https://github.com/osxfuse/osxfuse/releases
 
