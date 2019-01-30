@@ -279,6 +279,7 @@ void CurlHandlerPool::ReturnHandler(CURL* h)
 #define	RAM_CRED_URL                ""
 #define RAMCRED_ACCESSKEYID         "AccessKeyId"
 #define RAMCRED_SECRETACCESSKEY     "SecretAccessKey"
+#define RAMCRED_ACCESSKEYSECRET     "AccessKeySecret"
 #define RAMCRED_ACCESSTOKEN         "Token"
 #define RAMCRED_EXPIRATION          "Expiration"
 #define RAMCRED_KEYCOUNT            4
@@ -1343,6 +1344,8 @@ bool S3fsCurl::ParseRAMCredentialResponse(const char* response, ramcredmap_t& ke
     if(string::npos != (pos = oneline.find(RAMCRED_ACCESSKEYID))){
       key = RAMCRED_ACCESSKEYID;
     }else if(string::npos != (pos = oneline.find(RAMCRED_SECRETACCESSKEY))){
+      key = RAMCRED_SECRETACCESSKEY;
+    }else if (string::npos != (pos = oneline.find(RAMCRED_ACCESSKEYSECRET))) {
       key = RAMCRED_SECRETACCESSKEY;
     }else if(string::npos != (pos = oneline.find(RAMCRED_ACCESSTOKEN))){
       key = RAMCRED_ACCESSTOKEN;
