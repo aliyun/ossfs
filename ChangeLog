@@ -1,5 +1,9 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.80.6 (24/05/2019)
+
+- support ECSRole
+
 ## v1.80.5 (25/05/2018)
 
 - Lock FdEntity when race condition

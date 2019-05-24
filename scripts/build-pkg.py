@@ -19,17 +19,19 @@ from subprocess import Popen, PIPE
 import shlex, random, string, os, shutil, glob, ntpath, re
 
 docker_images = {
-    'centos6.5:dev':'reg.docker.alibaba-inc.com/ossfs/ossfs-centos6.5:dev',
-    'centos6.5:test':'reg.docker.alibaba-inc.com/ossfs/ossfs-centos6.5:test',
-    'centos7.0:dev':'reg.docker.alibaba-inc.com/ossfs/ossfs-centos7.0:dev',
-    'centos7.0:test':'reg.docker.alibaba-inc.com/ossfs/ossfs-centos7.0:test',
-    'ubuntu14.04:dev':'reg.docker.alibaba-inc.com/ossfs/ossfs-ubuntu14.04:dev',
-    'ubuntu14.04:test':'reg.docker.alibaba-inc.com/ossfs/ossfs-ubuntu14.04:test',
-    'ubuntu16.04:dev':'reg.docker.alibaba-inc.com/ossfs/ossfs-ubuntu16.04:dev',
-    'ubuntu16.04:test':'reg.docker.alibaba-inc.com/ossfs/ossfs-ubuntu16.04:test',
+    'centos6.5:dev':'ossfs-centos6.5:dev',
+    'centos6.5:test':'ossfs-centos6.5:test',
+    'centos7.0:dev':'ossfs-centos7.0:dev',
+    'centos7.0:test':'ossfs-centos7.0:test',
+    'ubuntu14.04:dev':'ossfs-ubuntu14.04:dev',
+    'ubuntu14.04:test':'ossfs-ubuntu14.04:test',
+    'ubuntu16.04:dev':'ossfs-ubuntu16.04:dev',
+    'ubuntu16.04:test':'ossfs-ubuntu16.04:test',
+    'ubuntu18.04:dev':'ossfs-ubuntu18.04:dev',
+    'ubuntu18.04:test':'ossfs-ubuntu18.04:test',
 }
 
-os_list = ['centos6.5', 'centos7.0', 'ubuntu14.04', 'ubuntu16.04']
+os_list = ['centos6.5', 'centos7.0', 'ubuntu14.04', 'ubuntu16.04', 'ubuntu18.04']
 working_dir = '/tmp/ossfs'
 dest_dir = '/var/ossfs'
 ossfs_source_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
