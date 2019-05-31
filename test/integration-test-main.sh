@@ -268,6 +268,7 @@ function test_chmod {
 
 function test_chown {
     echo "Testing chown file function ..."
+    id
 
     # show current user id
     id
