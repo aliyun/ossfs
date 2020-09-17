@@ -239,6 +239,7 @@ class S3fsCurl
     static bool             is_sigv4;
     static const std::string skUserAgent;
     static bool            listobjectsv2;
+    static bool             requester_pays;
 
     // variables
     CURL*                hCurl;
@@ -371,6 +372,8 @@ class S3fsCurl
     static bool IsSignatureV4(void) { return S3fsCurl::is_sigv4; }
     static bool SetListObjectsV2(bool isset) { bool bresult = S3fsCurl::listobjectsv2; S3fsCurl::listobjectsv2 = isset; return bresult; }
     static bool IsListObjectsV2() { return S3fsCurl::listobjectsv2; }
+    static bool SetRequesterPays(bool flag) { bool old_flag = S3fsCurl::requester_pays; S3fsCurl::requester_pays = flag; return old_flag; }
+    static bool IsRequesterPays(void) { return S3fsCurl::requester_pays; }
 
     // methods
     bool CreateCurlHandle(bool force = false);
