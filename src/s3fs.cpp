@@ -4298,6 +4298,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     // OSSSSECKEYS                    Loaing Environment for Server Side Encrypting custom keys
     // OSSSSEKMSID                    Loaing Environment for Server Side Encrypting Key id
     //
+    if(0 == strcmp(arg, "requester_pays")){
+        S3fsCurl::SetRequesterPays(true);
+        return 0;
+    }
     if(0 == STR2NCMP(arg, "use_sse")){
       if(0 == strcmp(arg, "use_sse") || 0 == strcmp(arg, "use_sse=1")){ // use_sse=1 is old type paraemter
         // sse type is SSE_OSS

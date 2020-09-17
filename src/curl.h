@@ -238,6 +238,7 @@ class S3fsCurl
     static off_t            multipart_size;
     static bool             is_sigv4;
     static const std::string skUserAgent;
+    static bool             requester_pays;
 
     // variables
     CURL*                hCurl;
@@ -368,6 +369,8 @@ class S3fsCurl
     static off_t GetMultipartSize(void) { return S3fsCurl::multipart_size; }
     static bool SetSignatureV4(bool isset) { bool bresult = S3fsCurl::is_sigv4; S3fsCurl::is_sigv4 = isset; return bresult; }
     static bool IsSignatureV4(void) { return S3fsCurl::is_sigv4; }
+    static bool SetRequesterPays(bool flag) { bool old_flag = S3fsCurl::requester_pays; S3fsCurl::requester_pays = flag; return old_flag; }
+    static bool IsRequesterPays(void) { return S3fsCurl::requester_pays; }
 
     // methods
     bool CreateCurlHandle(bool force = false);
