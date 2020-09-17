@@ -48,6 +48,9 @@ FUSE singlethreaded option (disables multi-threaded operation)
 All ossfs options must given in the form where "opt" is:
  <option_name>=<option_value>
 .TP
+\fB\-o\fR requester_pays (default is disable)
+This option instructs ossfs to enable requests involving Requester Pays buckets (It includes the 'x-oss-request-payer: requester' entry in the request header).
+.TP
 \fB\-o\fR default_acl (default="private")
 the default canned acl to apply to all written OSS objects, e.g., "public-read".
 Any created files will have this canned acl.
