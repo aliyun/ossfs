@@ -325,6 +325,7 @@ off_t            S3fsCurl::multipart_size      = MULTIPART_SIZE; // default
 bool             S3fsCurl::is_sigv4            = true;           // default
 const string     S3fsCurl::skUserAgent = "aliyun-sdk-http/1.0()/ossfs" + string(VERSION);
 bool             S3fsCurl::listobjectsv2       = false;          // default
+bool             S3fsCurl::requester_pays      = false;          // default
 
 //-------------------------------------------------------------------
 // Class methods for S3fsCurl
@@ -2083,6 +2084,9 @@ int S3fsCurl::DeleteRequest(const char* tpath)
   string date    = get_date_rfc850();
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("DELETE", "", "", date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2211,6 +2215,9 @@ bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* 
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
   requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", skUserAgent.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("HEAD", "", "", date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2355,6 +2362,9 @@ int S3fsCurl::PutHeadRequest(const char* tpath, headers_t& meta, bool is_copy)
   string date    = get_date_rfc850();
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", "", ContentType, date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2467,6 +2477,9 @@ int S3fsCurl::PutRequest(const char* tpath, headers_t& meta, int fd)
   string date    = get_date_rfc850();
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", strMD5, ContentType, date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2535,6 +2548,9 @@ int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("GET", "", "", date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2617,6 +2633,9 @@ int S3fsCurl::CheckBucket(void)
   string date    = get_date_rfc850();
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("GET", "", "", date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2667,6 +2686,9 @@ int S3fsCurl::ListBucketRequest(const char* tpath, const char* query, string& si
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
     string sresource = resource + "/";
     if (signResource != "") {
@@ -2774,6 +2796,9 @@ int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, string
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Length", NULL);
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("POST", "", contype, date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2860,6 +2885,9 @@ int S3fsCurl::CompleteMultipartPostRequest(const char* tpath, string& upload_id,
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("POST", "", contype, date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2909,6 +2937,9 @@ int S3fsCurl::MultipartListRequest(string& body)
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("GET", "", "", date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -2958,6 +2989,9 @@ int S3fsCurl::AbortMultipartUpload(const char* tpath, string& upload_id)
   string date    = get_date_rfc850();
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("DELETE", "", "", date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -3038,6 +3072,9 @@ int S3fsCurl::UploadMultipartPostSetup(const char* tpath, int part_num, string& 
 	  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-MD5", strMD5.c_str());
   }
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", strMD5, "", date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
@@ -3134,6 +3171,9 @@ int S3fsCurl::CopyMultipartPostRequest(const char* from, const char* to, int par
   string date    = get_date_rfc850();
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
 
+  if (S3fsCurl::IsRequesterPays()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+  }
   if(!S3fsCurl::IsPublicBucket()){
 	  string Signature = CalcSignature("PUT", "", ContentType, date, resource);
 	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());

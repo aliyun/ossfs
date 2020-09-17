@@ -212,6 +212,13 @@ If this option is specified with nocopapi, the ossfs ignores it.
 \fB\-o\fR use_path_request_style (use legacy API calling style)
 Enble compatibility with OSS-like APIs which do not support the virtual-host request style, by using the older path request style.
 .TP
+\fB\-o\fR listobjectsv2 (use ListObjectsV2)
+Issue ListObjectsV2 instead of ListObjects, useful on object
+stores without ListObjects support.
+.TP
+\fB\-o\fR requester_pays (default is disable)
+This option instructs ossfs to enable requests involving Requester Pays buckets (It includes the 'x-oss-request-payer: requester' entry in the request header).
+.TP
 \fB\-o\fR dbglevel (default="crit")
 Set the debug message level. set value as crit(critical), err(error), warn(warning), info(information) to debug level. default debug level is critical.
 If ossfs run with "-d" option, the debug level is set information.
