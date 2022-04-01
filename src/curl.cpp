@@ -324,6 +324,7 @@ int              S3fsCurl::max_parallel_cnt    = 5;              // default
 off_t            S3fsCurl::multipart_size      = MULTIPART_SIZE; // default
 bool             S3fsCurl::is_sigv4            = true;           // default
 const string     S3fsCurl::skUserAgent = "aliyun-sdk-http/1.0()/ossfs" + string(VERSION);
+bool             S3fsCurl::listobjectsv2       = false;          // default
 
 //-------------------------------------------------------------------
 // Class methods for S3fsCurl
@@ -2596,10 +2597,17 @@ int S3fsCurl::CheckBucket(void)
   if(!CreateCurlHandle(true)){
     return -1;
   }
+
+  std::string urlargs;
+  if(S3fsCurl::IsListObjectsV2()){
+    urlargs = "?list-type=2";
+  }
+  
   string resource;
   string turl;
   MakeUrlResource(get_realpath("/").c_str(), resource, turl);
 
+  turl            += urlargs;
   url             = prepare_url(turl.c_str());
   path            = get_realpath("/");
   requestHeaders  = NULL;
@@ -2631,7 +2639,7 @@ int S3fsCurl::CheckBucket(void)
   return result;
 }
 
-int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
+int S3fsCurl::ListBucketRequest(const char* tpath, const char* query, string& signResource)
 {
   S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
@@ -2660,8 +2668,12 @@ int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
   requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
 
   if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("GET", "", "", date, (resource + "/"));
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
+    string sresource = resource + "/";
+    if (signResource != "") {
+      sresource += "?" + signResource;
+    }
+    string Signature = CalcSignature("GET", "", "", date, sresource);
+    requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
   }
 
   // setopt
