@@ -238,6 +238,7 @@ class S3fsCurl
     static off_t            multipart_size;
     static bool             is_sigv4;
     static const std::string skUserAgent;
+    static bool            listobjectsv2;
 
     // variables
     CURL*                hCurl;
@@ -368,6 +369,8 @@ class S3fsCurl
     static off_t GetMultipartSize(void) { return S3fsCurl::multipart_size; }
     static bool SetSignatureV4(bool isset) { bool bresult = S3fsCurl::is_sigv4; S3fsCurl::is_sigv4 = isset; return bresult; }
     static bool IsSignatureV4(void) { return S3fsCurl::is_sigv4; }
+    static bool SetListObjectsV2(bool isset) { bool bresult = S3fsCurl::listobjectsv2; S3fsCurl::listobjectsv2 = isset; return bresult; }
+    static bool IsListObjectsV2() { return S3fsCurl::listobjectsv2; }
 
     // methods
     bool CreateCurlHandle(bool force = false);
@@ -389,7 +392,7 @@ class S3fsCurl
     int PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size, sse_type_t ssetype, std::string& ssevalue);
     int GetObjectRequest(const char* tpath, int fd, off_t start = -1, ssize_t size = -1);
     int CheckBucket(void);
-    int ListBucketRequest(const char* tpath, const char* query);
+    int ListBucketRequest(const char* tpath, const char* query, std::string& signResource);
     int PreMultipartPostRequest(const char* tpath, headers_t& meta, std::string& upload_id, bool is_copy);
     int CompleteMultipartPostRequest(const char* tpath, std::string& upload_id, etaglist_t& parts);
     int UploadMultipartPostRequest(const char* tpath, int part_num, std::string& upload_id);

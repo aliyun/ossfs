@@ -152,6 +152,7 @@ static int append_objects_from_xml(const char* path, xmlDocPtr doc, S3ObjList& h
 static bool GetXmlNsUrl(xmlDocPtr doc, string& nsurl);
 static xmlChar* get_base_exp(xmlDocPtr doc, const char* exp);
 static xmlChar* get_prefix(xmlDocPtr doc);
+static xmlChar* get_next_continuation_token(xmlDocPtr doc);
 static xmlChar* get_next_marker(xmlDocPtr doc);
 static char* get_object_name(xmlDocPtr doc, xmlNodePtr node, const char* path);
 static int put_headers(const char* path, headers_t& meta, bool is_copy);
@@ -2410,6 +2411,7 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
   string    query_delimiter;;
   string    query_prefix;;
   string    query_maxkey;;
+  string    next_continuation_token = "";
   string    next_marker = "";
   bool      truncated = true;
   S3fsCurl  s3fscurl;
@@ -2439,7 +2441,17 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
   }
 
   while(truncated){
-    string each_query = query_delimiter;
+    string each_query;
+    string sign_resource;
+    if(next_continuation_token != ""){
+      each_query += "continuation-token=" + urlEncode(next_continuation_token) + "&";
+      sign_resource = "continuation-token=" + next_continuation_token; 
+      next_continuation_token = "";
+    }
+    each_query += query_delimiter;
+    if(S3fsCurl::IsListObjectsV2()){
+      each_query += "list-type=2&";
+    }
     if(next_marker != ""){
       each_query += "marker=" + urlEncode(next_marker) + "&";
       next_marker = "";
@@ -2448,7 +2460,7 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     each_query += query_prefix;
 
     // request
-    if(0 != (result = s3fscurl.ListBucketRequest(path, each_query.c_str()))){
+    if(0 != (result = s3fscurl.ListBucketRequest(path, each_query.c_str(), sign_resource))){
       S3FS_PRN_ERR("ListBucketRequest returns with error.");
       return result;
     }
@@ -2465,11 +2477,16 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
       return -1;
     }
     if(true == (truncated = is_truncated(doc))){
-      xmlChar*	tmpch = get_next_marker(doc);
-      if(tmpch){
+      xmlChar* tmpch;
+      if(NULL != (tmpch = get_next_continuation_token(doc))){
+        next_continuation_token = (char*)tmpch;
+        xmlFree(tmpch);
+      }else if(NULL != (tmpch = get_next_marker(doc))){
         next_marker = (char*)tmpch;
         xmlFree(tmpch);
-      }else{
+      }		
+
+      if(next_continuation_token == "" && next_marker == ""){
         // If did not specify "delimiter", s3 did not return "NextMarker".
         // On this case, can use lastest name for next marker.
         //
@@ -2699,6 +2716,11 @@ static xmlChar* get_base_exp(xmlDocPtr doc, const char* exp)
 static xmlChar* get_prefix(xmlDocPtr doc)
 {
   return get_base_exp(doc, "Prefix");
+}
+
+static xmlChar* get_next_continuation_token(xmlDocPtr doc)
+{
+    return get_base_exp(doc, "NextContinuationToken");
 }
 
 static xmlChar* get_next_marker(xmlDocPtr doc)
@@ -4565,6 +4587,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == strcmp(arg, "use_path_request_style")){
       pathrequeststyle = true;
+      return 0;
+    }
+    if(0 == strcmp(arg, "listobjectsv2")){
+      S3fsCurl::SetListObjectsV2(true);
       return 0;
     }
     //
