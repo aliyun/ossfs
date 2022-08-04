@@ -681,8 +681,12 @@ void FdEntity::Close(void)
   S3FS_PRN_DBG("[path=%s][fd=%d][refcnt=%d]", path.c_str(), fd, (-1 != fd ? refcnt - 1 : refcnt));
 
   if(-1 != fd){
-    if (__sync_sub_and_fetch(&refcnt, 1) == 0) {
-      AutoLock auto_lock(&fdent_lock);
+    AutoLock auto_lock(&fdent_lock);
+
+    if(0 < refcnt){
+      refcnt--;
+    }
+    if(0 == refcnt){
       if(0 != cachepath.size()){
         CacheFileStat cfstat(path.c_str());
         if(!pagelist.Serialize(cfstat, true)){
@@ -2052,11 +2056,11 @@ FdEntity* FdManager::ExistOpen(const char* path, int existfd, bool ignore_existf
         if(0 == strcmp((*iter).second->GetPath(), path)){
           ent = (*iter).second;
           ent->Dup();
-          break;
         }else{
           // found fd, but it is used another file(file descriptor is recycled)
           // so returns NULL.
         }
+        break;
       }
     }
   }
