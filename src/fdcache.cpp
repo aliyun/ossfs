@@ -943,7 +943,7 @@ int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time, bool no_fd_lock_
 }
 
 // [NOTE]
-// This method is called from olny nocopapi functions.
+// This method is called from only nocopyapi functions.
 // So we do not check disk space for this option mode, if there is no enough
 // disk space this method will be failed.
 //
@@ -1228,7 +1228,7 @@ int FdEntity::NoCacheLoadAndPost(off_t start, size_t size)
     if(0 != size && static_cast<size_t>(start + size) <= static_cast<size_t>((*iter)->offset)){
       break;
     }
-    // download earch multipart size(default 10MB) in unit
+    // download each multipart size(default 10MB) in unit
     for(size_t oneread = 0, totalread = ((*iter)->offset < start ? start : 0); totalread < (*iter)->bytes; totalread += oneread){
       int   upload_fd = fd;
       off_t offset    = (*iter)->offset + totalread;
@@ -1276,7 +1276,7 @@ int FdEntity::NoCacheLoadAndPost(off_t start, size_t size)
         // after this, file length is (offset + size), but file does not use any disk space.
         //
         if(-1 == ftruncate(tmpfd, 0) || -1 == ftruncate(tmpfd, (offset + oneread))){
-          S3FS_PRN_ERR("failed to tatic_cast<size_t>runcate temporary file(%d).", tmpfd);
+          S3FS_PRN_ERR("failed to truncate temporary file(%d).", tmpfd);
           result = -EIO;
           break;
         }
@@ -1430,7 +1430,7 @@ int FdEntity::RowFlush(const char* tpath, bool force_sync)
       // check disk space
       if(FdManager::IsSafeDiskSpace(NULL, restsize)){
         // enough disk space
-        // Load all unitialized area
+        // Load all uninitialized area
         if(0 != (result = Load())){
           S3FS_PRN_ERR("failed to upload all area(errno=%d)", result);
           return static_cast<ssize_t>(result);
@@ -1444,7 +1444,7 @@ int FdEntity::RowFlush(const char* tpath, bool force_sync)
         }
       }
     }else{
-      // alreay start miltipart uploading
+      // already start multipart uploading
     }
   }
 
@@ -1631,7 +1631,7 @@ ssize_t FdEntity::Write(const char* bytes, off_t start, size_t size)
     if(FdManager::IsSafeDiskSpace(NULL, restsize)){
       // enough disk space
 
-      // Load unitialized area which starts from 0 to (start + size) before writing.
+      // Load uninitialized area which starts from 0 to (start + size) before writing.
       if(0 < start && 0 != (result = Load(0, static_cast<size_t>(start)))){
         S3FS_PRN_ERR("failed to load uninitialized area before writing(errno=%d)", result);
         return static_cast<ssize_t>(result);
@@ -1651,7 +1651,7 @@ ssize_t FdEntity::Write(const char* bytes, off_t start, size_t size)
       mp_size  = 0;
     }
   }else{
-    // alreay start miltipart uploading
+    // already start multipart uploading
   }
 
   // Writing
@@ -1849,7 +1849,7 @@ bool FdManager::MakeRandomTempPath(const char* path, string& tmppath)
 {
   char szBuff[64];
 
-  sprintf(szBuff, NOCACHE_PATH_PREFIX_FORM, random());     // warry for performance, but maybe don't warry.
+  sprintf(szBuff, NOCACHE_PATH_PREFIX_FORM, random());     // worry for performance, but maybe don't worry.
   tmppath  = szBuff;
   tmppath += path ? path : "";
   return true;
@@ -2017,7 +2017,7 @@ FdEntity* FdManager::Open(const char* path, headers_t* pmeta, ssize_t size, time
       // using cache
       fent[string(path)] = ent;
     }else{
-      // not using cache, so the key of fdentity is set not really existsing path.
+      // not using cache, so the key of fdentity is set not really existing path.
       // (but not strictly unexisting path.)
       //
       // [NOTE]
