@@ -595,6 +595,28 @@ int mkdirp(const string& path, mode_t mode)
   return 0;
 }
 
+// get existed directory path
+string get_exist_directory_path(const string& path)
+{
+  string       existed("/");    // "/" is existed.
+  string       base;
+  string       component;
+  stringstream ss(path);
+  while (getline(ss, component, '/')) {
+    if(base != "/"){
+      base += "/";
+    }
+    base += component;
+    struct stat st;
+    if(0 == stat(base.c_str(), &st) && S_ISDIR(st.st_mode)){
+      existed = base;
+    }else{
+      break;
+    }
+  }
+  return existed;
+}
+
 bool check_exist_dir_permission(const char* dirpath)
 {
   if(!dirpath || '\0' == dirpath[0]){
