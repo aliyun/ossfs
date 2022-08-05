@@ -188,6 +188,7 @@ class FdManager
     static pthread_mutex_t cache_cleanup_lock;
     static bool            is_lock_init;
     static std::string     cache_dir;
+    static bool            check_cache_dir_exist;
     static size_t          free_disk_space; // limit free disk space
 
     fdent_map_t            fent;
@@ -211,6 +212,8 @@ class FdManager
     static bool MakeCachePath(const char* path, std::string& cache_path, bool is_create_dir = true, bool is_mirror_path = false);
     static bool CheckCacheTopDir(void);
     static bool MakeRandomTempPath(const char* path, std::string& tmppath);
+    static bool SetCheckCacheDirExist(bool is_check);
+    static bool CheckCacheDirExist(void);
 
     static size_t GetEnsureFreeDiskSpace(void) { return FdManager::free_disk_space; }
     static size_t SetEnsureFreeDiskSpace(size_t size);
