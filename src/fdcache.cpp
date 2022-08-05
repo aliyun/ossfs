@@ -46,7 +46,7 @@
 #include "s3fs_util.h"
 #include "string_util.h"
 #include "curl.h"
-
+#include "cache.h"
 using namespace std;
 
 //------------------------------------------------
