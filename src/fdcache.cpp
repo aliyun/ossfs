@@ -1833,11 +1833,21 @@ bool FdManager::DeleteCacheDirectory(void)
   if(0 == FdManager::cache_dir.size()){
     return true;
   }
-  string cache_dir;
-  if(!FdManager::MakeCachePath(NULL, cache_dir, false)){
+
+  string cache_path;
+  if(!FdManager::MakeCachePath(NULL, cache_path, false)){
     return false;
   }
-  return delete_files_in_dir(cache_dir.c_str(), true);
+  if(!delete_files_in_dir(cache_path.c_str(), true)){
+    return false;
+  }
+
+  string mirror_path = FdManager::cache_dir + "/." + bucket + ".mirror";
+  if(!delete_files_in_dir(mirror_path.c_str(), true)){
+    return false;
+  }
+
+  return true;
 }
 
 int FdManager::DeleteCacheFile(const char* path)
