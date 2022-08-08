@@ -1441,6 +1441,18 @@ static int s3fs_rename(const char* from, const char* to)
     return result;
   }
 
+  // flush pending writes if file is open
+  FdEntity *entity = FdManager::get()->ExistOpen(from);
+  if(entity != NULL){
+    if(0 != (result = entity->Flush(true))){
+      S3FS_PRN_ERR("could not upload file(%s): result=%d", to, result);
+      return result;
+    }
+    StatCache::getStatCacheData()->DelStat(from);
+    FdManager::get()->Close(entity);
+    entity = NULL;
+  }
+
   // files larger than 5GB must be modified via the multipart interface
   if(S_ISDIR(buf.st_mode)){
     result = rename_directory(from, to);
