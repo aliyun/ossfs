@@ -847,13 +847,22 @@ int FdEntity::Open(headers_t* pmeta, ssize_t size, time_t time, bool no_fd_lock_
   if(0 != cachepath.size()){
     // using cache
 
+    struct stat st;
+    if(stat(cachepath.c_str(), &st) == 0){
+      if(st.st_mtime < time){
+        S3FS_PRN_DBG("cache file stale, removing: %s", cachepath.c_str());
+        if(unlink(cachepath.c_str()) != 0){
+          return (0 == errno ? -EIO : -errno);
+        }
+      }
+    }
+
     // open cache and cache stat file, load page info.
     CacheFileStat cfstat(path.c_str());
 
     // try to open cache file
     if(-1 != (fd = open(cachepath.c_str(), O_RDWR)) && pagelist.Serialize(cfstat, false)){
       // succeed to open cache file and to load stats data
-      struct stat st;
       memset(&st, 0, sizeof(struct stat));
       if(-1 == fstat(fd, &st)){
         S3FS_PRN_ERR("fstat is failed. errno(%d)", errno);
