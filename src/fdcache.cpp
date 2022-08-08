@@ -1961,8 +1961,15 @@ bool FdManager::CheckCacheDirExist(void)
   return true;
 }
 
+size_t FdManager::GetEnsureFreeDiskSpace(void)
+{
+  AutoLock auto_lock(&FdManager::reserved_diskspace_lock);
+  return FdManager::free_disk_space;
+}
+
 size_t FdManager::SetEnsureFreeDiskSpace(size_t size)
 {
+  AutoLock auto_lock(&FdManager::reserved_diskspace_lock);
   size_t old = FdManager::free_disk_space;
   FdManager::free_disk_space = size;
   return old;
@@ -2321,8 +2328,8 @@ void FdManager::CleanupCacheDirInternal(const std::string &path)
 
 bool FdManager::ReserveDiskSpace(size_t size)
 {
-  AutoLock auto_lock(&FdManager::reserved_diskspace_lock);
   if(IsSafeDiskSpace(NULL, size)){
+    AutoLock auto_lock(&FdManager::reserved_diskspace_lock);
     free_disk_space += size;
     return true;
   }
