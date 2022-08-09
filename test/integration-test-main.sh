@@ -8,14 +8,39 @@ source $COMMON
 
 # Configuration
 TEST_TEXT="HELLO WORLD"
-TEST_TEXT_FILE=test-s3fs.txt
+TEST_TEXT_FILE=test-ossfs.txt
 TEST_DIR=testdir
-ALT_TEST_TEXT_FILE=test-s3fs-ALT.txt
+ALT_TEST_TEXT_FILE=test-ossfs-ALT.txt
 TEST_TEXT_FILE_LENGTH=15
-BIG_FILE=big-file-s3fs.txt
+BIG_FILE=big-file-ossfs.txt
 BIG_FILE_LENGTH=$((25 * 1024 * 1024))
 CUR_DIR=`pwd`
 TEST_BUCKET_MOUNT_POINT_1=$1
+
+function get_size() {
+    stat -c %s "$1"
+}
+
+function check_file_size() {
+    FILE_NAME="$1"
+    EXPECTED_SIZE="$2"
+
+    # Verify file is zero length via metadata
+    size=$(get_size ${FILE_NAME})
+    if [ $size -ne $EXPECTED_SIZE ]
+    then
+        echo "error: expected ${FILE_NAME} to be zero length"
+        return 1
+    fi
+
+    # Verify file is zero length via data
+    size=$(cat ${FILE_NAME} | wc -c)
+    if [ $size -ne $EXPECTED_SIZE ]
+    then
+        echo "error: expected ${FILE_NAME} to be $EXPECTED_SIZE length, got $size"
+        return 1
+    fi
+}
 
 function mk_test_file {
     if [ $# == 0 ]; then
@@ -29,6 +54,21 @@ function mk_test_file {
         echo "Could not create file ${TEST_TEXT_FILE}, it does not exist"
         exit 1
     fi
+
+    # wait & check
+    BASE_TEXT_LENGTH=`echo $TEXT | wc -c | awk '{print $1}'`
+    TRY_COUNT=10
+    while true; do
+        MK_TEXT_LENGTH=`wc -c $TEST_TEXT_FILE | awk '{print $1}'`
+        if [ $BASE_TEXT_LENGTH -eq $MK_TEXT_LENGTH ]; then
+            break
+        fi
+        TRY_COUNT=`expr $TRY_COUNT - 1`
+        if [ $TRY_COUNT -le 0 ]; then
+            echo "Could not create file ${TEST_TEXT_FILE}, that file size is something wrong"
+        fi
+        sleep 1
+    done
 }
 
 function rm_test_file {
@@ -77,20 +117,16 @@ function rm_test_dir {
 
 function test_append_file {
     echo "Testing append to file ..."
+
+    TEST_INPUT="echo ${TEST_TEXT} to ${TEST_TEXT_FILE}"
+
     # Write a small test file
     for x in `seq 1 $TEST_TEXT_FILE_LENGTH`
     do
-       echo "echo ${TEST_TEXT} to ${TEST_TEXT_FILE}"
+        echo $TEST_INPUT
     done > ${TEST_TEXT_FILE}
 
-    # Verify contents of file
-    echo "Verifying length of test file"
-    FILE_LENGTH=`wc -l $TEST_TEXT_FILE | awk '{print $1}'`
-    if [ "$FILE_LENGTH" -ne "$TEST_TEXT_FILE_LENGTH" ]
-    then
-       echo "error: expected $TEST_TEXT_FILE_LENGTH , got $FILE_LENGTH"
-       exit 1
-    fi
+    check_file_size "${TEST_TEXT_FILE}" $(($TEST_TEXT_FILE_LENGTH * $(echo $TEST_INPUT | wc -c)))
 
     rm_test_file
 }
@@ -104,11 +140,8 @@ function test_truncate_file {
     : > ${TEST_TEXT_FILE}
 
     # Verify file is zero length
-    if [ -s ${TEST_TEXT_FILE} ]
-    then
-        echo "error: expected ${TEST_TEXT_FILE} to be zero length"
-        exit 1
-    fi
+    check_file_size "${TEST_TEXT_FILE}" 0
+
     rm_test_file
 }
 
@@ -122,12 +155,8 @@ function test_truncate_empty_file {
     truncate ${TEST_TEXT_FILE} -s $t_size
 
     # Verify file is zero length
-    size=$(stat -c %s ${TEST_TEXT_FILE})
-    if [ $t_size -ne $size ]
-    then
-        echo "error: expected ${TEST_TEXT_FILE} to be $t_size length, got $size"
-        exit 1
-    fi
+    check_file_size "${TEST_TEXT_FILE}" $t_size
+
     rm_test_file
 }
 
@@ -470,9 +499,142 @@ function test_file_size_in_stat_cache {
 
 function test_ut_ossfs {
     echo "Testing ossfs python ut..."
-    python $CUR_DIR/ut_test.py
+    python3 $CUR_DIR/ut_test.py
 }
 
+function test_mv_empty_directory {
+    echo "Testing mv directory function ..."
+    if [ -e $TEST_DIR ]; then
+       echo "Unexpected, this file/directory exists: ${TEST_DIR}"
+       return 1
+    fi
+
+    mk_test_dir
+
+    mv ${TEST_DIR} ${TEST_DIR}_rename
+    if [ ! -d "${TEST_DIR}_rename" ]; then
+       echo "Directory ${TEST_DIR} was not renamed"
+       return 1
+    fi
+
+    rmdir ${TEST_DIR}_rename
+    if [ -e "${TEST_DIR}_rename" ]; then
+       echo "Could not remove the test directory, it still exists: ${TEST_DIR}_rename"
+       return 1
+    fi
+}
+
+function test_mv_nonempty_directory {
+    echo "Testing mv directory function ..."
+    if [ -e $TEST_DIR ]; then
+       echo "Unexpected, this file/directory exists: ${TEST_DIR}"
+       return 1
+    fi
+
+    mk_test_dir
+
+    touch ${TEST_DIR}/file
+
+    mv ${TEST_DIR} ${TEST_DIR}_rename
+    if [ ! -d "${TEST_DIR}_rename" ]; then
+       echo "Directory ${TEST_DIR} was not renamed"
+       return 1
+    fi
+
+    rm -r ${TEST_DIR}_rename
+    if [ -e "${TEST_DIR}_rename" ]; then
+       echo "Could not remove the test directory, it still exists: ${TEST_DIR}_rename"
+       return 1
+    fi
+}
+
+function test_rm_rf_dir {
+   echo "Test that rm -rf will remove directory with contents"
+   # Create a dir with some files and directories
+   mkdir dir1
+   mkdir dir1/dir2
+   touch dir1/file1
+   touch dir1/dir2/file2
+
+   # Remove the dir with recursive rm
+   rm -rf dir1
+
+   if [ -e dir1 ]; then
+       echo "rm -rf did not remove $PWD/dir1"
+       return 1
+   fi
+}
+
+function test_copy_file {
+   echo "Test simple copy"
+
+   dd if=/dev/urandom of=/tmp/simple_file bs=1024 count=1
+   cp /tmp/simple_file copied_simple_file
+   cmp /tmp/simple_file copied_simple_file
+
+   rm_test_file /tmp/simple_file
+   rm_test_file copied_simple_file
+}
+
+function test_write_after_seek_ahead {
+   echo "Test writes succeed after a seek ahead"
+   dd if=/dev/zero of=testfile seek=1 count=1 bs=1024
+   rm_test_file testfile
+}
+
+function test_overwrite_existing_file_range {
+    echo "Test overwrite range succeeds"
+    dd if=<(seq 1000) of=${TEST_TEXT_FILE}
+    dd if=/dev/zero of=${TEST_TEXT_FILE} seek=1 count=1 bs=1024 conv=notrunc
+    cmp ${TEST_TEXT_FILE} <(
+        seq 1000 | head -c 1024
+        dd if=/dev/zero count=1 bs=1024
+        seq 1000 | tail -c +2049
+    )
+    rm_test_file
+}
+
+function test_concurrency {
+    echo "Test concurrent updates to a directory"
+    for i in `seq 5`; do echo foo > $i; done
+    for process in `seq 10`; do
+        for i in `seq 5`; do
+            file=$(ls `seq 5` | sed -n "$(($RANDOM % 5 + 1))p")
+            cat $file >/dev/null || true
+            rm -f $file
+            echo foo > $file || true
+        done &
+    done
+    wait
+    rm -f `seq 5`
+}
+
+function test_concurrent_writes {
+    echo "Test concurrent updates to a file"
+    dd if=/dev/urandom of=${TEST_TEXT_FILE} bs=$BIG_FILE_LENGTH count=1
+    for process in `seq 10`; do
+        dd if=/dev/zero of=${TEST_TEXT_FILE} seek=$(($RANDOM % $BIG_FILE_LENGTH)) count=1 bs=1024 conv=notrunc &
+    done
+    wait
+    rm_test_file
+}
+
+function test_open_second_fd {
+    echo "read from an open fd"
+    rm_test_file second_fd_file
+    RESULT=$( (echo foo ; wc -c < second_fd_file >&2) 2>& 1>second_fd_file)
+    if [ "$RESULT" -ne 4 ]; then
+        echo "size mismatch, expected: 4, was: ${RESULT}"
+        return 1
+    fi
+    rm_test_file second_fd_file
+}
+
+function test_write_multiple_offsets {
+    echo "test writing to multiple offsets"
+    python3 $CUR_DIR/write_multiple_offsets.py ${TEST_TEXT_FILE}
+    rm_test_file ${TEST_TEXT_FILE}
+}
 
 function run_all_tests {
     test_append_file
@@ -487,18 +649,28 @@ function run_all_tests {
     test_list
     test_list_many_files
     # XXX: Haoran: Do not know why this case failed in script but passed by manually run.
-    #test_remove_nonempty_directory
+    test_remove_nonempty_directory
     # TODO: broken: https://github.com/s3fs-fuse/s3fs-fuse/issues/145
-    #test_rename_before_close
+    test_rename_before_close
     test_multipart_upload
     # TODO: test disabled until S3Proxy 1.5.0 is released
-    #test_multipart_copy
+    test_multipart_copy
     test_special_characters
     test_symlink
     test_extended_attributes
     test_mtime_file
     test_file_size_in_stat_cache
     test_ut_ossfs
+    test_mv_empty_directory
+    test_mv_nonempty_directory
+    test_rm_rf_dir
+    test_copy_file
+    test_write_after_seek_ahead
+    test_overwrite_existing_file_range
+    test_concurrency
+    test_concurrent_writes
+    test_open_second_fd
+    test_write_multiple_offsets
 }
 
 # Mount the bucket
