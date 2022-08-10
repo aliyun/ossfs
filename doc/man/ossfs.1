@@ -219,6 +219,17 @@ stores without ListObjects support.
 \fB\-o\fR requester_pays (default is disable)
 This option instructs ossfs to enable requests involving Requester Pays buckets (It includes the 'x-oss-request-payer: requester' entry in the request header).
 .TP
+\fB\-o\fR notsup_compat_dir (not support compatibility directory types)
+As a default, ossfs supports objects of the directory type as much as possible and recognizes them as directories.
+Objects that can be recognized as directory objects are "dir/", "dir", "dir_$folder$", and there is a file object that does not have a directory object but contains that directory path.
+ossfs needs redundant communication to support all these directory types.
+The object as the directory created by ossfs is "dir/".
+By restricting ossfs to recognize only "dir/" as a directory, communication traffic can be reduced.
+This option is used to give this restriction to ossfs.
+However, if there is a directory object other than "dir/" in the bucket, specifying this option is not recommended.
+ossfs may not be able to recognize the object correctly if an object created by ossfs exists in the bucket.
+Please use this option when the directory in the bucket is only "dir/" object.
+.TP
 \fB\-o\fR dbglevel (default="crit")
 Set the debug message level. set value as crit(critical), err(error), warn(warning), info(information) to debug level. default debug level is critical.
 If ossfs run with "-d" option, the debug level is set information.
