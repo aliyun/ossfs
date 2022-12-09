@@ -494,7 +494,7 @@ function test_mtime_file {
 
 function test_file_size_in_stat_cache {
     echo "Testing file size in stat cache..."
-    python $CUR_DIR/stat_cache_test.py $TEST_BUCKET_MOUNT_POINT_1
+    python3 $CUR_DIR/stat_cache_test.py $TEST_BUCKET_MOUNT_POINT_1
 }
 
 function test_ut_ossfs {
