@@ -1,5 +1,31 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.80.7 (13/12/2022)
+
+- Add listobjectV2 option.
+- Add notsup_compat_dir option.
+- Add requester_pays option.
+- Refactored the check_object_access function.
+- Fixed a bug about overwrite metadata at updating directory stats.
+- Flush file before renaming & Fixed a rename bug when enable_noobj_cache.
+- Always hold lock when accessing free_disk_space.
+- Remove cache file when object time differs.
+- Fix deadlock due to fdmanager_lock and fdent_data_lock.
+- Remove mirror path when deleting cache.
+- Load tail range during overwrite.
+- Fixed ref-count when error occurred.
+- Increase FdEntity reference count when returning.
+- Add disk space reservation.
+- Reduce lock contention on file open.
+- Fix condition for parallel download.
+- Improved use of temporary files.
+- Fix intermittent upload failures on macOS.
+- Add remove stat file cache dir api.
+- Some files partially contain NUL content after uploading.
+- Fixed writing sparsed file.
+- Cleanup cache directory when running out of disk space.
+- Add mirror file logic for removing cache file.
+
 ## v1.80.6 (24/05/2019)
 
 - support ECSRole
