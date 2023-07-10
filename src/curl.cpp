@@ -2165,8 +2165,14 @@ bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_o
     }
 
   }else if(SSE_KMS == ssetype){
-	// Do not support KMS
-	return false;
+    if (is_only_c) {
+        return true;
+    }
+    ssevalue = OssfsCurl::GetSseKmsId();
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption", "KMS");
+    if (!ssevalue.empty()) {
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-key-id", ssevalue.c_str());
+    }
   }
   return true;
 }
