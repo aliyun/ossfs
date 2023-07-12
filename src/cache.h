@@ -180,7 +180,7 @@ class StatCache
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
-bool convert_header_to_stat(const char* path, const headers_t& meta, struct stat* pst, bool forcedir = false);
+bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, struct stat* pst, bool forcedir = false);
 
 #endif // S3FS_CACHE_H_
 

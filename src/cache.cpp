@@ -362,7 +362,7 @@ bool StatCache::AddStat(const std::string& key, headers_t& meta, bool forcedir, 
 
     // make new
     stat_cache_entry* ent = new stat_cache_entry();
-    if(!convert_header_to_stat(key.c_str(), meta, &(ent->stbuf), forcedir)){
+    if(!convert_header_to_stat(key, meta, &(ent->stbuf), forcedir)){
         delete ent;
         return false;
     }
@@ -412,6 +412,9 @@ bool StatCache::AddStat(const std::string& key, headers_t& meta, bool forcedir, 
 // Updates only meta data if cached data exists.
 // And when these are updated, it also updates the cache time.
 //
+// Since the file mode may change while the file is open, it is
+// updated as well.
+//
 bool StatCache::UpdateMetaStats(const std::string& key, headers_t& meta)
 {
     if(CacheSize < 1){
@@ -445,6 +448,7 @@ bool StatCache::UpdateMetaStats(const std::string& key, headers_t& meta)
 
     // Update time.
     SetStatCacheTime(ent->cache_date);
+    ent->stbuf.st_mode = get_mode(meta, key);
 
     return true;
 }
@@ -763,9 +767,9 @@ bool StatCache::DelSymlink(const char* key, bool lock_already_held)
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
-bool convert_header_to_stat(const char* path, const headers_t& meta, struct stat* pst, bool forcedir)
+bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, struct stat* pst, bool forcedir)
 {
-    if(!path || !pst){
+    if(!pst){
         return false;
     }
     memset(pst, 0, sizeof(struct stat));
@@ -773,7 +777,7 @@ bool convert_header_to_stat(const char* path, const headers_t& meta, struct stat
     pst->st_nlink = 1; // see fuse FAQ
 
     // mode
-    pst->st_mode = get_mode(meta, path, true, forcedir);
+    pst->st_mode = get_mode(meta, strpath, true, forcedir);
 
     // blocks
     if(S_ISREG(pst->st_mode)){

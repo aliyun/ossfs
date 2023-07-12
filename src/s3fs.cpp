@@ -483,14 +483,14 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
         }
         if(!StatCache::getStatCacheData()->GetStat(strpath, pstat, pheader, overcheck, pisforce)){
             // There is not in cache.(why?) -> retry to convert.
-            if(!convert_header_to_stat(strpath.c_str(), (*pheader), pstat, forcedir)){
+            if(!convert_header_to_stat(strpath, (*pheader), pstat, forcedir)){
                 S3FS_PRN_ERR("failed convert headers to stat[path=%s]", strpath.c_str());
                 return -ENOENT;
             }
         }
     }else{
         // cache size is Zero -> only convert.
-        if(!convert_header_to_stat(strpath.c_str(), (*pheader), pstat, forcedir)){
+        if(!convert_header_to_stat(strpath, (*pheader), pstat, forcedir)){
             S3FS_PRN_ERR("failed convert headers to stat[path=%s]", strpath.c_str());
             return -ENOENT;
         }
