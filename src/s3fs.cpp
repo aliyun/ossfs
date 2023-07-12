@@ -99,6 +99,8 @@ static bool shallowcopyapi        = true;//
 static bool is_readdir_optimize   = false;
 static bool is_refresh_fakemeta   = false;
 static off_t readdir_check_size   = 0;
+static bool is_new_symlink_format = false;
+
 //-------------------------------------------------------------------
 // Global functions : prototype
 //-------------------------------------------------------------------
@@ -832,22 +834,42 @@ static int s3fs_readlink(const char* _path, char* buf, size_t size)
                 return result;
             }
 
+            // Get symlink attr
+            std::string  strType;
+            std::string strTarget;
+            if (!ent->GetSymlinkAttr(strType, strTarget)) {
+                // Do nothing
+            }
+
             off_t readsize;
-            // Get size
-            if(!ent->GetSize(readsize)){
-                S3FS_PRN_ERR("could not get file size(file=%s)", path);
-                return -EIO;
+            if (strType == "header") {
+                if(strTarget.empty()){
+                    S3FS_PRN_ERR("could not get symlink target");
+                    return -EIO;
+                }
+                readsize = strTarget.length();
+                if(static_cast<off_t>(size) <= readsize){
+                    readsize = size - 1;
+                }
+                memcpy(buf, strTarget.c_str(), readsize);
+                buf[readsize] = '\0';
+            } else {
+                // Get size
+                if(!ent->GetSize(readsize)){
+                    S3FS_PRN_ERR("could not get file size(file=%s)", path);
+                    return -EIO;
+                }
+                if(static_cast<off_t>(size) <= readsize){
+                    readsize = size - 1;
+                }
+                // Read
+                ssize_t ressize;
+                if(0 > (ressize = ent->Read(autoent.GetPseudoFd(), buf, 0, readsize))){
+                    S3FS_PRN_ERR("could not read file(file=%s, ressize=%zd)", path, ressize);
+                    return static_cast<int>(ressize);
+                }
+                buf[ressize] = '\0';
             }
-            if(static_cast<off_t>(size) <= readsize){
-                readsize = size - 1;
-            }
-            // Read
-            ssize_t ressize;
-            if(0 > (ressize = ent->Read(autoent.GetPseudoFd(), buf, 0, readsize))){
-                S3FS_PRN_ERR("could not read file(file=%s, ressize=%zd)", path, ressize);
-                return static_cast<int>(ressize);
-            }
-            buf[ressize] = '\0';
         }
 
         // check buf if it has space words.
@@ -1166,6 +1188,19 @@ static int s3fs_symlink(const char* _from, const char* _to)
         strFrom           = trim(std::string(from));
         ssize_t from_size = static_cast<ssize_t>(strFrom.length());
         ssize_t ressize;
+        // new symlink format
+        if (is_new_symlink_format) {
+            // If the target's path is less 2K, save it into header in new symlink format
+            if (from_size < 2*1024) {
+                ent->SetSymlinkAttr("header", strFrom);
+                from_size = 0;
+            } else {
+                ent->SetSymlinkAttr("body", "");
+            }
+        } else {
+            // allways remove
+            ent->SetSymlinkAttr("", "");
+        }
         if(from_size != (ressize = ent->Write(autoent.GetPseudoFd(), strFrom.c_str(), 0, from_size))){
             if(ressize < 0){
                 S3FS_PRN_ERR("could not write tmpfile(errno=%d)", static_cast<int>(ressize));
@@ -4488,6 +4523,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             readdir_check_size = static_cast<off_t>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
             return 0;
         }
+        if(0 == strcmp(arg, "symlink_in_meta")){
+            is_new_symlink_format = true;
+            return 0;
+        }        
         //
         // log file option
         //

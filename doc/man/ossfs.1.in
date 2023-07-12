@@ -341,6 +341,10 @@ Maximum size in file length of issuing HeadObject request to get extended inform
 If a file size is greater than this threshold, only use the basic information from ListObjects result.
 This option works when readdir_optimize option is eanbled.
 .TP
+\fB\-o\fR symlink_in_meta (default is disable)
+Enable to save the symbolic link target in object user metadata.
+This option is used in conjunction with the readdir_optimize option.
+.TP
 \fB\-o\fR logfile - specify the log output file.
 ossfs outputs the log file to syslog. Alternatively, if ossfs is started with the "-f" option specified, the log will be output to the stdout/stderr.
 You can use this option to specify the log file that ossfs outputs.

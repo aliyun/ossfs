@@ -1853,6 +1853,97 @@ function test_write_data_with_skip() {
     rm_test_file "${_TMP_SKIPWRITE_FILE}"
 }
 
+function test_symlink_in_meta {
+    describe "Testing symlinks in meta ..."
+
+    rm -f "${TEST_TEXT_FILE}"
+    rm -f "${ALT_TEST_TEXT_FILE}"
+    echo foo > "${TEST_TEXT_FILE}"
+
+    ln -s "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}"
+    cmp "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}"
+
+    rm -f "${TEST_TEXT_FILE}"
+
+    local ALT_OBJECT_NAME; ALT_OBJECT_NAME=$(basename "${PWD}")/"${ALT_TEST_TEXT_FILE}"
+    local target_symlink; target_symlink=$(aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${ALT_OBJECT_NAME}" | grep "symlink-target")
+    if ! echo "${target_symlink}" | grep -q "header:${#TEST_TEXT_FILE}:${TEST_TEXT_FILE}"; then
+        echo "Unexpected target_symlink: ${target_symlink}"
+        return 1;
+    fi
+
+    [ -L "${ALT_TEST_TEXT_FILE}" ]
+    [ ! -f "${ALT_TEST_TEXT_FILE}" ]
+
+    rm -f "${ALT_TEST_TEXT_FILE}"
+
+    # set target_symlink meta and get file stat
+    local TEST_TEXT_FILE_RAW;TEST_TEXT_FILE_RAW="${TEST_TEXT_FILE}-raw.txt"
+    local ALT_TEST_TEXT_FILE_RAW;ALT_TEST_TEXT_FILE_RAW="${TEST_TEXT_FILE_RAW}.link.txt"
+    echo hello > "${TEST_TEXT_FILE_RAW}"
+    local meta="header:${#TEST_TEXT_FILE_RAW}:${TEST_TEXT_FILE_RAW}"
+    local SYMLINK_NAME; SYMLINK_NAME=$(basename "${PWD}")/"${ALT_TEST_TEXT_FILE_RAW}"
+    aws_cli s3api put-object --content-type="text/plain" --metadata="symlink-target=${meta}" --bucket "${TEST_BUCKET_1}" --key "$SYMLINK_NAME"
+
+    cmp "${TEST_TEXT_FILE_RAW}" "${ALT_TEST_TEXT_FILE_RAW}"
+
+    rm -f "${TEST_TEXT_FILE_RAW}"
+
+    [ -L "${ALT_TEST_TEXT_FILE_RAW}" ]
+    [ ! -f "${ALT_TEST_TEXT_FILE_RAW}" ]
+
+    rm -f "${ALT_TEST_TEXT_FILE_RAW}"
+
+    #set target_symlink meta with urlencode
+    local TEST_TEXT_FILE_ENC;TEST_TEXT_FILE_ENC="${TEST_TEXT_FILE}-raw-%.txt"
+    local ALT_TEST_TEXT_FILE_ENC;ALT_TEST_TEXT_FILE_ENC="${TEST_TEXT_FILE_ENC}.link.txt"
+    echo world > "${TEST_TEXT_FILE_ENC}"
+    local meta_enc="header:${#TEST_TEXT_FILE_ENC}:${TEST_TEXT_FILE}-raw-%25.txt"
+    local SYMLINK_NAME_ENC; SYMLINK_NAME_ENC=$(basename "${PWD}")/"${ALT_TEST_TEXT_FILE_ENC}"
+    aws_cli s3api put-object --content-type="text/plain" --metadata="symlink-target=${meta_enc}" --bucket "${TEST_BUCKET_1}" --key "$SYMLINK_NAME_ENC"
+
+    cmp "${TEST_TEXT_FILE_ENC}" "${ALT_TEST_TEXT_FILE_ENC}"
+
+    local CONTENT; CONTENT=$(cat "${ALT_TEST_TEXT_FILE_ENC}")
+
+    if [ "${CONTENT}" != "world" ]; then
+       echo "CONTENT read is unexpected, got ${CONTENT}, expected world"
+       return 1
+    fi
+
+    rm -f "${TEST_TEXT_FILE_ENC}"
+
+    [ -L "${ALT_TEST_TEXT_FILE_ENC}" ]
+    [ ! -f "${ALT_TEST_TEXT_FILE_ENC}" ]
+
+    rm -f "${ALT_TEST_TEXT_FILE_ENC}"
+
+    #set target_symlink in body
+    local TEST_TEXT_FILE_BODY;TEST_TEXT_FILE_BODY="${TEST_TEXT_FILE}-raw-body.txt"
+    local ALT_TEST_TEXT_FILE_BODY;ALT_TEST_TEXT_FILE_BODY="${TEST_TEXT_FILE_BODY}.link.txt"
+    echo "hello world" > "${TEST_TEXT_FILE_BODY}"
+    local meta_body="body:0:"
+    local SYMLINK_NAME_BODY; SYMLINK_NAME_BODY=$(basename "${PWD}")/"${ALT_TEST_TEXT_FILE_BODY}"
+    local TMP_BODY_CONTENT_FILE="/tmp/${TEST_TEXT_FILE_BODY}.body"
+    echo ${TEST_TEXT_FILE_BODY} > ${TMP_BODY_CONTENT_FILE}
+    aws_cli s3api put-object --content-type="text/plain" --metadata="symlink-target=${meta_body}" --bucket "${TEST_BUCKET_1}" --key "${SYMLINK_NAME_BODY}" --body "${TMP_BODY_CONTENT_FILE}"
+
+    local CONTENT_BODY; CONTENT_BODY=$(cat "${ALT_TEST_TEXT_FILE_BODY}")
+    if [ "${CONTENT_BODY}" != "hello world" ]; then
+       echo "CONTENT_BODY read is unexpected, got ${CONTENT_BODY}, expected hello world"
+       return 1
+    fi
+
+    cmp "${TEST_TEXT_FILE_BODY}" "${ALT_TEST_TEXT_FILE_BODY}"
+    rm -f "${TEST_TEXT_FILE_BODY}"
+
+    [ -L "${ALT_TEST_TEXT_FILE_BODY}" ]
+    [ ! -f "${ALT_TEST_TEXT_FILE_BODY}" ]
+
+    rm -f "${ALT_TEST_TEXT_FILE_BODY}"
+    rm -f "${TMP_BODY_CONTENT_FILE}"
+}
+
 function add_all_tests {
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
@@ -1938,6 +2029,9 @@ function add_all_tests {
         add_tests test_ensurespace_move_file
     fi
     add_tests test_write_data_with_skip
+    if ps u -p "${OSSFS_PID}" | grep -q symlink_in_meta; then
+        add_tests test_symlink_in_meta
+    fi
 }
 
 init_suite

@@ -59,6 +59,7 @@ bool is_need_check_obj_detail(const headers_t& meta);
 bool merge_headers(headers_t& base, const headers_t& additional, bool add_noexist);
 bool simple_parse_xml(const char* data, size_t len, const char* key, std::string& value);
 std::string utc_to_gmt(const char* s);
+off_t get_symlink_size(const headers_t& meta);
 #endif // S3FS_METAHEADER_H_
 
 /*

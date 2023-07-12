@@ -113,6 +113,8 @@ class FdEntity
         bool SetUId(uid_t uid);
         bool SetGId(gid_t gid);
         bool SetContentType(const char* path);
+        bool GetSymlinkAttr(std::string& type, std::string& symlink);
+        bool SetSymlinkAttr(const std::string& type, const std::string& symlink);
 
         int Load(off_t start, off_t size, AutoLock::Type type, bool is_modified_flag = false);  // size=0 means loading to end
 
