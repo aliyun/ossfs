@@ -76,6 +76,95 @@ inline bool IsExpireStatCacheTime(const struct timespec& ts, const time_t& expir
     return (0 < CompareStatCacheTime(nowts, ts));
 }
 
+bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, struct stat* pst, bool forcedir, bool noextendedmeta, off_t check_size_meta)
+{
+    if(!pst){
+        return false;
+    }
+    memset(pst, 0, sizeof(struct stat));
+
+    pst->st_nlink = 1; // see fuse FAQ
+
+    // mode
+    pst->st_mode = get_mode(meta, strpath, true, forcedir, noextendedmeta);
+
+    // blocks
+    if(S_ISREG(pst->st_mode)){
+        pst->st_blocks = get_blocks(pst->st_size);
+    }
+    pst->st_blksize = 4096;
+
+    // mtime
+    struct timespec mtime = get_mtime(meta, true, noextendedmeta);
+    if(pst->st_mtime < 0){
+        pst->st_mtime = 0L;
+    }else{
+        if(mtime.tv_sec < 0){
+            mtime.tv_sec  = 0;
+            mtime.tv_nsec = 0;
+        }
+#if defined(__APPLE__)
+        pst->st_mtime = mtime.tv_sec;
+        pst->st_mtimespec.tv_nsec = mtime.tv_nsec;
+#else
+        pst->st_mtim.tv_sec = mtime.tv_sec;
+        pst->st_mtim.tv_nsec = mtime.tv_nsec;
+#endif
+    }
+
+    // ctime
+    struct timespec ctime = get_ctime(meta, true, noextendedmeta);
+    if(pst->st_ctime < 0){
+        pst->st_ctime = 0L;
+    }else{
+        if(ctime.tv_sec < 0){
+            ctime.tv_sec  = 0;
+            ctime.tv_nsec = 0;
+        }
+#if defined(__APPLE__)
+        pst->st_ctime = ctime.tv_sec;
+        pst->st_ctimespec.tv_nsec = ctime.tv_nsec;
+#else
+        pst->st_ctim.tv_sec = ctime.tv_sec;
+        pst->st_ctim.tv_nsec = ctime.tv_nsec;
+#endif
+    }
+
+    // atime
+    struct timespec atime = get_atime(meta, true, noextendedmeta);
+    if(pst->st_atime < 0){
+        pst->st_atime = 0L;
+    }else{
+        if(atime.tv_sec < 0){
+            atime.tv_sec  = 0;
+            atime.tv_nsec = 0;
+        }
+#if defined(__APPLE__)
+        pst->st_atime = atime.tv_sec;
+        pst->st_atimespec.tv_nsec = atime.tv_nsec;
+#else
+        pst->st_atim.tv_sec = atime.tv_sec;
+        pst->st_atim.tv_nsec = atime.tv_nsec;
+#endif
+    }
+
+    // size
+    pst->st_size = get_size(meta);
+
+    //change symlink to S_IFREG
+    if (noextendedmeta && S_ISLNK(pst->st_mode) && !is_check_meta(pst->st_size, check_size_meta)) {
+        pst->st_mode &= ~S_IFMT;
+        pst->st_mode |= S_IFREG;
+    }
+
+    // uid/gid
+    pst->st_uid = get_uid(meta, noextendedmeta);
+    pst->st_gid = get_gid(meta, noextendedmeta);
+
+    return true;
+}
+
+
 //
 // For stats cache out 
 //
@@ -123,7 +212,8 @@ pthread_mutex_t StatCache::stat_cache_lock;
 //-------------------------------------------------------------------
 // Constructor/Destructor
 //-------------------------------------------------------------------
-StatCache::StatCache() : IsExpireTime(true), IsExpireIntervalType(false), ExpireTime(15 * 60), CacheSize(100000), IsCacheNoObject(false)
+StatCache::StatCache() : IsExpireTime(true), IsExpireIntervalType(false), ExpireTime(15 * 60), CacheSize(100000), IsCacheNoObject(false),
+ IsNoExtendedMeta(false), CheckSizeForMeta(0LL)
 {
     if(this == StatCache::getStatCacheData()){
         stat_cache.clear();
@@ -201,6 +291,14 @@ bool StatCache::SetCacheNoObject(bool flag)
     return old;
 }
 
+bool StatCache::SetNoExtendedMeta(bool flag, off_t check_size)
+{
+    bool old = IsNoExtendedMeta;
+    IsNoExtendedMeta = flag;
+    CheckSizeForMeta = check_size;
+    return old;
+}
+
 void StatCache::Clear()
 {
     AutoLock lock(&StatCache::stat_cache_lock);
@@ -212,7 +310,7 @@ void StatCache::Clear()
     S3FS_MALLOCTRIM(0);
 }
 
-bool StatCache::GetStat(const std::string& key, struct stat* pst, headers_t* meta, bool overcheck, const char* petag, bool* pisforce)
+bool StatCache::GetStat(const std::string& key, struct stat* pst, headers_t* meta, bool overcheck, const char* petag, bool* pisforce, bool *pisfake)
 {
     bool is_delete_cache = false;
     std::string strpath = key;
@@ -273,6 +371,9 @@ bool StatCache::GetStat(const std::string& key, struct stat* pst, headers_t* met
                 }
                 if(pisforce != NULL){
                     (*pisforce) = ent->isforce;
+                }
+                if (pisfake != NULL) {
+                    (*pisfake) = ent->isfake;
                 }
                 ent->hit_count++;
   
@@ -335,12 +436,12 @@ bool StatCache::IsNoObjectCache(const std::string& key, bool overcheck)
     return false;
 }
 
-bool StatCache::AddStat(const std::string& key, headers_t& meta, bool forcedir, bool no_truncate)
+bool StatCache::AddStat(const std::string& key, headers_t& meta, bool forcedir, bool no_truncate, bool isfake)
 {
     if(!no_truncate && CacheSize< 1){
         return true;
     }
-    S3FS_PRN_INFO3("add stat cache entry[path=%s]", key.c_str());
+    S3FS_PRN_INFO3("add stat cache entry[path=%s], flag(%d, %d, %d)", key.c_str(), forcedir, no_truncate, isfake);
 
     bool found;
     bool do_truncate;
@@ -362,7 +463,7 @@ bool StatCache::AddStat(const std::string& key, headers_t& meta, bool forcedir, 
 
     // make new
     stat_cache_entry* ent = new stat_cache_entry();
-    if(!convert_header_to_stat(key, meta, &(ent->stbuf), forcedir)){
+    if(!convert_header_to_stat(key, meta, &(ent->stbuf), forcedir, IsNoExtendedMeta, CheckSizeForMeta)){
         delete ent;
         return false;
     }
@@ -370,6 +471,7 @@ bool StatCache::AddStat(const std::string& key, headers_t& meta, bool forcedir, 
     ent->isforce    = forcedir;
     ent->noobjcache = false;
     ent->notruncate = (no_truncate ? 1L : 0L);
+    ent->isfake     = isfake;
     ent->meta.clear();
     SetStatCacheTime(ent->cache_date);    // Set time.
     //copy only some keys
@@ -448,7 +550,11 @@ bool StatCache::UpdateMetaStats(const std::string& key, headers_t& meta)
 
     // Update time.
     SetStatCacheTime(ent->cache_date);
-    ent->stbuf.st_mode = get_mode(meta, key);
+
+    // Update only mode
+    if(!IsNoExtendedMeta){
+        ent->stbuf.st_mode = get_mode(meta, key);
+    }
 
     return true;
 }
@@ -764,27 +870,13 @@ bool StatCache::DelSymlink(const char* key, bool lock_already_held)
     return true;
 }
 
-//-------------------------------------------------------------------
-// Functions
-//-------------------------------------------------------------------
-bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, struct stat* pst, bool forcedir)
+bool StatCache::ConvertMetaToStat(const std::string& strpath, const headers_t& meta, struct stat* pst, bool forcedir)
 {
-    if(!pst){
-        return false;
-    }
-    memset(pst, 0, sizeof(struct stat));
+    return convert_header_to_stat(strpath, meta, pst, forcedir, IsNoExtendedMeta, CheckSizeForMeta);
+}
 
-    pst->st_nlink = 1; // see fuse FAQ
-
-    // mode
-    pst->st_mode = get_mode(meta, strpath, true, forcedir);
-
-    // blocks
-    if(S_ISREG(pst->st_mode)){
-        pst->st_blocks = get_blocks(pst->st_size);
-    }
-    pst->st_blksize = 4096;
-
+bool StatCache::ToTimeStat(const headers_t& meta, struct stat* pst)
+{
     // mtime
     struct timespec mtime = get_mtime(meta);
     if(pst->st_mtime < 0){
@@ -838,16 +930,9 @@ bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, s
         pst->st_atim.tv_nsec = atime.tv_nsec;
 #endif
     }
-
-    // size
-    pst->st_size = get_size(meta);
-
-    // uid/gid
-    pst->st_uid = get_uid(meta);
-    pst->st_gid = get_gid(meta);
-
     return true;
 }
+
 
 /*
 * Local variables:

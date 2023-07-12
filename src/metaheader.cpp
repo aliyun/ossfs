@@ -64,15 +64,17 @@ static struct timespec get_time(const headers_t& meta, const char *header)
     return cvt_string_to_time((*iter).second.c_str());
 }
 
-struct timespec get_mtime(const headers_t& meta, bool overcheck)
+struct timespec get_mtime(const headers_t& meta, bool overcheck, bool noextendedmeta)
 {
-    struct timespec t = get_time(meta, "x-oss-meta-mtime");
-    if(0 < t.tv_sec){
-        return t;
-    }
-    t = get_time(meta, "x-oss-meta-goog-reserved-file-mtime");
-    if(0 < t.tv_sec){
-        return t;
+    if (!noextendedmeta) {
+        struct timespec t = get_time(meta, "x-oss-meta-mtime");
+        if(0 < t.tv_sec){
+            return t;
+        }
+        t = get_time(meta, "x-oss-meta-goog-reserved-file-mtime");
+        if(0 < t.tv_sec){
+            return t;
+        }
     }
     if(overcheck){
         struct timespec ts = {get_lastmodified(meta), 0};
@@ -81,11 +83,13 @@ struct timespec get_mtime(const headers_t& meta, bool overcheck)
     return DEFAULT_TIMESPEC;
 }
 
-struct timespec get_ctime(const headers_t& meta, bool overcheck)
+struct timespec get_ctime(const headers_t& meta, bool overcheck, bool noextendedmeta)
 {
-    struct timespec t = get_time(meta, "x-oss-meta-ctime");
-    if(0 < t.tv_sec){
-        return t;
+    if (!noextendedmeta) {
+        struct timespec t = get_time(meta, "x-oss-meta-ctime");
+        if(0 < t.tv_sec){
+            return t;
+        }
     }
     if(overcheck){
         struct timespec ts = {get_lastmodified(meta), 0};
@@ -94,11 +98,13 @@ struct timespec get_ctime(const headers_t& meta, bool overcheck)
     return DEFAULT_TIMESPEC;
 }
 
-struct timespec get_atime(const headers_t& meta, bool overcheck)
+struct timespec get_atime(const headers_t& meta, bool overcheck, bool noextendedmeta)
 {
-    struct timespec t = get_time(meta, "x-oss-meta-atime");
-    if(0 < t.tv_sec){
-        return t;
+    if (!noextendedmeta) {
+        struct timespec t = get_time(meta, "x-oss-meta-atime");
+        if(0 < t.tv_sec){
+            return t;
+        }
     }
     if(overcheck){
         struct timespec ts = {get_lastmodified(meta), 0};
@@ -126,13 +132,34 @@ mode_t get_mode(const char *s, int base)
     return static_cast<mode_t>(cvt_strtoofft(s, base));
 }
 
-mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir, bool forcedir)
+mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir, bool forcedir, bool noextendedmeta)
 {
     mode_t mode     = 0;
     bool   isS3sync = false;
     headers_t::const_iterator iter;
 
-    if(meta.end() != (iter = meta.find("x-oss-meta-mode"))){
+    if(noextendedmeta){
+        //get file type from mode
+        if(meta.end() != (iter = meta.find("x-oss-meta-mode"))){
+            mode = get_mode((*iter).second.c_str());
+        }
+        // remove permissions
+        mode &= S_IFMT;
+        // set permissions to default
+        if(mode & S_IFMT){
+            if(S_ISLNK(mode)){
+                mode |= 0777;
+            }else if(S_ISDIR(mode)){
+                mode |= 0750;
+            }else if(S_ISCHR(mode) || S_ISBLK(mode)){
+                mode |= 0644;
+            }else{
+                mode |= 0640;
+            }
+        }else{
+            mode = (!strpath.empty() && '/' == *strpath.rbegin()) ? 0750 : 0640;
+        }
+    }else if(meta.end() != (iter = meta.find("x-oss-meta-mode"))){
         mode = get_mode((*iter).second.c_str());
     }else if(meta.end() != (iter = meta.find("x-oss-meta-permissions"))){ // for s3sync
         mode = get_mode((*iter).second.c_str());
@@ -211,10 +238,12 @@ uid_t get_uid(const char *s)
     return static_cast<uid_t>(cvt_strtoofft(s, /*base=*/ 0));
 }
 
-uid_t get_uid(const headers_t& meta)
+uid_t get_uid(const headers_t& meta, bool nometa)
 {
     headers_t::const_iterator iter;
-    if(meta.end() != (iter = meta.find("x-oss-meta-uid"))){
+    if (nometa) {
+        return geteuid();
+    }else if(meta.end() != (iter = meta.find("x-oss-meta-uid"))){
         return get_uid((*iter).second.c_str());
     }else if(meta.end() != (iter = meta.find("x-oss-meta-owner"))){ // for s3sync
         return get_uid((*iter).second.c_str());
@@ -230,10 +259,12 @@ gid_t get_gid(const char *s)
     return static_cast<gid_t>(cvt_strtoofft(s, /*base=*/ 0));
 }
 
-gid_t get_gid(const headers_t& meta)
+gid_t get_gid(const headers_t& meta, bool nometa)
 {
     headers_t::const_iterator iter;
-    if(meta.end() != (iter = meta.find("x-oss-meta-gid"))){
+    if (nometa) {
+        return getegid();
+    }else if(meta.end() != (iter = meta.find("x-oss-meta-gid"))){
         return get_gid((*iter).second.c_str());
     }else if(meta.end() != (iter = meta.find("x-oss-meta-group"))){ // for s3sync
         return get_gid((*iter).second.c_str());
@@ -278,6 +309,28 @@ time_t get_lastmodified(const headers_t& meta)
         return -1;
     }
     return get_lastmodified((*iter).second.c_str());
+}
+
+static const char *s_wday[] = {
+    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+};
+
+static const char *s_mon[] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+std::string utc_to_gmt(const char* s)
+{
+    struct tm tm;
+    char date[128];
+    if(!s){
+        return std::string("");
+    }
+    memset(&tm, 0, sizeof(struct tm));
+    strptime(s, "%Y-%m-%dT%H:%M:%S", &tm);
+    sprintf(date, "%s, %.2d %s %.4d %.2d:%.2d:%.2d GMT", 
+        s_wday[tm.tm_wday], tm.tm_mday, s_mon[tm.tm_mon], 1900 + tm.tm_year, 
+        tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return std::string(date);
 }
 
 //
