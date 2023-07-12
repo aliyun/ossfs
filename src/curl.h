@@ -337,7 +337,7 @@ class S3fsCurl
 
         // methods
         bool CreateCurlHandle(bool only_pool = false, bool remake = false);
-        bool DestroyCurlHandle(bool restore_pool = true, bool clear_internal_data = true);
+        bool DestroyCurlHandle(bool restore_pool = true, bool clear_internal_data = true, bool lock_already_held = false);
 
         bool GetRAMCredentials(const char* cred_url, const char* iam_v2_token, const char* ibm_secret_access_key, std::string& response);
         bool GetRAMRoleFromMetaData(const char* cred_url, const char* iam_v2_token, std::string& token);
