@@ -1,0 +1,425 @@
+.TH OSSFS "1" "@MAN_PAGE_DATE@" "OSSFS" "User Commands"
+.SH NAME
+OSSFS \- FUSE-based file system backed by Alibaba Cloud OSS
+.SH SYNOPSIS
+.SS mounting
+.TP
+\fBossfs bucket[:/path] mountpoint \fP [options]
+.TP
+\fBossfs mountpoint \fP [options (must specify bucket= option)]
+.SS unmounting
+.TP
+\fBumount mountpoint
+For root.
+.TP
+\fBfusermount -u mountpoint
+For unprivileged user.
+.SS utility mode (remove interrupted multipart uploading objects)
+.TP
+\fBossfs --incomplete-mpu-list (-u) bucket
+.TP
+\fBossfs --incomplete-mpu-abort[=all | =<expire date format>] bucket
+.SH DESCRIPTION
+ossfs is a FUSE filesystem that allows you to mount an Alibaba Cloud OSS bucket as a local filesystem. It stores files natively and transparently in OSS (i.e., you can use other programs to access the same files).
+.SH AUTHENTICATION
+The ossfs password file has this format (use this format if you have only one set of credentials):
+.RS 4
+\fBaccessKeyId\fP:\fBsecretAccessKey\fP
+.RE
+
+If you have more than one set of credentials, this syntax is also recognized:
+.RS 4
+\fBbucketName\fP:\fBaccessKeyId\fP:\fBsecretAccessKey\fP
+.RE
+.PP
+Password files can be stored in two locations:
+.RS 4
+ \fB/etc/passwd-ossfs\fP     [0640]
+ \fB$HOME/.passwd-ossfs\fP   [0600]
+.RE
+.PP
+ossfs also recognizes the \fBOSS_ACCESS_KEY_ID\fP and \fBOSS_SECRET_ACCESS_KEY\fP environment variables.
+.SH OPTIONS
+.SS "general options"
+.TP
+\fB\-h\fR   \fB\-\-help\fR
+print help
+.TP
+\fB\  \fR   \fB\-\-version\fR
+print version
+.TP
+\fB\-f\fR
+FUSE foreground option - do not run as daemon.
+.TP
+\fB\-s\fR
+FUSE single-threaded option (disables multi-threaded operation)
+.SS "mount options"
+.TP
+All ossfs options must given in the form where "opt" is:
+ <option_name>=<option_value>
+.TP
+\fB\-o\fR bucket
+if it is not specified bucket name (and path) in command line, must specify this option after \-o option for bucket name.
+.TP
+\fB\-o\fR default_acl (default="private")
+the default canned acl to apply to all written oss objects, e.g., "private", "public-read".
+.TP
+\fB\-o\fR retries (default="5")
+number of times to retry a failed OSS transaction.
+.TP
+\fB\-o\fR tmpdir (default="/tmp")
+local folder for temporary files.
+.TP
+\fB\-o\fR use_cache (default="" which means disabled)
+local folder to use for local file cache.
+.TP
+\fB\-o\fR check_cache_dir_exist (default is disable)
+If use_cache is set, check if the cache directory exists.
+If this option is not specified, it will be created at runtime when the cache directory does not exist.
+.TP
+\fB\-o\fR del_cache - delete local file cache
+delete local file cache when ossfs starts and exits.
+.TP
+\fB\-o\fR storage_class (default="Standard")
+store object with specified storage class.
+Possible values: Standard, IA, Archive, ColdArchive, and DeepColdArchive.
+.TP
+\fB\-o\fR use_sse (default is disable)
+Specify two type OSS's Server-Site Encryption: SSE-OSS or SSE-KMS. SSE-OSS uses Alibaba Cloud OSS-managed encryption keys and SSE-KMS uses the master key which you manage in Alibaba Cloud KMS.
+You can specify "use_sse" or "use_sse=1" enables SSE-OSS type (use_sse=1 is old type parameter).
+For setting SSE-KMS, specify "use_sse=kmsid" or "use_sse=kmsid:<kms id>".
+You can use "k" for short "kmsid".
+If you san specify SSE-KMS type with your <kms id> in Alibaba Cloud KMS, you can set it after "kmsid:" (or "k:").
+If you specify only "kmsid" ("k"), you need to set OSSSSEKMSID environment which value is <kms id>.
+You must be careful about that you can not use the KMS id which is not same EC2 region.
+.TP
+\fB\-o\fR passwd_file (default="")
+specify the path to the password file, which which takes precedence over the password in $HOME/.passwd-ossfs and /etc/passwd-ossfs
+.TP
+\fB\-o\fR ahbe_conf (default="" which means disabled)
+This option specifies the configuration file path which file is the additional HTTP header by file (object) extension.
+ The configuration file format is below:
+ -----------
+ line         = [file suffix or regex] HTTP-header [HTTP-values]
+ file suffix  = file (object) suffix, if this field is empty, it means "reg:(.*)".(=all object).
+ regex        = regular expression to match the file (object) path. this type starts with "reg:" prefix.
+ HTTP-header  = additional HTTP header name
+ HTTP-values  = additional HTTP header value
+ -----------
+ Sample:
+ -----------
+ .gz                    Content-Encoding  gzip
+ .Z                     Content-Encoding  compress
+ reg:^/MYDIR/(.*)[.]t2$ Content-Encoding  text2
+ -----------
+ A sample configuration file is uploaded in "test" directory.
+If you specify this option for set "Content-Encoding" HTTP header, please take care for RFC 2616.
+.TP
+\fB\-o\fR public_bucket (default="" which means disabled)
+anonymously mount a public bucket when set to 1, ignores the $HOME/.passwd-ossfs and /etc/passwd-ossfs files.
+OSS does not allow copy object api for anonymous users, then ossfs sets nocopyapi option automatically when public_bucket=1 option is specified.
+.TP
+\fB\-o\fR connect_timeout (default="300" seconds)
+time to wait for connection before giving up.
+.TP
+\fB\-o\fR readwrite_timeout (default="120" seconds)
+time to wait between read/write activity before giving up.
+.TP
+\fB\-o\fR list_object_max_keys (default="1000")
+specify the maximum number of keys returned by OSS list object API. The default is 1000. you can set this value to 1000 or more.
+.TP
+\fB\-o\fR max_stat_cache_size (default="100,000" entries (about 40MB))
+maximum number of entries in the stat cache and symbolic link cache.
+.TP
+\fB\-o\fR stat_cache_expire (default is 900)
+specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time indicates the time since cached.
+.TP
+\fB\-o\fR stat_cache_interval_expire (default is 900)
+specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time is based on the time from the last access time of those cache.
+This option is exclusive with stat_cache_expire, and is left for compatibility with older versions.
+.TP
+\fB\-o\fR enable_noobj_cache (default is disable)
+enable cache entries for the object which does not exist.
+ossfs always has to check whether file (or sub directory) exists under object (path) when ossfs does some command, since ossfs has recognized a directory which does not exist and has files or sub directories under itself.
+It increases ListBucket request and makes performance bad.
+You can specify this option for performance, ossfs memorizes in stat cache that the object (file or directory) does not exist.
+.TP
+\fB\-o\fR no_check_certificate (by default this option is disabled)
+server certificate won't be checked against the available certificate authorities.
+.TP
+\fB\-o\fR ssl_verify_hostname (default="2")
+When 0, do not verify the SSL certificate against the hostname.
+.TP
+\fB\-o\fR nodnscache - disable DNS cache.
+ossfs is always using DNS cache, this option make DNS cache disable.
+.TP
+\fB\-o\fR nosscache - disable SSL session cache.
+ossfs is always using SSL session cache, this option make SSL session cache disable.
+.TP
+\fB\-o\fR multireq_max (default="20")
+maximum number of parallel request for listing objects.
+.TP
+\fB\-o\fR parallel_count (default="5")
+number of parallel request for uploading big objects.
+ossfs uploads large object (over 20MB) by multipart post request, and sends parallel requests.
+This option limits parallel request count which ossfs requests at once.
+It is necessary to set this value depending on a CPU and a network band.
+.TP
+\fB\-o\fR multipart_size (default="10")
+part size, in MB, for each multipart request.
+The minimum value is 5 MB and the maximum value is 5 GB.
+.TP
+\fB\-o\fR multipart_copy_size (default="512")
+part size, in MB, for each multipart copy request, used for
+renames and mixupload.
+The minimum value is 5 MB and the maximum value is 5 GB.
+Must be at least 512 MB to copy the maximum 5 TB object size
+but lower values may improve performance.
+.TP
+\fB\-o\fR max_dirty_data (default="5120")
+Flush dirty data to OSS after a certain number of MB written.
+The minimum value is 50 MB. -1 value means disable.
+Cannot be used with nomixupload.
+.TP
+\fB\-o\fR ensure_diskfree (default 0)
+sets MB to ensure disk free space. This option means the threshold of free space size on disk which is used for the cache file by ossfs.
+ossfs makes file for downloading, uploading and caching files.
+If the disk free space is smaller than this value, ossfs do not use disk space as possible in exchange for the performance.
+.TP
+\fB\-o\fR multipart_threshold (default="25")
+threshold, in MB, to use multipart upload instead of
+single-part. Must be at least 5 MB.
+.TP
+\fB\-o\fR singlepart_copy_limit (default="512")
+maximum size, in MB, of a single-part copy before trying
+multipart copy.
+.TP
+\fB\-o\fR host (default="https://oss-cn-hangzhou.aliyuncs.com")
+Set a host, e.g., https://example.com.
+.TP
+\fB\-o\fR servicepath (default="/")
+Set a service path when the host requires a prefix.
+.TP
+\fB\-o\fR url (default="https://oss-cn-hangzhou.aliyuncs.com")
+sets the url to use to access Alibaba Cloud OSS. If you want to use HTTP, then you can set "url=http://oss-cn-hangzhou.aliyuncs.com".
+If you do not use https, please specify the URL with the url option.
+.TP
+\fB\-o\fR endpoint (default="cn-hangzhou")
+sets the endpoint to use on signature version 4.
+If this option is not specified, ossfs uses "cn-hangzhou" region as the default.
+If the ossfs could not connect to the region specified by this option, ossfs could not run.
+But if you do not specify this option, and if you can not connect with the default region, ossfs will retry to automatically connect to the other region.
+So ossfs can know the correct region name, because ossfs can find it in an error from the OSS server.
+.TP
+\fB\-o\fR sigv1 (default is signature version 1)
+sets signing OSS requests by using only signature version 1.
+.TP
+\fB\-o\fR mp_umask (default is "0000")
+sets umask for the mount point directory.
+If allow_other option is not set, ossfs allows access to the mount point only to the owner.
+In the opposite case ossfs allows access to all users as the default.
+But if you set the allow_other with this option, you can control the permissions of the mount point by this option like umask.
+.TP
+\fB\-o\fR umask (default is "0000")
+sets umask for files under the mountpoint. This can allow
+users other than the mounting user to read and write to files
+that they did not create.
+.TP
+\fB\-o\fR nomultipart - disable multipart uploads
+.TP
+\fB\-o\fR enable_content_md5 (default is disable)
+Allow OSS server to check data integrity of uploads via the Content-MD5 header.
+This can add CPU overhead to transfers.
+\fB\-o\fR enable_unsigned_payload (default is disable)
+Do not calculate Content-SHA256 for PutObject and UploadPart
+payloads. This can reduce CPU overhead to transfers.
+.TP
+\fB\-o\fR ram_role (default is no IAM role)
+This option requires the IAM role name or "auto". If you specify "auto", ossfs will automatically use the IAM role names that are set to an instance. If you specify this option without any argument, it is the same as that you have specified the "auto".
+.TP
+\fB\-o\fR use_xattr (default is not handling the extended attribute)
+Enable to handle the extended attribute (xattrs).
+If you set this option, you can use the extended attribute.
+For example, encfs and ecryptfs need to support the extended attribute.
+Notice: if ossfs handles the extended attribute, ossfs can not work to copy command with preserve=mode.
+.TP
+\fB\-o\fR noxmlns - disable registering xml name space.
+disable registering xml name space for response of ListBucketResult and ListVersionsResult etc.
+This option should not be specified now, because ossfs looks up xmlns automatically after v1.66.
+.TP
+\fB\-o\fR nomixupload - disable copy in multipart uploads.
+Disable to use PUT (copy api) when multipart uploading large size objects.
+By default, when doing multipart upload, the range of unchanged data will use PUT (copy api) whenever possible.
+When nocopyapi or norenameapi is specified, use of PUT (copy api) is invalidated even if this option is not specified.
+.TP
+\fB\-o\fR nocopyapi - for other incomplete compatibility object storage.
+For a distributed object storage which is compatibility OSS API without PUT (copy api).
+If you set this option, ossfs do not use PUT with "x-oss-copy-source" (copy api). Because traffic is increased 2-3 times by this option, we do not recommend this.
+.TP
+\fB\-o\fR norenameapi - for other incomplete compatibility object storage.
+For a distributed object storage which is compatibility OSS API without PUT (copy api).
+This option is a subset of nocopyapi option. The nocopyapi option does not use copy-api for all command (ex. chmod, chown, touch, mv, etc), but this option does not use copy-api for only rename command (ex. mv).
+If this option is specified with nocopyapi, then ossfs ignores it.
+.TP
+\fB\-o\fR use_path_request_style (use legacy API calling style)
+Enable compatibility with OSS-like APIs which do not support the virtual-host request style, by using the older path request style.
+.TP
+\fB\-o\fR listobjectsv2 (use ListObjectsV2)
+Issue ListObjectsV2 instead of ListObjects, useful on object
+stores without ListObjects support.
+.TP
+\fB\-o\fR noua (suppress User-Agent header)
+Usually ossfs outputs of the User-Agent in "ossfs/<version> (commit hash <hash>; <using ssl library name>)" format.
+If this option is specified, ossfs suppresses the output of the User-Agent.
+.TP
+\fB\-o\fR cipher_suites
+Customize the list of TLS cipher suites. Expects a colon separated list of cipher suite names.
+A list of available cipher suites, depending on your TLS engine, can be found on the CURL library documentation:
+https://curl.haxx.se/docs/ssl-ciphers.html
+.TP
+\fB\-o\fR instance_name
+The instance name of the current ossfs mountpoint.
+This name will be added to logging messages and user agent headers sent by ossfs.
+.TP
+\fB\-o\fR complement_stat (complement lack of file/directory mode)
+ossfs complements lack of information about file/directory mode if a file or a directory object does not have x-oss-meta-mode header.
+As default, ossfs does not complements stat information for a object, then the object will not be able to be allowed to list/modify.
+.TP
+\fB\-o\fR notsup_compat_dir (disable support of alternative directory names)
+.RS
+ossfs supports the three different naming schemas "dir/", "dir" and "dir_$folder$" to map directory names to OSS objects and vice versa. As a fourth variant, directories can be determined indirectly if there is a file object with a path (e.g. "/dir/file") but without the parent directory.
+.TP
+ossfs uses only the first schema "dir/" to create OSS objects for directories.
+.TP
+The support for these different naming schemas causes an increased communication effort.
+.TP
+If all applications exclusively use the "dir/" naming scheme and the bucket does not contain any objects with a different naming scheme, this option can be used to disable support for alternative naming schemes. This reduces access time and can save costs.
+.TP
+\fB\-o\fR use_wtf8 - support arbitrary file system encoding.
+OSS requires all object names to be valid UTF-8. But some
+clients, notably Windows NFS clients, use their own encoding.
+This option re-encodes invalid UTF-8 object names into valid
+UTF-8 by mapping offending codes into a 'private' codepage of the
+Unicode set.
+Useful on clients not using UTF-8 as their file system encoding.
+.TP
+\fB\-o\fR use_session_token - indicate that session token should be provided.
+If credentials are provided by environment variables this switch
+forces presence check of OSS_SESSION_TOKEN variable.
+Otherwise an error is returned.
+.TP
+\fB\-o\fR requester_pays (default is disable)
+This option instructs ossfs to enable requests involving Requester Pays buckets (It includes the 'x-oss-request-payer=requester' entry in the request header).
+.TP
+\fB\-o\fR mime (default is "/etc/mime.types")
+Specify the path of the mime.types file.
+If this option is not specified, the existence of "/etc/mime.types" is checked, and that file is loaded as mime information.
+If this file does not exist on macOS, then "/etc/apache2/mime.types" is checked as well.
+.TP
+\fB\-o\fR logfile - specify the log output file.
+ossfs outputs the log file to syslog. Alternatively, if ossfs is started with the "-f" option specified, the log will be output to the stdout/stderr.
+You can use this option to specify the log file that ossfs outputs.
+If you specify a log file with this option, it will reopen the log file when ossfs receives a SIGHUP signal. You can use the SIGHUP signal for log rotation.
+.TP
+\fB\-o\fR dbglevel (default="crit")
+Set the debug message level. set value as crit (critical), err (error), warn (warning), info (information) to debug level. default debug level is critical.
+If ossfs run with "-d" option, the debug level is set information.
+When ossfs catch the signal SIGUSR2, the debug level is bump up.
+.TP
+\fB\-o\fR curldbg - put curl debug message
+Put the debug message from libcurl when this option is specified.
+Specify "normal" or "body" for the parameter.
+If the parameter is omitted, it is the same as "normal".
+If "body" is specified, some API communication body data will be output in addition to the debug message output as "normal".
+.TP
+\fB\-o\fR no_time_stamp_msg - no time stamp in debug message
+The time stamp is output to the debug message by default.
+If this option is specified, the time stamp will not be output in the debug message.
+It is the same even if the environment variable "OSSFS_MSGTIMESTAMP" is set to "no".
+.TP
+\fB\-o\fR set_check_cache_sigusr1 (default is stdout)
+If the cache is enabled, you can check the integrity of the cache file and the cache file's stats info file.
+This option is specified and when sending the SIGUSR1 signal to the ossfs process checks the cache status at that time.
+This option can take a file path as parameter to output the check result to that file.
+The file path parameter can be omitted. If omitted, the result will be output to stdout or syslog.
+.SS "utility mode options"
+.TP
+\fB\-u\fR or \fB\-\-incomplete\-mpu\-list\fR
+Lists multipart incomplete objects uploaded to the specified bucket.
+.TP
+\fB\-\-incomplete\-mpu\-abort\fR all or date format (default="24H")
+Delete the multipart incomplete object uploaded to the specified bucket.
+If "all" is specified for this option, all multipart incomplete objects will be deleted.
+If you specify no argument as an option, objects older than 24 hours (24H) will be deleted (This is the default value).
+You can specify an optional date format.
+It can be specified as year, month, day, hour, minute, second, and it is expressed as "Y", "M", "D", "h", "m", "s" respectively.
+For example, "1Y6M10D12h30m30s".
+.SH FUSE/MOUNT OPTIONS
+.TP
+Most of the generic mount options described in 'man mount' are supported (ro, rw, suid, nosuid, dev, nodev, exec, noexec, atime, noatime, sync async, dirsync). Filesystems are mounted with '\-onodev,nosuid' by default, which can only be overridden by a privileged user.
+.TP
+There are many FUSE specific mount options that can be specified. e.g. allow_other. See the FUSE README for the full set.
+.SH LOCAL STORAGE CONSUMPTION
+.TP
+ossfs requires local caching for operation. You can enable a local cache with "\-o use_cache" or ossfs uses temporary files to cache pending requests to oss.
+.TP
+Apart from the requirements discussed below, it is recommended to keep enough cache resp. temporary storage to allow one copy each of all files open for reading and writing at any one time.
+.TP
+.SS Local cache with \[dq]\-o use_cache\[dq]
+.TP
+ossfs automatically maintains a local cache of files. The cache folder is specified by the parameter of "\-o use_cache". It is only a local cache that can be deleted at any time. ossfs rebuilds it if necessary.
+.TP
+Whenever ossfs needs to read or write a file on OSS, it first creates the file in the cache directory and operates on it.
+.TP
+The amount of local cache storage used can be indirectly controlled  with "\-o ensure_diskfree".
+.TP
+.SS Without local cache
+.TP
+Since ossfs always requires some storage space for operation, it creates temporary files to store incoming write requests until the required oss request size is reached and the segment has been uploaded. After that, this data is truncated in the temporary file to free up storage space.
+.TP
+Per file you need at least twice the part size (default 5MB or "-o multipart_size") for writing multipart requests or space for the whole file if single requests are enabled ("\-o nomultipart").
+.SH PERFORMANCE CONSIDERATIONS
+.TP
+This section discusses settings to improve ossfs performance.
+.TP
+In most cases, backend performance cannot be controlled and is therefore not part of this discussion.
+.TP
+Details of the local storage usage is discussed in "LOCAL STORAGE CONSUMPTION".
+.TP
+.SS CPU and Memory Consumption
+.TP
+ossfs is a multi-threaded application. Depending on the workload it may use multiple CPUs and a certain amount of memory. You can monitor the CPU and memory consumption with the "top" utility.
+.TP
+.SS Performance of OSS requests
+.TP
+ossfs provides several options (e.g. "\-o multipart_size", "\-o parallel_count") to control behaviour and thus indirectly the performance. The possible combinations of these options in conjunction with the various OSS backends are so varied that there is no individual recommendation other than the default values. Improved individual settings can be found by testing and measuring.
+.TP
+The two options "Enable no object cache" ("\-o enable_noobj_cache") and "Disable support of alternative directory names" ("\-o notsup_compat_dir") can be used to control shared access to the same bucket by different applications:
+.TP
+.IP \[bu]
+Enable no object cache ("\-o enable_noobj_cache")
+.RS
+.TP
+If a bucket is used exclusively by an ossfs instance, you can enable the cache for non-existent files and directories with "\-o enable_noobj_cache". This eliminates repeated requests to check the existence of an object, saving time and possibly money.
+.RE
+.IP \[bu]
+Disable support of alternative directory names ("\-o notsup_compat_dir")
+.RS
+.TP
+ossfs supports "dir/", "dir" and "dir_$folder$" to map directory names to OSS objects and vice versa.
+.TP
+Some applications use a different naming schema for associating directory names to OSS objects. For example, Apache Hadoop uses the  "dir_$folder$" schema to create OSS objects for directories.
+.TP
+The option "\-o notsup_compat_dir" can be set if all accessing tools use the "dir/" naming schema for directory objects and the bucket does not contain any objects with a different naming scheme. In this case, accessing directory objects saves time and possibly money because alternative schemas are not checked.
+.RE
+.SH NOTES
+.TP
+The maximum size of objects that ossfs can handle depends on Alibaba Cloud OSS. For example, up to 5 GB when using single PUT API. And up to 5 TB is supported when Multipart Upload API is used.
+.TP
+ossfs leverages /etc/mime.types to "guess" the "correct" content-type based on file name extension. This means that you can copy a website to OSS and serve it up directly from OSS with correct content-types!
+.SH SEE ALSO
+fuse(8), mount(8), fusermount(1), fstab(5)
+.SH BUGS
+Due to OSS's "eventual consistency" limitations, file creation can and will occasionally fail. Even after a successful create, subsequent reads can fail for an indeterminate time, even after one or more successful reads. Create and read enough files and you will eventually encounter this failure. This is not a flaw in ossfs and it is not something a FUSE wrapper like ossfs can work around. The retries option does not address this issue. Your application must either tolerate or compensate for these failures, for example by retrying creates or reads.
+.SH AUTHOR
+ossfs has been written by Randy Rizun <rrizun@gmail.com>.

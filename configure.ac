@@ -1,8 +1,7 @@
 ######################################################################
-# ossfs - FUSE-based file system backed by Aliyun OSS
+# ossfs -  FUSE-based file system backed by Alibaba Cloud OSS
 #
 # Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
-# Copyright 2015 Haoran Yang <yangzhuodog1982@gmail.com>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -21,7 +20,7 @@
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.59)
-AC_INIT(ossfs, 1.80.7)
+AC_INIT(ossfs, 1.91.1)
 AC_CONFIG_HEADER([config.h])
 
 AC_CANONICAL_SYSTEM
@@ -30,12 +29,22 @@ AM_INIT_AUTOMAKE([foreign])
 AC_PROG_CXX
 AC_PROG_CC
 
-CXXFLAGS="$CXXFLAGS -Wall -D_FILE_OFFSET_BITS=64"
+AC_CHECK_HEADERS([sys/xattr.h])
+AC_CHECK_HEADERS([attr/xattr.h])
+AC_CHECK_HEADERS([sys/extattr.h])
+AC_CHECK_FUNCS([fallocate])
+
+CXXFLAGS="$CXXFLAGS -Wall -fno-exceptions -D_FILE_OFFSET_BITS=64 -D_FORTIFY_SOURCE=2"
 
 dnl ----------------------------------------------
-dnl For OSX
+dnl For macOS
 dnl ----------------------------------------------
 case "$target" in
+   *-cygwin* )
+      # Do something specific for windows using winfsp
+      CXXFLAGS="$CXXFLAGS -D_GNU_SOURCE=1"
+      min_fuse_version=2.8
+      ;;
    *-darwin* )
       # Do something specific for mac
       min_fuse_version=2.7.3
@@ -173,13 +182,13 @@ dnl
 dnl For PKG_CONFIG before checking nss/gnutls.
 dnl this is redundant checking, but we need checking before following.
 dnl
-PKG_CHECK_MODULES([common_lib_checking], [fuse >= ${min_fuse_version} libcurl >= 7.0 libxml-2.0 >= 2.6])
+PKG_CHECK_MODULES([common_lib_checking], [fuse >= ${min_fuse_version} libcurl >= 7.0 libxml-2.0 >= 2.6 ])
 
 AC_MSG_CHECKING([compile ossfs with])
 case "${auth_lib}" in
 openssl)
   AC_MSG_RESULT(OpenSSL)
-  PKG_CHECK_MODULES([DEPS], [fuse >= ${min_fuse_version} libcurl >= 7.0 libxml-2.0 >= 2.6 libcrypto >= 0.9])
+  PKG_CHECK_MODULES([DEPS], [fuse >= ${min_fuse_version} libcurl >= 7.0 libxml-2.0 >= 2.6 libcrypto >= 0.9 ])
   ;;
 gnutls)
   AC_MSG_RESULT(GnuTLS-gcrypt)
@@ -229,6 +238,10 @@ dnl ----------------------------------------------
 dnl malloc_trim function
 AC_CHECK_FUNCS([malloc_trim])
 
+dnl clock_gettime function(macos)
+AC_SEARCH_LIBS([clock_gettime],[rt posix4]) 
+AC_CHECK_FUNCS([clock_gettime])
+
 dnl ----------------------------------------------
 dnl check symbols/macros/enums
 dnl ----------------------------------------------
@@ -253,18 +266,72 @@ AC_COMPILE_IFELSE(
 )
 
 dnl ----------------------------------------------
+dnl check CURLoption
+dnl ----------------------------------------------
+dnl CURLOPT_TCP_KEEPALIVE (is supported by 7.25.0 and later)
+AC_MSG_CHECKING([checking CURLOPT_TCP_KEEPALIVE])
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM([[#include <curl/curl.h>]],
+                   [[CURLoption opt = CURLOPT_TCP_KEEPALIVE;]])
+  ],
+  [AC_DEFINE(HAVE_CURLOPT_TCP_KEEPALIVE, 1, [Define to 1 if libcurl has CURLOPT_TCP_KEEPALIVE CURLoption])
+   AC_MSG_RESULT(yes)
+  ],
+  [AC_DEFINE(HAVE_CURLOPT_TCP_KEEPALIVE, 0, [Define to 1 if libcurl has CURLOPT_TCP_KEEPALIVE CURLoption])
+   AC_MSG_RESULT(no)
+  ]
+)
+
+dnl CURLOPT_SSL_ENABLE_ALPN (is supported by 7.36.0 and later)
+AC_MSG_CHECKING([checking CURLOPT_SSL_ENABLE_ALPN])
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM([[#include <curl/curl.h>]],
+                   [[CURLoption opt = CURLOPT_SSL_ENABLE_ALPN;]])
+  ],
+  [AC_DEFINE(HAVE_CURLOPT_SSL_ENABLE_ALPN, 1, [Define to 1 if libcurl has CURLOPT_SSL_ENABLE_ALPN CURLoption])
+   AC_MSG_RESULT(yes)
+  ],
+  [AC_DEFINE(HAVE_CURLOPT_SSL_ENABLE_ALPN, 0, [Define to 1 if libcurl has CURLOPT_SSL_ENABLE_ALPN CURLoption])
+   AC_MSG_RESULT(no)
+  ]
+)
+
+dnl CURLOPT_KEEP_SENDING_ON_ERROR (is supported by 7.51.0 and later)
+AC_MSG_CHECKING([checking CURLOPT_KEEP_SENDING_ON_ERROR])
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM([[#include <curl/curl.h>]],
+                   [[CURLoption opt = CURLOPT_KEEP_SENDING_ON_ERROR;]])
+  ],
+  [AC_DEFINE(HAVE_CURLOPT_KEEP_SENDING_ON_ERROR, 1, [Define to 1 if libcurl has CURLOPT_KEEP_SENDING_ON_ERROR CURLoption])
+   AC_MSG_RESULT(yes)
+  ],
+  [AC_DEFINE(HAVE_CURLOPT_KEEP_SENDING_ON_ERROR, 0, [Define to 1 if libcurl has CURLOPT_KEEP_SENDING_ON_ERROR CURLoption])
+   AC_MSG_RESULT(no)
+  ]
+)
+
+dnl ----------------------------------------------
+dnl build date
+dnl ----------------------------------------------
+AC_SUBST([MAN_PAGE_DATE], [$(date +"%B %Y")])
+
+dnl ----------------------------------------------
 dnl output files
 dnl ----------------------------------------------
-AC_CONFIG_FILES(Makefile src/Makefile test/Makefile doc/Makefile)
+AC_CONFIG_FILES(Makefile
+                src/Makefile
+                test/Makefile
+                doc/Makefile
+                doc/man/ossfs.1)
 
 dnl ----------------------------------------------
 dnl short commit hash
 dnl ----------------------------------------------
-AC_CHECK_PROG([GITCMD], [git —version], [yes], [no])
-AC_CHECK_FILE([.git], [DOTGITDIR=yes], [DOTGITDIR=no])
+AC_CHECK_PROG([GITCMD], [git --version], [yes], [no])
+AS_IF([test -d .git], [DOTGITDIR=yes], [DOTGITDIR=no])
 
 AC_MSG_CHECKING([github short commit hash])
-if test “x${GITCMD}” = “xyes” -a “x${DOTGITDIR}” = “xyes”; then
+if test "x${GITCMD}" = "xyes" -a "x${DOTGITDIR}" = "xyes"; then
     GITCOMMITHASH=`git rev-parse --short HEAD`
 elif test -f default_commit_hash; then
     GITCOMMITHASH=`cat default_commit_hash`
@@ -283,3 +350,12 @@ AC_OUTPUT
 dnl ----------------------------------------------
 dnl end configuration
 dnl ----------------------------------------------
+
+#
+# Local variables:
+# tab-width: 4
+# c-basic-offset: 4
+# End:
+# vim600: expandtab sw=4 ts=4 fdm=marker
+# vim<600: expandtab sw=4 ts=4
+#

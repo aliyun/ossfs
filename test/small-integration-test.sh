@@ -1,92 +1,90 @@
 #!/bin/bash
+#
+# ossfs - FUSE-based file system backed by Alibaba Cloud OSS
+#
+# Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
 
 #
-# By default tests run against a local s3proxy instance.  To run against 
-# Aliyun OSS, specify the following variables:
-#
-# OSSFS_CREDENTIALS_FILE=keyfile      ossfs format key file
-# TEST_BUCKET_1=bucket               Name of bucket to use 
-# OSSPROXY_BINARY=""                  Leave empty 
-# OSS_URL=""   Specify OSS server
-#
-# Example: 
-#
-# OSSFS_CREDENTIALS_FILE=keyfile TEST_BUCKET_1=bucket OSSPROXY_BINARY="" OSS_URL="http://oss_url" ./small-integration-test.sh
+# Test ossfs file system operations with
 #
 
-set -o xtrace
 set -o errexit
+set -o pipefail
 
-: ${OSS_URL:="http://127.0.0.1:8080"}
-
-# Require root
-REQUIRE_ROOT=require-root.sh
-#source $REQUIRE_ROOT
 source integration-test-common.sh
 
-function retry {
-    set +o errexit
-    N=$1; shift;
-    status=0
-    for i in $(seq $N); do
-        $@
-        status=$?
-        if [ $status == 0 ]; then
-            break
-        fi
-        sleep 1
-    done
+CACHE_DIR="/tmp/ossfs-cache"
+rm -rf "${CACHE_DIR}"
+mkdir "${CACHE_DIR}"
 
-    if [ $status != 0 ]; then
-        echo "timeout waiting for $@"
-    fi
-    set -o errexit
-    return $status
-}
+source test-utils.sh
 
-function exit_handler {
-    if [ -n "${OSSPROXY_PID}" ]
-    then
-        kill $OSSPROXY_PID
-    fi
-    retry 30 fusermount -u $TEST_BUCKET_MOUNT_POINT_1
-}
-trap exit_handler EXIT
+#reserve 200MB for data cache
+FAKE_FREE_DISK_SIZE=200
+ENSURE_DISKFREE_SIZE=10
 
-if [ -n "${OSSPROXY_BINARY}" ]
-then
-    stdbuf -oL -eL java -jar "$OSSPROXY_BINARY" --properties s3proxy.conf | stdbuf -oL -eL sed -u "s/^/s3proxy: /" &
-
-    # wait for OSSProxy to start
-    for i in $(seq 30);
-    do
-        if exec 3<>"/dev/tcp/127.0.0.1/8080";
-        then
-            exec 3<&-  # Close for read
-            exec 3>&-  # Close for write
-            break
-        fi
-        sleep 1
-    done
-
-    OSSPROXY_PID=$(netstat -lpnt | grep :8080 | awk '{ print $7 }' | sed -u 's|/java||')
+export CACHE_DIR
+export ENSURE_DISKFREE_SIZE 
+if [ -n "${ALL_TESTS}" ]; then
+    FLAGS=(
+        "use_cache=${CACHE_DIR} -o ensure_diskfree=${ENSURE_DISKFREE_SIZE} -o fake_diskfree=${FAKE_FREE_DISK_SIZE}"
+        enable_content_md5
+        enable_noobj_cache
+        "max_stat_cache_size=100"
+        nocopyapi
+        nomultipart
+        notsup_compat_dir
+        sigv1
+        "singlepart_copy_limit=10"  # limit size to exercise multipart code paths
+        #use_sse  # TODO: S3Proxy does not support SSE
+    )
+else
+    FLAGS=(
+        sigv1
+    )
 fi
 
-# Mount the bucket
-if [ ! -d $TEST_BUCKET_MOUNT_POINT_1 ]
-then
-	mkdir -p $TEST_BUCKET_MOUNT_POINT_1
+start_s3proxy
+
+if ! aws_cli s3api head-bucket --bucket "${TEST_BUCKET_1}" --region "${OSS_REGION}"; then
+    aws_cli s3 mb "s3://${TEST_BUCKET_1}" --region "${OSS_REGION}"
 fi
-stdbuf -oL -eL $OSSFS $TEST_BUCKET_1 $TEST_BUCKET_MOUNT_POINT_1 \
-    -o createbucket \
-    -o enable_content_md5 \
-    -o passwd_file=$OSSFS_CREDENTIALS_FILE \
-    -o singlepart_copy_limit=$((10 * 1024)) \
-    -o url=${OSS_URL} \
-    -o dbglevel=info -f |& stdbuf -oL -eL sed -u "s/^/ossfs: /" &
 
-retry 30 grep $TEST_BUCKET_MOUNT_POINT_1 /proc/mounts || exit 1
+for flag in "${FLAGS[@]}"; do
+    echo "testing ossfs flag: ${flag}"
 
-./integration-test-main.sh $TEST_BUCKET_MOUNT_POINT_1
+    # shellcheck disable=SC2086
+    start_ossfs -o ${flag}
 
-echo "All tests complete."
+    ./integration-test-main.sh
+
+    stop_ossfs
+done
+
+stop_s3proxy
+
+echo "$0: tests complete."
+
+#
+# Local variables:
+# tab-width: 4
+# c-basic-offset: 4
+# End:
+# vim600: expandtab sw=4 ts=4 fdm=marker
+# vim<600: expandtab sw=4 ts=4
+#
