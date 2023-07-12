@@ -40,17 +40,17 @@ typedef std::map<std::string, std::string, header_nocase_cmp> headers_t;
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
-struct timespec get_mtime(const headers_t& meta, bool overcheck = true);
-struct timespec get_ctime(const headers_t& meta, bool overcheck = true);
-struct timespec get_atime(const headers_t& meta, bool overcheck = true);
+struct timespec get_mtime(const headers_t& meta, bool overcheck = true, bool noextendedmeta = false);
+struct timespec get_ctime(const headers_t& meta, bool overcheck = true, bool noextendedmeta = false);
+struct timespec get_atime(const headers_t& meta, bool overcheck = true, bool noextendedmeta = false);
 off_t get_size(const char *s);
 off_t get_size(const headers_t& meta);
 mode_t get_mode(const char *s, int base = 0);
-mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir = false, bool forcedir = false);
+mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir = false, bool forcedir = false, bool noextendedmeta = false);
 uid_t get_uid(const char *s);
-uid_t get_uid(const headers_t& meta);
+uid_t get_uid(const headers_t& meta, bool noextendedmeta = false);
 gid_t get_gid(const char *s);
-gid_t get_gid(const headers_t& meta);
+gid_t get_gid(const headers_t& meta, bool noextendedmeta = false);
 blkcnt_t get_blocks(off_t size);
 time_t cvtIAMExpireStringToTime(const char* s);
 time_t get_lastmodified(const char* s);
@@ -58,6 +58,7 @@ time_t get_lastmodified(const headers_t& meta);
 bool is_need_check_obj_detail(const headers_t& meta);
 bool merge_headers(headers_t& base, const headers_t& additional, bool add_noexist);
 bool simple_parse_xml(const char* data, size_t len, const char* key, std::string& value);
+std::string utc_to_gmt(const char* s);
 #endif // S3FS_METAHEADER_H_
 
 /*

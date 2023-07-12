@@ -96,6 +96,9 @@ static off_t max_dirty_data       = 5LL * 1024LL * 1024LL * 1024LL;
 static bool use_wtf8              = false;
 static off_t fake_diskfree_size   = -1; // default is not set(-1)
 static bool shallowcopyapi        = true;//
+static bool is_readdir_optimize   = false;
+static bool is_refresh_fakemeta   = false;
+static off_t readdir_check_size   = 0;
 //-------------------------------------------------------------------
 // Global functions : prototype
 //-------------------------------------------------------------------
@@ -107,7 +110,7 @@ int put_headers(const char* path, headers_t& meta, bool is_copy, bool use_st_siz
 static bool is_special_name_folder_object(const char* path);
 static int chk_dir_object_type(const char* path, std::string& newpath, std::string& nowpath, std::string& nowcache, headers_t* pmeta = NULL, dirtype* pDirType = NULL);
 static int remove_old_type_dir(const std::string& path, dirtype type);
-static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t* pmeta = NULL, bool overcheck = true, bool* pisforce = NULL, bool add_no_truncate_cache = false);
+static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t* pmeta = NULL, bool overcheck = true, bool* pisforce = NULL, bool add_no_truncate_cache = false, bool refresh_fakemeta = false);
 static int check_object_access(const char* path, int mask, struct stat* pstbuf);
 static int check_object_owner(const char* path, struct stat* pstbuf);
 static int check_parent_object_access(const char* path, int mask);
@@ -335,7 +338,7 @@ static int remove_old_type_dir(const std::string& path, dirtype type)
 // 2) "dir/"
 // 3) "dir_$folder$"
 //
-static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t* pmeta, bool overcheck, bool* pisforce, bool add_no_truncate_cache)
+static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t* pmeta, bool overcheck, bool* pisforce, bool add_no_truncate_cache, bool refresh_fakemeta)
 {
     int          result = -1;
     struct stat  tmpstbuf;
@@ -345,6 +348,7 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
     std::string  strpath;
     S3fsCurl     s3fscurl;
     bool         forcedir = false;
+    bool         fakemeta = false;
     std::string::size_type Pos;
 
     S3FS_PRN_DBG("[path=%s]", path);
@@ -370,8 +374,12 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
         strpath.erase(Pos);
         strpath += "/";
     }
-    if(StatCache::getStatCacheData()->GetStat(strpath, pstat, pheader, overcheck, pisforce)){
-        return 0;
+    if(StatCache::getStatCacheData()->GetStat(strpath, pstat, pheader, overcheck, pisforce, &fakemeta)){
+        if (refresh_fakemeta && fakemeta) {
+            // igrone the fake meta
+        } else {
+            return 0;
+        }
     }
     if(StatCache::getStatCacheData()->IsNoObjectCache(strpath)){
         // there is the path in the cache for no object, it is no object.
@@ -484,14 +492,14 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
         }
         if(!StatCache::getStatCacheData()->GetStat(strpath, pstat, pheader, overcheck, pisforce)){
             // There is not in cache.(why?) -> retry to convert.
-            if(!convert_header_to_stat(strpath, (*pheader), pstat, forcedir)){
+            if(!StatCache::getStatCacheData()->ConvertMetaToStat(strpath, (*pheader), pstat, forcedir)){
                 S3FS_PRN_ERR("failed convert headers to stat[path=%s]", strpath.c_str());
                 return -ENOENT;
             }
         }
     }else{
         // cache size is Zero -> only convert.
-        if(!convert_header_to_stat(strpath, (*pheader), pstat, forcedir)){
+        if(!StatCache::getStatCacheData()->ConvertMetaToStat(strpath, (*pheader), pstat, forcedir)){
             S3FS_PRN_ERR("failed convert headers to stat[path=%s]", strpath.c_str());
             return -ENOENT;
         }
@@ -1199,7 +1207,7 @@ static int rename_object(const char* from, const char* to, bool update_ctime)
         // not permit removing "from" object parent dir.
         return result;
     }
-    if(0 != (result = get_object_attribute(from, &buf, &meta))){
+    if(0 != (result = get_object_attribute(from, &buf, &meta, true, NULL, false, is_refresh_fakemeta))){
         return result;
     }
     s3_realpath = get_realpath(from);
@@ -1335,7 +1343,7 @@ static int rename_large_object(const char* from, const char* to)
         // not permit removing "from" object parent dir.
         return result;
     }
-    if(0 != (result = get_object_attribute(from, &buf, &meta, false))){
+    if(0 != (result = get_object_attribute(from, &buf, &meta, false, NULL, false, is_refresh_fakemeta))){
         return result;
     }
 
@@ -1599,6 +1607,10 @@ static int s3fs_chmod(const char* _path, mode_t mode)
         return result;
     }
 
+    if (is_readdir_optimize) {
+        return 0;
+    }
+
     if(S_ISDIR(stbuf.st_mode)){
         result = chk_dir_object_type(path, newpath, strpath, nowcache, &meta, &nDirType);
     }else{
@@ -1691,6 +1703,10 @@ static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
         return result;
     }
 
+    if (is_readdir_optimize) {
+        return 0;
+    }
+
     // Get attributes
     if(S_ISDIR(stbuf.st_mode)){
         result = chk_dir_object_type(path, newpath, strpath, nowcache, NULL, &nDirType);
@@ -1768,6 +1784,10 @@ static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
     }
     if(0 != (result = check_object_owner(path, &stbuf))){
         return result;
+    }
+
+    if (is_readdir_optimize) {
+        return 0;
     }
 
     if((uid_t)(-1) == uid){
@@ -1866,6 +1886,10 @@ static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
     }
     if(0 != (result = check_object_owner(path, &stbuf))){
         return result;
+    }
+
+    if (is_readdir_optimize) {
+        return 0;
     }
 
     if((uid_t)(-1) == uid){
@@ -1968,28 +1992,32 @@ static int s3fs_utimens(const char* _path, const struct timespec ts[2])
         }
     }
 
-    struct timespec now;
-    if(-1 == clock_gettime(static_cast<clockid_t>(CLOCK_REALTIME), &now)){
-        abort();
-    }
-#if __APPLE__
-    struct timespec actime = handle_utimens_special_values(ts[0], now, stbuf.st_ctimespec);
-    struct timespec mtime = handle_utimens_special_values(ts[1], now, stbuf.st_mtimespec);
-#else
-    struct timespec actime = handle_utimens_special_values(ts[0], now, stbuf.st_ctim);
-    struct timespec mtime = handle_utimens_special_values(ts[1], now, stbuf.st_mtim);
-#endif
-
     if(S_ISDIR(stbuf.st_mode)){
         result = chk_dir_object_type(path, newpath, strpath, nowcache, &meta, &nDirType);
     }else{
         strpath  = path;
         nowcache = strpath;
-        result   = get_object_attribute(strpath.c_str(), NULL, &meta);
+        result   = get_object_attribute(strpath.c_str(), NULL, &meta, true, NULL, false, is_refresh_fakemeta);
     }
     if(0 != result){
         return result;
     }
+
+    //covent u/a/mtime from meta
+    struct stat stbuftime;
+    StatCache::getStatCacheData()->ToTimeStat(meta, &stbuftime);    
+    struct timespec now;
+    if(-1 == clock_gettime(static_cast<clockid_t>(CLOCK_REALTIME), &now)){
+        abort();
+    }
+
+#if __APPLE__
+    struct timespec actime = handle_utimens_special_values(ts[0], now, stbuftime.st_ctimespec);
+    struct timespec mtime = handle_utimens_special_values(ts[1], now, stbuftime.st_mtimespec);
+#else
+    struct timespec actime = handle_utimens_special_values(ts[0], now, stbuftime.st_ctim);
+    struct timespec mtime = handle_utimens_special_values(ts[1], now, stbuftime.st_mtim);
+#endif
 
     if(S_ISDIR(stbuf.st_mode) && IS_REPLACEDIR(nDirType)){
         // Should rebuild directory object(except new type)
@@ -2185,7 +2213,7 @@ static int s3fs_truncate(const char* _path, off_t size)
     }
 
     // Get file information
-    if(0 == (result = get_object_attribute(path, NULL, &meta))){
+    if(0 == (result = get_object_attribute(path, NULL, &meta, true, NULL, false, is_refresh_fakemeta))){
         // File exists
 
         // [NOTE]
@@ -2674,6 +2702,132 @@ static int readdir_multi_head(const char* path, const S3ObjList& head, void* buf
     return result;
 }
 
+static int readdir_multi_head_optimize(const char* path, const S3ObjList& head, void* buf, fuse_fill_dir_t filler)
+{
+    S3fsMultiCurl curlmulti(S3fsCurl::GetMaxMultiRequest());
+    s3obj_list_t  headlist;
+    s3obj_list_t  fillerlist;
+    int           result = 0;
+    s3obj_list_t  reheadlist;
+
+    S3FS_PRN_INFO1("[path=%s][list=%zu]", path, headlist.size());
+
+    // Make base path list.
+    head.GetNameList(headlist, true, false);  // get name with "/".
+
+    // Initialize S3fsMultiCurl
+    curlmulti.SetSuccessCallback(multi_head_callback);
+    curlmulti.SetRetryCallback(multi_head_retry_callback);
+
+    s3obj_list_t::iterator iter;
+
+    fillerlist.clear();
+    // Make single head request(with max).
+    for(iter = headlist.begin(); headlist.end() != iter; iter = headlist.erase(iter)){
+        std::string disppath = path + (*iter);
+        std::string etag     = head.GetETag((*iter).c_str());
+
+        std::string fillpath = disppath;
+        if('/' == *disppath.rbegin()){
+            fillpath.erase(fillpath.length() -1);
+        }
+        fillerlist.push_back(fillpath);
+
+        if(StatCache::getStatCacheData()->HasStat(disppath, etag.c_str())){
+            continue;
+        }
+
+        //dir
+        bool isDir = head.IsDir((*iter).c_str());
+        if (isDir) {
+            reheadlist.push_back(*iter);
+            S3FS_PRN_DBG("reheadlist dir [path=%s]", (*iter).c_str());
+            continue;
+        }
+
+        //use headrequest to get extended info
+        std::string strsize = head.GetSize((*iter).c_str());
+        off_t size = get_size(strsize.c_str());
+        if (is_check_meta(size, readdir_check_size)) {
+            reheadlist.push_back(*iter);
+            S3FS_PRN_DBG("reheadlist size limit [path=%s, size=%s]", (*iter).c_str(), strsize.c_str());
+            continue;
+        }
+
+        // conver meta to header_t
+        std::string lastmodified = head.GetLastModified((*iter).c_str());
+        headers_t headers;
+        headers["Content-Length"] = strsize;
+        headers["Last-Modified"] = utc_to_gmt(lastmodified.c_str());
+        if(!StatCache::getStatCacheData()->AddStat(disppath, headers, /*forcedir*/false, /*no_truncate*/false, true)){
+            S3FS_PRN_ERR("failed adding stat cache [path=%s]", disppath.c_str());
+        }
+    }
+
+    //check from header meta
+    for(iter = reheadlist.begin(); reheadlist.end() != iter; ++iter){
+        std::string disppath = path + (*iter);
+        S3fsCurl* s3fscurl = new S3fsCurl();
+        if(!s3fscurl->PreHeadRequest(disppath, (*iter), disppath)){  // target path = cache key path.(ex "dir/")
+            S3FS_PRN_WARN("Could not make curl object for head request(%s).", disppath.c_str());
+            delete s3fscurl;
+            continue;
+        }
+
+        if(!curlmulti.SetS3fsCurlObject(s3fscurl)){
+            S3FS_PRN_WARN("Could not make curl object into multi curl(%s).", disppath.c_str());
+            delete s3fscurl;
+            continue;
+        }
+    }
+
+    // Multi request
+    if(0 != (result = curlmulti.Request())){
+        if(-EIO == result){
+            S3FS_PRN_WARN("error occurred in multi request(errno=%d), but continue...", result);
+            result = 0;
+        }else{
+            S3FS_PRN_ERR("error occurred in multi request(errno=%d).", result);
+            return result;
+        }
+    }
+
+    // if the dir exists in reheadlist, but is not in stat cache,
+    // it is just a common prefix, need add to stat cache.
+    headers_t emptyheaders;
+    for(iter = reheadlist.begin(); reheadlist.end() != iter; iter = reheadlist.erase(iter)){
+        std::string disppath = path + (*iter);
+        bool isDir = head.IsDir((*iter).c_str());
+        if (isDir) {
+            if (!StatCache::getStatCacheData()->HasStat(disppath)) {
+                if(!StatCache::getStatCacheData()->AddStat(disppath, emptyheaders, isDir)){
+                    S3FS_PRN_ERR("failed adding stat cache [path=%s]", disppath.c_str());
+                }
+            }
+        }
+    }
+
+    // populate fuse buffer
+    // here is best position, because a case is cache size < files in directory
+    //
+    for(iter = fillerlist.begin(); fillerlist.end() != iter; ++iter){
+        struct stat st;
+        bool in_cache = StatCache::getStatCacheData()->GetStat((*iter), &st);
+        std::string bpath = mybasename((*iter));
+        if(use_wtf8){
+            bpath = s3fs_wtf8_decode(bpath);
+        }
+        if(in_cache){
+            filler(buf, bpath.c_str(), &st, 0);
+        }else{
+            S3FS_PRN_INFO2("Could not find %s file in stat cache.", (*iter).c_str());
+            filler(buf, bpath.c_str(), 0, 0);
+        }
+    }
+
+    return result;
+}
+
 static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi)
 {
     WTF8_ENCODE(path)
@@ -2705,8 +2859,14 @@ static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, of
         strpath += "/";
     }
 
-    if(0 != (result = readdir_multi_head(strpath.c_str(), head, buf, filler))){
-        S3FS_PRN_ERR("readdir_multi_head returns error(%d).", result);
+    if (is_readdir_optimize){
+        result = readdir_multi_head_optimize(strpath.c_str(), head, buf, filler);
+    } else {
+        result = readdir_multi_head(strpath.c_str(), head, buf, filler);
+    }
+        
+    if (result != 0) {
+        S3FS_PRN_ERR("readdir_multi_head, optimize(%d) returns error(%d).", is_readdir_optimize, result);
     }
 
     S3FS_MALLOCTRIM(0);
@@ -4320,6 +4480,14 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             shallowcopyapi = false;
             return 0;
         }
+        if(0 == strcmp(arg, "readdir_optimize")){
+            is_readdir_optimize = true;
+            return 0;
+        }
+        if(is_prefix(arg, "readdir_check_size=")){
+            readdir_check_size = static_cast<off_t>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            return 0;
+        }
         //
         // log file option
         //
@@ -4729,6 +4897,20 @@ int main(int argc, char* argv[])
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
         exit(EXIT_FAILURE);
+    }
+
+    // check readdir_optimize 
+    if(is_readdir_optimize){
+        if(is_use_xattr){
+            S3FS_PRN_EXIT("readdir_optimize option could not be specified with use_xattr option.");
+            S3fsCurl::DestroyS3fsCurl();
+            s3fs_destroy_global_ssl();
+            destroy_parser_xml_lock();
+            exit(EXIT_FAILURE);
+        }
+        is_refresh_fakemeta = true;
+        StatCache::getStatCacheData()->SetNoExtendedMeta(true, readdir_check_size);
+        S3FS_PRN_INFO("Readdir optimize, flag(%d, %lld)", is_refresh_fakemeta, static_cast<long long int>(readdir_check_size));
     }
 
     s3fs_oper.getattr     = s3fs_getattr;

@@ -37,8 +37,9 @@ struct stat_cache_entry {
     bool              isforce;
     bool              noobjcache;  // Flag: cache is no object for no listing.
     unsigned long     notruncate;  // 0<:   not remove automatically at checking truncate
+    bool              isfake;   // Flag: meta is built from listobject result.
 
-    stat_cache_entry() : hit_count(0), isforce(false), noobjcache(false), notruncate(0L)
+    stat_cache_entry() : hit_count(0), isforce(false), noobjcache(false), notruncate(0L), isfake(false)
     {
         memset(&stbuf, 0, sizeof(struct stat));
         cache_date.tv_sec  = 0;
@@ -90,13 +91,15 @@ class StatCache
         unsigned long          CacheSize;
         bool                   IsCacheNoObject;
         symlink_cache_t        symlink_cache;
+        bool                   IsNoExtendedMeta;
+        off_t                  CheckSizeForMeta;
 
     private:
         StatCache();
         ~StatCache();
 
         void Clear();
-        bool GetStat(const std::string& key, struct stat* pst, headers_t* meta, bool overcheck, const char* petag, bool* pisforce);
+        bool GetStat(const std::string& key, struct stat* pst, headers_t* meta, bool overcheck, const char* petag, bool* pisforce, bool *pisfake);
         // Truncate stat cache
         bool TruncateCache();
         // Truncate symbolic link cache
@@ -129,26 +132,37 @@ class StatCache
             return IsCacheNoObject;
         }
 
-        // Get stat cache
-        bool GetStat(const std::string& key, struct stat* pst, headers_t* meta, bool overcheck = true, bool* pisforce = NULL)
+        bool SetNoExtendedMeta(bool flag, off_t check_size);
+
+        bool EnableNoExtendedMeta()
         {
-            return GetStat(key, pst, meta, overcheck, NULL, pisforce);
+            return SetNoExtendedMeta(true, 0);
+        }
+        bool DisableNoExtendedMeta()
+        {
+            return SetNoExtendedMeta(false, 0);
+        }
+
+        // Get stat cache
+        bool GetStat(const std::string& key, struct stat* pst, headers_t* meta, bool overcheck = true, bool* pisforce = NULL, bool *pisfake = NULL)
+        {
+            return GetStat(key, pst, meta, overcheck, NULL, pisforce, pisfake);
         }
         bool GetStat(const std::string& key, struct stat* pst, bool overcheck = true)
         {
-            return GetStat(key, pst, NULL, overcheck, NULL, NULL);
+            return GetStat(key, pst, NULL, overcheck, NULL, NULL, NULL);
         }
         bool GetStat(const std::string& key, headers_t* meta, bool overcheck = true)
         {
-            return GetStat(key, NULL, meta, overcheck, NULL, NULL);
+            return GetStat(key, NULL, meta, overcheck, NULL, NULL, NULL);
         }
         bool HasStat(const std::string& key, bool overcheck = true)
         {
-            return GetStat(key, NULL, NULL, overcheck, NULL, NULL);
+            return GetStat(key, NULL, NULL, overcheck, NULL, NULL, NULL);
         }
         bool HasStat(const std::string& key, const char* etag, bool overcheck = true)
         {
-            return GetStat(key, NULL, NULL, overcheck, etag, NULL);
+            return GetStat(key, NULL, NULL, overcheck, etag, NULL, NULL);
         }
 
         // Cache For no object
@@ -156,7 +170,7 @@ class StatCache
         bool AddNoObjectCache(const std::string& key);
 
         // Add stat cache
-        bool AddStat(const std::string& key, headers_t& meta, bool forcedir = false, bool no_truncate = false);
+        bool AddStat(const std::string& key, headers_t& meta, bool forcedir = false, bool no_truncate = false, bool isfake = false);
 
         // Update meta stats
         bool UpdateMetaStats(const std::string& key, headers_t& meta);
@@ -170,17 +184,20 @@ class StatCache
         {
             return DelStat(key.c_str(), lock_already_held);
         }
-
         // Cache for symbolic link
         bool GetSymlink(const std::string& key, std::string& value);
         bool AddSymlink(const std::string& key, const std::string& value);
         bool DelSymlink(const char* key, bool lock_already_held = false);
+
+        // header meta to stat
+        bool ConvertMetaToStat(const std::string& strpath, const headers_t& meta, struct stat* pst, bool forcedir);
+
+        // header meta to stat
+        bool ToTimeStat(const headers_t& meta, struct stat* pst);
 };
 
-//-------------------------------------------------------------------
-// Functions
-//-------------------------------------------------------------------
-bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, struct stat* pst, bool forcedir = false);
+
+static inline bool is_check_meta(off_t size, off_t max_size) { return (size == 0) || (size <= max_size); }
 
 #endif // S3FS_CACHE_H_
 

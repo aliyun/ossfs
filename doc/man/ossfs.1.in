@@ -329,6 +329,18 @@ OSS supports shallow copy feature, so try using the single-part copy api for a l
 If that fails, use the multipart copy api again. It can speed up the process of renaming a large file or updating a file's meta.
 If this option is specified, renames a large file or update a large file's meta by multipart upload.
 .TP
+\fB\-o\fR readdir_optimize (default is disable)
+ossfs stroes extended information like access & change time, owner, permissions, etc in the object's meta data.
+The ListObjects only returns basic information like name, size, and modified time, so ossfs issues HeadObject request for each file to get extended information. This causes poor performance in readdir.
+If this option is specified, ossfs improves readdir preformence by ignoring extended information and faking these metadata - atime/ctime, uid/gid, and permissions.
+If this option is specified, chmod and chown works nothing.
+If this option is specified, only the symlink built in new symlink format can be displayed correctly.
+.TP
+\fB\-o\fR readdir_check_size (default="0")
+Maximum size in file length of issuing HeadObject request to get extended information.
+If a file size is greater than this threshold, only use the basic information from ListObjects result.
+This option works when readdir_optimize option is eanbled.
+.TP
 \fB\-o\fR logfile - specify the log output file.
 ossfs outputs the log file to syslog. Alternatively, if ossfs is started with the "-f" option specified, the log will be output to the stdout/stderr.
 You can use this option to specify the log file that ossfs outputs.
