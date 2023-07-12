@@ -23,6 +23,11 @@ The ossfs is built based on ossfs and has all the features of s3fs. Main feature
 * in-memory metadata caching
 * local disk data caching
 
+In addition to the above features, ossfs also has its own features.
+* renames via server-side single-part copy to improve large files renaming performance
+* optional saves the symbolic link target in object user metadata
+* optional improve readdir perfermence by ignoring metadata-atime/ctime, uid/gid, and permissions
+
 ### Precompiled installer
 
 We have prepared an installer package for common Linux releases: 
