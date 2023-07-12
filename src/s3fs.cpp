@@ -95,6 +95,7 @@ static int max_keys_list_object   = 1000;// default is 1000
 static off_t max_dirty_data       = 5LL * 1024LL * 1024LL * 1024LL;
 static bool use_wtf8              = false;
 static off_t fake_diskfree_size   = -1; // default is not set(-1)
+static bool shallowcopyapi        = true;//
 //-------------------------------------------------------------------
 // Global functions : prototype
 //-------------------------------------------------------------------
@@ -743,7 +744,18 @@ int put_headers(const char* path, headers_t& meta, bool is_copy, bool use_st_siz
         size = get_size(meta);
     }
 
-    if(!nocopyapi && !nomultipart && size >= multipart_threshold){
+    if (shallowcopyapi) {
+        //oss support shallow copy.try using copy api.
+        //if fails for the large file, use multi copy again.
+        if(0 != (result = s3fscurl.PutHeadRequest(path, meta, is_copy))){
+            if (size < singlepart_copy_limit) {
+                return result;
+            }  
+            if(0 != (result = s3fscurl.MultipartHeadRequest(path, size, meta, is_copy))){
+                return result;
+            }
+        }
+    }else if(!nocopyapi && !nomultipart && size >= multipart_threshold){
         if(0 != (result = s3fscurl.MultipartHeadRequest(path, size, meta, is_copy))){
             return result;
         }
@@ -1541,7 +1553,7 @@ static int s3fs_rename(const char* _from, const char* _to)
     // files larger than 5GB must be modified via the multipart interface
     if(S_ISDIR(buf.st_mode)){
         result = rename_directory(from, to);
-    }else if(!nomultipart && buf.st_size >= singlepart_copy_limit){
+    }else if(!nomultipart && buf.st_size >= singlepart_copy_limit && !shallowcopyapi){
         result = rename_large_object(from, to);
     }else{
         if(!nocopyapi && !norenameapi){
@@ -4302,6 +4314,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         if(is_prefix(arg, "download_traffic_limit=")){
             long traffic_limit = static_cast<long>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
             S3fsCurl::SetDownloadTrafficLimit(traffic_limit);
+            return 0;
+        }
+        if(0 == strcmp(arg, "noshallowcopyapi")){
+            shallowcopyapi = false;
             return 0;
         }
         //
