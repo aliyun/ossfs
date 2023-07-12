@@ -324,6 +324,11 @@ The minimum value is 819200 bit/s and the maximum value is 838860800 bit/s. 0 va
 The single-connection bandwidth throttling, in bit/s, for each download request.
 The minimum value is 819200 bit/s and the maximum value is 838860800 bit/s. 0 value means disable.
 .TP
+\fB\-o\fR noshallowcopyapi - disable using shallow copy feature.
+OSS supports shallow copy feature, so try using the single-part copy api for a large file renaming or a large file's meta updating. 
+If that fails, use the multipart copy api again. It can speed up the process of renaming a large file or updating a file's meta.
+If this option is specified, renames a large file or update a large file's meta by multipart upload.
+.TP
 \fB\-o\fR logfile - specify the log output file.
 ossfs outputs the log file to syslog. Alternatively, if ossfs is started with the "-f" option specified, the log will be output to the stdout/stderr.
 You can use this option to specify the log file that ossfs outputs.
