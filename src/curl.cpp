@@ -1847,7 +1847,7 @@ bool S3fsCurl::CreateCurlHandle(bool only_pool, bool remake)
     AutoLock lock(&S3fsCurl::curl_handles_lock);
 
     if(hCurl && remake){
-        if(!DestroyCurlHandle(false)){
+        if(!DestroyCurlHandle(false, true, /*lock_already_held=*/ true)){
             S3FS_PRN_ERR("could not destroy handle.");
             return false;
         }
@@ -1872,7 +1872,7 @@ bool S3fsCurl::CreateCurlHandle(bool only_pool, bool remake)
     return true;
 }
 
-bool S3fsCurl::DestroyCurlHandle(bool restore_pool, bool clear_internal_data)
+bool S3fsCurl::DestroyCurlHandle(bool restore_pool, bool clear_internal_data, bool lock_already_held)
 {
     // [NOTE]
     // If type is REQTYPE_IAMCRED or REQTYPE_IAMROLE, do not clear type.
@@ -1888,7 +1888,7 @@ bool S3fsCurl::DestroyCurlHandle(bool restore_pool, bool clear_internal_data)
     }
 
     if(hCurl){
-        AutoLock lock(&S3fsCurl::curl_handles_lock);
+        AutoLock lock(&S3fsCurl::curl_handles_lock, lock_already_held ? AutoLock::ALREADY_LOCKED : AutoLock::NONE);
   
         S3fsCurl::curl_times.erase(hCurl);
         S3fsCurl::curl_progress.erase(hCurl);
