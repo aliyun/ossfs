@@ -1,7 +1,7 @@
 /*
- * s3fs - FUSE-based file system backed by Aliyun OSS
+ * ossfs -  FUSE-based file system backed by Alibaba Cloud OSS
  *
- * Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
+ * Copyright(C) 2007 Randy Rizun <rrizun@gmail.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -18,280 +18,66 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <unistd.h>
-#include <stdint.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <errno.h>
-#include <syslog.h>
-#include <pthread.h>
-#include <assert.h>
-#include <curl/curl.h>
-#include <libxml/xpath.h>
-#include <libxml/xpathInternals.h>
-#include <libxml/tree.h>
-#include <iostream>
 #include <fstream>
-#include <string>
-#include <map>
+#include <sstream>
 #include <algorithm>
-#include <list>
-#include <vector>
 
 #include "common.h"
-#include "curl.h"
-#include "string_util.h"
 #include "s3fs.h"
-#include "s3fs_util.h"
+#include "curl.h"
+#include "curl_multi.h"
+#include "curl_util.h"
 #include "s3fs_auth.h"
-
-using namespace std;
-
-static const std::string empty_payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-//-------------------------------------------------------------------
-// Utilities
-//-------------------------------------------------------------------
-// [TODO]
-// This function uses tempolary file, but should not use it.
-// For not using it, we implement function in each auth file(openssl, nss. gnutls).
-//
-static bool make_md5_from_string(const char* pstr, string& md5)
-{
-  if(!pstr || '\0' == pstr[0]){
-    S3FS_PRN_ERR("Parameter is wrong.");
-    return false;
-  }
-  FILE* fp;
-  if(NULL == (fp = tmpfile())){
-    S3FS_PRN_ERR("Could not make tmpfile.");
-    return false;
-  }
-  size_t length = strlen(pstr);
-  if(length != fwrite(pstr, sizeof(char), length, fp)){
-    S3FS_PRN_ERR("Failed to write tmpfile.");
-    fclose(fp);
-    return false;
-  }
-  int fd;
-  if(0 != fflush(fp) || 0 != fseek(fp, 0L, SEEK_SET) || -1 == (fd = fileno(fp))){
-    S3FS_PRN_ERR("Failed to make MD5.");
-    fclose(fp);
-    return false;
-  }
-  // base64 md5
-  md5 = s3fs_get_content_md5(fd);
-  if(0 == md5.length()){
-    S3FS_PRN_ERR("Failed to make MD5.");
-    fclose(fp);
-    return false;
-  }
-  fclose(fp);
-  return true;
-}
-
-#if 0 // noused
-static string tolower_header_name(const char* head)
-{
-  string::size_type pos;
-  string            name = head;
-  string            value("");
-  if(string::npos != (pos = name.find(':'))){
-    value= name.substr(pos);
-    name = name.substr(0, pos);
-  }
-  name = lower(name);
-  name += value;
-  return name;
-}
-#endif
+#include "autolock.h"
+#include "s3fs_util.h"
+#include "string_util.h"
+#include "addhead.h"
 
 //-------------------------------------------------------------------
-// Class BodyData
+// Symbols
 //-------------------------------------------------------------------
-#define BODYDATA_RESIZE_APPEND_MIN  (1 * 1024)         // 1KB
-#define BODYDATA_RESIZE_APPEND_MID  (1 * 1024 * 1024)  // 1MB
-#define BODYDATA_RESIZE_APPEND_MAX  (10 * 1024 * 1024) // 10MB
-#define	AJUST_BLOCK(bytes, block)   (((bytes / block) + ((bytes % block) ? 1 : 0)) * block)
-
-bool BodyData::Resize(size_t addbytes)
-{
-  if(IsSafeSize(addbytes)){
-    return true;
-  }
-
-  // New size
-  size_t need_size = AJUST_BLOCK((lastpos + addbytes + 1) - bufsize, sizeof(off_t));
-
-  if(BODYDATA_RESIZE_APPEND_MAX < bufsize){
-    need_size = (BODYDATA_RESIZE_APPEND_MAX < need_size ? need_size : BODYDATA_RESIZE_APPEND_MAX);
-  }else if(BODYDATA_RESIZE_APPEND_MID < bufsize){
-    need_size = (BODYDATA_RESIZE_APPEND_MID < need_size ? need_size : BODYDATA_RESIZE_APPEND_MID);
-  }else if(BODYDATA_RESIZE_APPEND_MIN < bufsize){
-    need_size = ((bufsize * 2) < need_size ? need_size : (bufsize * 2));
-  }else{
-    need_size = (BODYDATA_RESIZE_APPEND_MIN < need_size ? need_size : BODYDATA_RESIZE_APPEND_MIN);
-  }
-  // realloc
-  char* newtext;
-  if(NULL == (newtext = (char*)realloc(text, (bufsize + need_size)))){
-    S3FS_PRN_CRIT("not enough memory (realloc returned NULL)");
-    free(text);
-    text = NULL;
-    return false;
-  }
-  text     = newtext;
-  bufsize += need_size;
-
-  return true;
-}
-
-void BodyData::Clear(void)
-{
-  if(text){
-    free(text);
-    text = NULL;
-  }
-  lastpos = 0;
-  bufsize = 0;
-}
-
-bool BodyData::Append(void* ptr, size_t bytes)
-{
-  if(!ptr){
-    return false;
-  }
-  if(0 == bytes){
-    return true;
-  }
-  if(!Resize(bytes)){
-    return false;
-  }
-  memcpy(&text[lastpos], ptr, bytes);
-  lastpos += bytes;
-  text[lastpos] = '\0';
-
-  return true;
-}
-
-const char* BodyData::str(void) const
-{
-  static const char* strnull = "";
-  if(!text){
-    return strnull;
-  }
-  return text;
-}
-
-//-------------------------------------------------------------------
-// Class CurlHandlerPool
-//-------------------------------------------------------------------
-
-bool CurlHandlerPool::Init()
-{
-  if (0 != pthread_mutex_init(&mLock, NULL)) {
-    S3FS_PRN_ERR("Init curl handlers lock failed");
-    return false;
-  }
-
-  mHandlers = new CURL*[mMaxHandlers](); // this will init the array to 0
-  for (int i = 0; i < mMaxHandlers; ++i, ++mIndex) {
-    mHandlers[i] = curl_easy_init();
-    if (!mHandlers[i]) {
-      S3FS_PRN_ERR("Init curl handlers pool failed");
-      Destroy();
-      return false;
-    }
-  }
-
-  return true;
-}
-
-bool CurlHandlerPool::Destroy()
-{
-  assert(mIndex >= -1 && mIndex < mMaxHandlers);
-
-  for (int i = 0; i <= mIndex; ++i) {
-    curl_easy_cleanup(mHandlers[i]);
-  }
-  delete[] mHandlers;
-
-  if (0 != pthread_mutex_destroy(&mLock)) {
-    S3FS_PRN_ERR("Destroy curl handlers lock failed");
-    return false;
-  }
-
-  return true;
-}
-
-CURL* CurlHandlerPool::GetHandler()
-{
-  CURL* h = NULL;
-
-  assert(mIndex >= -1 && mIndex < mMaxHandlers);
-
-  pthread_mutex_lock(&mLock);
-  if (mIndex >= 0) {
-    S3FS_PRN_DBG("Get handler from pool: %d", mIndex);
-    h = mHandlers[mIndex--];
-  }
-  pthread_mutex_unlock(&mLock);
-
-  if (!h) {
-    S3FS_PRN_INFO("Pool empty: create new handler");
-    h = curl_easy_init();
-  }
-
-  return h;
-}
-
-void CurlHandlerPool::ReturnHandler(CURL* h)
-{
-  bool needCleanup = true;
-
-  assert(mIndex >= -1 && mIndex < mMaxHandlers);
-
-  pthread_mutex_lock(&mLock);
-  if (mIndex < mMaxHandlers - 1) {
-    mHandlers[++mIndex] = h;
-    needCleanup = false;
-    S3FS_PRN_DBG("Return handler to pool: %d", mIndex);
-  }
-  pthread_mutex_unlock(&mLock);
-
-  if (needCleanup) {
-    S3FS_PRN_INFO("Pool full: destroy the handler");
-    curl_easy_cleanup(h);
-  }
-}
+static const char EMPTY_PAYLOAD_HASH[]              = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+static const char EMPTY_MD5_BASE64_HASH[]           = "1B2M2Y8AsgTpgAmY7PhCfg==";
 
 //-------------------------------------------------------------------
 // Class S3fsCurl
 //-------------------------------------------------------------------
-#define MULTIPART_SIZE              10485760          // 10MB
-#define MAX_MULTI_COPY_SOURCE_SIZE  524288000         // 500MB
+static const int MULTIPART_SIZE                     = 10 * 1024 * 1024;
+static const int GET_OBJECT_RESPONSE_LIMIT          = 1024;
 
-#define	RAM_EXPIRE_MERGIN           (20 * 60)         // update timming
-#define	RAM_CRED_URL                ""
-#define RAMCRED_ACCESSKEYID         "AccessKeyId"
-#define RAMCRED_SECRETACCESSKEY     "SecretAccessKey"
-#define RAMCRED_ACCESSKEYSECRET     "AccessKeySecret"
-#define RAMCRED_ACCESSTOKEN         "Token"
-#define RAMCRED_EXPIRATION          "Expiration"
-#define RAMCRED_KEYCOUNT            4
+// [NOTE] about default mime.types file
+// If no mime.types file is specified in the mime option, ossfs
+// will look for /etc/mime.types on all operating systems and
+// load mime information.
+// However, in the case of macOS, when this file does not exist,
+// it tries to detect the /etc/apache2/mime.types file.
+// The reason for this is that apache2 is preinstalled on macOS,
+// and the mime.types file is expected to exist in this path.
+// If the mime.types file is not found, ossfs will exit with an
+// error.
+//
+static const char DEFAULT_MIME_FILE[]               = "/etc/mime.types";
+static const char SPECIAL_DARWIN_MIME_FILE[]        = "/etc/apache2/mime.types";
 
 // [NOTICE]
 // This symbol is for libcurl under 7.23.0
 #ifndef CURLSHE_NOT_BUILT_IN
-#define CURLSHE_NOT_BUILT_IN        5
+#define CURLSHE_NOT_BUILT_IN                        5
 #endif
 
+//-------------------------------------------------------------------
+// Class S3fsCurl
+//-------------------------------------------------------------------
+const long       S3fsCurl::S3FSCURL_RESPONSECODE_NOTSET;
+const long       S3fsCurl::S3FSCURL_RESPONSECODE_FATAL_ERROR;
+const int        S3fsCurl::S3FSCURL_PERFORM_RESULT_NOTSET;
+pthread_mutex_t  S3fsCurl::curl_warnings_lock;
 pthread_mutex_t  S3fsCurl::curl_handles_lock;
-pthread_mutex_t  S3fsCurl::curl_share_lock[SHARE_MUTEX_MAX];
+S3fsCurl::callback_locks_t S3fsCurl::callback_locks;
 bool             S3fsCurl::is_initglobal_done  = false;
 CurlHandlerPool* S3fsCurl::sCurlPool           = NULL;
 int              S3fsCurl::sCurlPoolSize       = 32;
@@ -300,1875 +86,2968 @@ bool             S3fsCurl::is_cert_check       = true; // default
 bool             S3fsCurl::is_dns_cache        = true; // default
 bool             S3fsCurl::is_ssl_session_cache= true; // default
 long             S3fsCurl::connect_timeout     = 300;  // default
-time_t           S3fsCurl::readwrite_timeout   = 60;   // default
-int              S3fsCurl::retries             = 3;    // default
+time_t           S3fsCurl::readwrite_timeout   = 120;  // default
+int              S3fsCurl::retries             = 5;    // default
 bool             S3fsCurl::is_public_bucket    = false;
-string           S3fsCurl::default_acl         = "private";
-storage_class_t  S3fsCurl::storage_class       = STANDARD;
+acl_t            S3fsCurl::default_acl         = acl_t::PRIVATE;
+std::string      S3fsCurl::storage_class       = "STANDARD";
 sseckeylist_t    S3fsCurl::sseckeys;
-std::string      S3fsCurl::ssekmsid            = "";
-sse_type_t       S3fsCurl::ssetype             = SSE_DISABLE;
+std::string      S3fsCurl::ssekmsid;
+sse_type_t       S3fsCurl::ssetype             = sse_type_t::SSE_DISABLE;
 bool             S3fsCurl::is_content_md5      = false;
 bool             S3fsCurl::is_verbose          = false;
-string           S3fsCurl::OSSAccessKeyId;
-string           S3fsCurl::OSSSecretAccessKey;
-string           S3fsCurl::OSSAccessToken;
-time_t           S3fsCurl::OSSAccessTokenExpire= 0;
-string           S3fsCurl::RAM_role;
+bool             S3fsCurl::is_dump_body        = false;
+S3fsCred*        S3fsCurl::ps3fscred           = NULL;
 long             S3fsCurl::ssl_verify_hostname = 1;    // default(original code...)
+
+// protected by curl_warnings_lock
+bool             S3fsCurl::curl_warnings_once = false;
+
+// protected by curl_handles_lock
 curltime_t       S3fsCurl::curl_times;
 curlprogress_t   S3fsCurl::curl_progress;
-string           S3fsCurl::curl_ca_bundle;
+
+std::string      S3fsCurl::curl_ca_bundle;
 mimes_t          S3fsCurl::mimeTypes;
+std::string      S3fsCurl::userAgent;
 int              S3fsCurl::max_parallel_cnt    = 5;              // default
+int              S3fsCurl::max_multireq        = 20;             // default
 off_t            S3fsCurl::multipart_size      = MULTIPART_SIZE; // default
-bool             S3fsCurl::is_sigv4            = true;           // default
-const string     S3fsCurl::skUserAgent = "aliyun-sdk-http/1.0()/ossfs" + string(VERSION);
+off_t            S3fsCurl::multipart_copy_size = 512 * 1024 * 1024;  // default
+signature_type_t S3fsCurl::signature_type      = V1_ONLY;       // default
+bool             S3fsCurl::is_unsigned_payload = false;          // default
+bool             S3fsCurl::is_ua               = true;           // default
 bool             S3fsCurl::listobjectsv2       = false;          // default
 bool             S3fsCurl::requester_pays      = false;          // default
 
 //-------------------------------------------------------------------
 // Class methods for S3fsCurl
 //-------------------------------------------------------------------
-bool S3fsCurl::InitS3fsCurl(const char* MimeFile)
+bool S3fsCurl::InitS3fsCurl()
 {
-  if(0 != pthread_mutex_init(&S3fsCurl::curl_handles_lock, NULL)){
-    return false;
-  }
-  if(0 != pthread_mutex_init(&S3fsCurl::curl_share_lock[SHARE_MUTEX_DNS], NULL)){
-    return false;
-  }
-  if(0 != pthread_mutex_init(&S3fsCurl::curl_share_lock[SHARE_MUTEX_SSL_SESSION], NULL)){
-    return false;
-  }
-  if(!S3fsCurl::InitMimeType(MimeFile)){
-    return false;
-  }
-  if(!S3fsCurl::InitGlobalCurl()){
-    return false;
-  }
-  sCurlPool = new CurlHandlerPool(sCurlPoolSize);
-  if (!sCurlPool->Init()) {
-    return false;
-  }
-  if(!S3fsCurl::InitShareCurl()){
-    return false;
-  }
-  if(!S3fsCurl::InitCryptMutex()){
-    return false;
-  }
-  return true;
-}
-
-bool S3fsCurl::DestroyS3fsCurl(void)
-{
-  int result = true;
-
-  if(!S3fsCurl::DestroyCryptMutex()){
-    result = false;
-  }
-  if(!S3fsCurl::DestroyShareCurl()){
-    result = false;
-  }
-  if (!sCurlPool->Destroy()) {
-    result = false;
-  }
-  if(!S3fsCurl::DestroyGlobalCurl()){
-    result = false;
-  }
-  if(0 != pthread_mutex_destroy(&S3fsCurl::curl_share_lock[SHARE_MUTEX_DNS])){
-    result = false;
-  }
-  if(0 != pthread_mutex_destroy(&S3fsCurl::curl_share_lock[SHARE_MUTEX_SSL_SESSION])){
-    result = false;
-  }
-  if(0 != pthread_mutex_destroy(&S3fsCurl::curl_handles_lock)){
-    result = false;
-  }
-  return result;
-}
-
-bool S3fsCurl::InitGlobalCurl(void)
-{
-  if(S3fsCurl::is_initglobal_done){
-    return false;
-  }
-  if(CURLE_OK != curl_global_init(CURL_GLOBAL_ALL)){
-    S3FS_PRN_ERR("init_curl_global_all returns error.");
-    return false;
-  }
-  S3fsCurl::is_initglobal_done = true;
-  return true;
-}
-
-bool S3fsCurl::DestroyGlobalCurl(void)
-{
-  if(!S3fsCurl::is_initglobal_done){
-    return false;
-  }
-  curl_global_cleanup();
-  S3fsCurl::is_initglobal_done = false;
-  return true;
-}
-
-bool S3fsCurl::InitShareCurl(void)
-{
-  CURLSHcode nSHCode;
-
-  if(!S3fsCurl::is_dns_cache && !S3fsCurl::is_ssl_session_cache){
-    S3FS_PRN_INFO("Curl does not share DNS data.");
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+#if S3FS_PTHREAD_ERRORCHECK
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+#endif
+    if(0 != pthread_mutex_init(&S3fsCurl::curl_warnings_lock, &attr)){
+        return false;
+    }
+    if(0 != pthread_mutex_init(&S3fsCurl::curl_handles_lock, &attr)){
+        return false;
+    }
+    if(0 != pthread_mutex_init(&S3fsCurl::callback_locks.dns, &attr)){
+        return false;
+    }
+    if(0 != pthread_mutex_init(&S3fsCurl::callback_locks.ssl_session, &attr)){
+        return false;
+    }
+    if(!S3fsCurl::InitGlobalCurl()){
+        return false;
+    }
+    if(!S3fsCurl::InitShareCurl()){
+        return false;
+    }
+    if(!S3fsCurl::InitCryptMutex()){
+        return false;
+    }
+    // [NOTE]
+    // sCurlPoolSize must be over parallel(or multireq) count.
+    //
+    if(sCurlPoolSize < std::max(GetMaxParallelCount(), GetMaxMultiRequest())){
+        sCurlPoolSize = std::max(GetMaxParallelCount(), GetMaxMultiRequest());
+    }
+    sCurlPool = new CurlHandlerPool(sCurlPoolSize);
+    if (!sCurlPool->Init()) {
+        return false;
+    }
     return true;
-  }
-  if(S3fsCurl::hCurlShare){
-    S3FS_PRN_WARN("already initiated.");
-    return false;
-  }
-  if(NULL == (S3fsCurl::hCurlShare = curl_share_init())){
-    S3FS_PRN_ERR("curl_share_init failed");
-    return false;
-  }
-  if(CURLSHE_OK != (nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_LOCKFUNC, S3fsCurl::LockCurlShare))){
-    S3FS_PRN_ERR("curl_share_setopt(LOCKFUNC) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
-    return false;
-  }
-  if(CURLSHE_OK != (nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_UNLOCKFUNC, S3fsCurl::UnlockCurlShare))){
-    S3FS_PRN_ERR("curl_share_setopt(UNLOCKFUNC) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
-    return false;
-  }
-  if(S3fsCurl::is_dns_cache){
-    nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-    if(CURLSHE_OK != nSHCode && CURLSHE_BAD_OPTION != nSHCode && CURLSHE_NOT_BUILT_IN != nSHCode){
-      S3FS_PRN_ERR("curl_share_setopt(DNS) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
-      return false;
-    }else if(CURLSHE_BAD_OPTION == nSHCode || CURLSHE_NOT_BUILT_IN == nSHCode){
-      S3FS_PRN_WARN("curl_share_setopt(DNS) returns %d(%s), but continue without shared dns data.", nSHCode, curl_share_strerror(nSHCode));
-    }
-  }
-  if(S3fsCurl::is_ssl_session_cache){
-    nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-    if(CURLSHE_OK != nSHCode && CURLSHE_BAD_OPTION != nSHCode && CURLSHE_NOT_BUILT_IN != nSHCode){
-      S3FS_PRN_ERR("curl_share_setopt(SSL SESSION) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
-      return false;
-    }else if(CURLSHE_BAD_OPTION == nSHCode || CURLSHE_NOT_BUILT_IN == nSHCode){
-      S3FS_PRN_WARN("curl_share_setopt(SSL SESSION) returns %d(%s), but continue without shared ssl session data.", nSHCode, curl_share_strerror(nSHCode));
-    }
-  }
-  if(CURLSHE_OK != (nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_USERDATA, (void*)&S3fsCurl::curl_share_lock[0]))){
-    S3FS_PRN_ERR("curl_share_setopt(USERDATA) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
-    return false;
-  }
-  return true;
 }
 
-bool S3fsCurl::DestroyShareCurl(void)
+bool S3fsCurl::DestroyS3fsCurl()
 {
-  if(!S3fsCurl::hCurlShare){
-    if(!S3fsCurl::is_dns_cache && !S3fsCurl::is_ssl_session_cache){
-      return true;
+    bool result = true;
+
+    if(!S3fsCurl::DestroyCryptMutex()){
+        result = false;
     }
-    S3FS_PRN_WARN("already destroy share curl.");
-    return false;
-  }
-  if(CURLSHE_OK != curl_share_cleanup(S3fsCurl::hCurlShare)){
-    return false;
-  }
-  S3fsCurl::hCurlShare = NULL;
-  return true;
+    if(!sCurlPool->Destroy()){
+        result = false;
+    }
+    delete sCurlPool;
+    sCurlPool = NULL;
+    if(!S3fsCurl::DestroyShareCurl()){
+        result = false;
+    }
+    if(!S3fsCurl::DestroyGlobalCurl()){
+        result = false;
+    }
+    if(0 != pthread_mutex_destroy(&S3fsCurl::callback_locks.dns)){
+        result = false;
+    }
+    if(0 != pthread_mutex_destroy(&S3fsCurl::callback_locks.ssl_session)){
+        result = false;
+    }
+    if(0 != pthread_mutex_destroy(&S3fsCurl::curl_handles_lock)){
+        result = false;
+    }
+    if(0 != pthread_mutex_destroy(&S3fsCurl::curl_warnings_lock)){
+        result = false;
+    }
+    return result;
+}
+
+bool S3fsCurl::InitGlobalCurl()
+{
+    if(S3fsCurl::is_initglobal_done){
+        return false;
+    }
+    if(CURLE_OK != curl_global_init(CURL_GLOBAL_ALL)){
+        S3FS_PRN_ERR("init_curl_global_all returns error.");
+        return false;
+    }
+    S3fsCurl::is_initglobal_done = true;
+    return true;
+}
+
+bool S3fsCurl::DestroyGlobalCurl()
+{
+    if(!S3fsCurl::is_initglobal_done){
+        return false;
+    }
+    curl_global_cleanup();
+    S3fsCurl::is_initglobal_done = false;
+    return true;
+}
+
+bool S3fsCurl::InitShareCurl()
+{
+    CURLSHcode nSHCode;
+
+    if(!S3fsCurl::is_dns_cache && !S3fsCurl::is_ssl_session_cache){
+        S3FS_PRN_INFO("Curl does not share DNS data.");
+        return true;
+    }
+    if(S3fsCurl::hCurlShare){
+        S3FS_PRN_WARN("already initiated.");
+        return false;
+    }
+    if(NULL == (S3fsCurl::hCurlShare = curl_share_init())){
+        S3FS_PRN_ERR("curl_share_init failed");
+        return false;
+    }
+    if(CURLSHE_OK != (nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_LOCKFUNC, S3fsCurl::LockCurlShare))){
+        S3FS_PRN_ERR("curl_share_setopt(LOCKFUNC) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
+        return false;
+    }
+    if(CURLSHE_OK != (nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_UNLOCKFUNC, S3fsCurl::UnlockCurlShare))){
+        S3FS_PRN_ERR("curl_share_setopt(UNLOCKFUNC) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
+        return false;
+    }
+    if(S3fsCurl::is_dns_cache){
+        nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        if(CURLSHE_OK != nSHCode && CURLSHE_BAD_OPTION != nSHCode && CURLSHE_NOT_BUILT_IN != nSHCode){
+            S3FS_PRN_ERR("curl_share_setopt(DNS) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
+            return false;
+        }else if(CURLSHE_BAD_OPTION == nSHCode || CURLSHE_NOT_BUILT_IN == nSHCode){
+            S3FS_PRN_WARN("curl_share_setopt(DNS) returns %d(%s), but continue without shared dns data.", nSHCode, curl_share_strerror(nSHCode));
+        }
+    }
+    if(S3fsCurl::is_ssl_session_cache){
+        nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        if(CURLSHE_OK != nSHCode && CURLSHE_BAD_OPTION != nSHCode && CURLSHE_NOT_BUILT_IN != nSHCode){
+            S3FS_PRN_ERR("curl_share_setopt(SSL SESSION) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
+            return false;
+        }else if(CURLSHE_BAD_OPTION == nSHCode || CURLSHE_NOT_BUILT_IN == nSHCode){
+            S3FS_PRN_WARN("curl_share_setopt(SSL SESSION) returns %d(%s), but continue without shared ssl session data.", nSHCode, curl_share_strerror(nSHCode));
+        }
+    }
+    if(CURLSHE_OK != (nSHCode = curl_share_setopt(S3fsCurl::hCurlShare, CURLSHOPT_USERDATA, &S3fsCurl::callback_locks))){
+        S3FS_PRN_ERR("curl_share_setopt(USERDATA) returns %d(%s)", nSHCode, curl_share_strerror(nSHCode));
+        return false;
+    }
+    return true;
+}
+
+bool S3fsCurl::DestroyShareCurl()
+{
+    if(!S3fsCurl::hCurlShare){
+        if(!S3fsCurl::is_dns_cache && !S3fsCurl::is_ssl_session_cache){
+            return true;
+        }
+        S3FS_PRN_WARN("already destroy share curl.");
+        return false;
+    }
+    if(CURLSHE_OK != curl_share_cleanup(S3fsCurl::hCurlShare)){
+        return false;
+    }
+    S3fsCurl::hCurlShare = NULL;
+    return true;
 }
 
 void S3fsCurl::LockCurlShare(CURL* handle, curl_lock_data nLockData, curl_lock_access laccess, void* useptr)
 {
-  if(!hCurlShare){
-    return;
-  }
-  pthread_mutex_t* lockmutex = static_cast<pthread_mutex_t*>(useptr);
-  if(CURL_LOCK_DATA_DNS == nLockData){
-    pthread_mutex_lock(&lockmutex[SHARE_MUTEX_DNS]);
-  }else if(CURL_LOCK_DATA_SSL_SESSION == nLockData){
-    pthread_mutex_lock(&lockmutex[SHARE_MUTEX_SSL_SESSION]);
-  }
+    if(!hCurlShare){
+        return;
+    }
+    S3fsCurl::callback_locks_t* locks = static_cast<S3fsCurl::callback_locks_t*>(useptr);
+    int result;
+    if(CURL_LOCK_DATA_DNS == nLockData){
+        if(0 != (result = pthread_mutex_lock(&locks->dns))){
+            S3FS_PRN_CRIT("pthread_mutex_lock returned: %d", result);
+            abort();
+        }
+    }else if(CURL_LOCK_DATA_SSL_SESSION == nLockData){
+        if(0 != (result = pthread_mutex_lock(&locks->ssl_session))){
+            S3FS_PRN_CRIT("pthread_mutex_lock returned: %d", result);
+            abort();
+        }
+    }
 }
 
 void S3fsCurl::UnlockCurlShare(CURL* handle, curl_lock_data nLockData, void* useptr)
 {
-  if(!hCurlShare){
-    return;
-  }
-  pthread_mutex_t* lockmutex = static_cast<pthread_mutex_t*>(useptr);
-  if(CURL_LOCK_DATA_DNS == nLockData){
-    pthread_mutex_unlock(&lockmutex[SHARE_MUTEX_DNS]);
-  }else if(CURL_LOCK_DATA_SSL_SESSION == nLockData){
-    pthread_mutex_unlock(&lockmutex[SHARE_MUTEX_SSL_SESSION]);
-  }
+    if(!hCurlShare){
+        return;
+    }
+    S3fsCurl::callback_locks_t* locks = static_cast<S3fsCurl::callback_locks_t*>(useptr);
+    int result;
+    if(CURL_LOCK_DATA_DNS == nLockData){
+        if(0 != (result = pthread_mutex_unlock(&locks->dns))){
+            S3FS_PRN_CRIT("pthread_mutex_unlock returned: %d", result);
+            abort();
+        }
+    }else if(CURL_LOCK_DATA_SSL_SESSION == nLockData){
+        if(0 != (result = pthread_mutex_unlock(&locks->ssl_session))){
+            S3FS_PRN_CRIT("pthread_mutex_unlock returned: %d", result);
+            abort();
+        }
+    }
 }
 
-bool S3fsCurl::InitCryptMutex(void)
+bool S3fsCurl::InitCryptMutex()
 {
-  return s3fs_init_crypt_mutex();
+    return s3fs_init_crypt_mutex();
 }
 
-bool S3fsCurl::DestroyCryptMutex(void)
+bool S3fsCurl::DestroyCryptMutex()
 {
-  return s3fs_destroy_crypt_mutex();
+    return s3fs_destroy_crypt_mutex();
 }
 
 // homegrown timeout mechanism
 int S3fsCurl::CurlProgress(void *clientp, double dltotal, double dlnow, double ultotal, double ulnow)
 {
-  CURL* curl = static_cast<CURL*>(clientp);
-  time_t now = time(0);
-  progress_t p(dlnow, ulnow);
+    CURL*      curl = static_cast<CURL*>(clientp);
+    time_t     now = time(0);
+    progress_t p(dlnow, ulnow);
 
-  pthread_mutex_lock(&S3fsCurl::curl_handles_lock);
+    AutoLock   lock(&S3fsCurl::curl_handles_lock);
 
-  // any progress?
-  if(p != S3fsCurl::curl_progress[curl]){
-    // yes!
-    S3fsCurl::curl_times[curl]    = now;
-    S3fsCurl::curl_progress[curl] = p;
-  }else{
-    // timeout?
-    if(now - S3fsCurl::curl_times[curl] > readwrite_timeout){
-      pthread_mutex_unlock(&S3fsCurl::curl_handles_lock);
-      S3FS_PRN_ERR("timeout now: %jd, curl_times[curl]: %jd, readwrite_timeout: %jd",
-                      (intmax_t)now, (intmax_t)(S3fsCurl::curl_times[curl]), (intmax_t)readwrite_timeout);
-      return CURLE_ABORTED_BY_CALLBACK;
+    // any progress?
+    if(p != S3fsCurl::curl_progress[curl]){
+        // yes!
+        S3fsCurl::curl_times[curl]    = now;
+        S3fsCurl::curl_progress[curl] = p;
+    }else{
+        // timeout?
+        if(now - S3fsCurl::curl_times[curl] > readwrite_timeout){
+            S3FS_PRN_ERR("timeout now: %lld, curl_times[curl]: %lld, readwrite_timeout: %lld",
+                          static_cast<long long>(now), static_cast<long long>((S3fsCurl::curl_times[curl])), static_cast<long long>(readwrite_timeout));
+            return CURLE_ABORTED_BY_CALLBACK;
+        }
     }
-  }
-
-  pthread_mutex_unlock(&S3fsCurl::curl_handles_lock);
-  return 0;
+    return 0;
 }
 
-bool S3fsCurl::InitMimeType(const char* MimeFile)
+bool S3fsCurl::InitCredentialObject(S3fsCred* pcredobj)
 {
-  if(!MimeFile){
-    MimeFile = "/etc/mime.types";  // default
-  }
-
-  string line;
-  ifstream MT(MimeFile);
-  if(MT.good()){
-    while(getline(MT, line)){
-      if(line[0]=='#'){
-        continue;
-      }
-      if(line.size() == 0){
-        continue;
-      }
-
-      stringstream tmp(line);
-      string mimeType;
-      tmp >> mimeType;
-      while(tmp){
-        string ext;
-        tmp >> ext;
-        if(ext.size() == 0){
-          continue;
-        }
-        S3fsCurl::mimeTypes[ext] = mimeType;
-      }
+    // Set the only Credential object
+    if(!pcredobj || S3fsCurl::ps3fscred){
+        S3FS_PRN_ERR("Unable to set the only Credential object.");
+        return false;
     }
-  }
-  return true;
+    S3fsCurl::ps3fscred = pcredobj;
+
+    return true;
+}
+
+bool S3fsCurl::InitMimeType(const std::string& strFile)
+{
+    std::string MimeFile;
+    if(!strFile.empty()){
+        MimeFile = strFile;
+    }else{
+        // search default mime.types
+        std::string errPaths = DEFAULT_MIME_FILE;
+        struct stat st;
+        if(0 == stat(DEFAULT_MIME_FILE, &st)){
+            MimeFile = DEFAULT_MIME_FILE;
+        }else if(compare_sysname("Darwin")){
+            // for macOS, search another default file.
+            if(0 == stat(SPECIAL_DARWIN_MIME_FILE, &st)){
+                MimeFile = SPECIAL_DARWIN_MIME_FILE;
+            }else{
+                errPaths += " and ";
+                errPaths += SPECIAL_DARWIN_MIME_FILE;
+            }
+        }
+        if(MimeFile.empty()){
+            S3FS_PRN_WARN("Could not find mime.types files, you have to create file(%s) or specify mime option for existing mime.types file.", errPaths.c_str());
+            return false;
+        }
+    }
+    S3FS_PRN_DBG("Try to load mime types from %s file.", MimeFile.c_str());
+
+    std::string line;
+    std::ifstream MT(MimeFile.c_str());
+    if(MT.good()){
+        S3FS_PRN_DBG("The old mime types are cleared to load new mime types.");
+        S3fsCurl::mimeTypes.clear();
+
+        while(getline(MT, line)){
+            if(line.empty()){
+                continue;
+            }
+            if(line[0]=='#'){
+                continue;
+            }
+
+            std::istringstream tmp(line);
+            std::string mimeType;
+            tmp >> mimeType;
+            std::string ext;
+            while(tmp >> ext){
+                S3fsCurl::mimeTypes[ext] = mimeType;
+            }
+        }
+        S3FS_PRN_INIT_INFO("Loaded mime information from %s", MimeFile.c_str());
+    }else{
+        S3FS_PRN_WARN("Could not load mime types from %s, please check the existence and permissions of this file.", MimeFile.c_str());
+        return false;
+    }
+    return true;
+}
+
+void S3fsCurl::InitUserAgent()
+{
+    if(S3fsCurl::userAgent.empty()){
+        S3fsCurl::userAgent =  "aliyun-sdk-http/1.0()/ossfs/";
+        S3fsCurl::userAgent += VERSION;
+        S3fsCurl::userAgent += " (commit hash ";
+        S3fsCurl::userAgent += COMMIT_HASH_VAL;
+        S3fsCurl::userAgent += "; ";
+        S3fsCurl::userAgent += s3fs_crypt_lib_name();
+        S3fsCurl::userAgent += ")";
+        S3fsCurl::userAgent += instance_name;
+    }
 }
 
 //
 // @param s e.g., "index.html"
 // @return e.g., "text/html"
 //
-string S3fsCurl::LookupMimeType(string name)
+std::string S3fsCurl::LookupMimeType(const std::string& name)
 {
-  string result("application/octet-stream");
-  string::size_type last_pos = name.find_last_of('.');
-  string::size_type first_pos = name.find_first_of('.');
-  string prefix, ext, ext2;
+    if(!name.empty() && name[name.size() - 1] == '/'){
+        return "application/x-directory";
+    }
 
-  // No dots in name, just return
-  if(last_pos == string::npos){
-    return result;
-  }
-  // extract the last extension
-  if(last_pos != string::npos){
-    ext = name.substr(1+last_pos, string::npos);
-  }
-  if (last_pos != string::npos) {
-     // one dot was found, now look for another
-     if (first_pos != string::npos && first_pos < last_pos) {
-        prefix = name.substr(0, last_pos);
-        // Now get the second to last file extension
-        string::size_type next_pos = prefix.find_last_of('.');
-        if (next_pos != string::npos) {
-           ext2 = prefix.substr(1+next_pos, string::npos);
+    std::string            result("application/octet-stream");
+    std::string::size_type last_pos  = name.find_last_of('.');
+    std::string::size_type first_pos = name.find_first_of('.');
+    std::string            prefix, ext, ext2;
+
+    // No dots in name, just return
+    if(last_pos == std::string::npos){
+        return result;
+    }
+    // extract the last extension
+    ext = name.substr(1+last_pos, std::string::npos);
+
+    if (last_pos != std::string::npos) {
+        // one dot was found, now look for another
+        if (first_pos != std::string::npos && first_pos < last_pos) {
+            prefix = name.substr(0, last_pos);
+            // Now get the second to last file extension
+            std::string::size_type next_pos = prefix.find_last_of('.');
+            if (next_pos != std::string::npos) {
+                ext2 = prefix.substr(1+next_pos, std::string::npos);
+            }
         }
-     }
-  }
+    }
 
-  // if we get here, then we have an extension (ext)
-  mimes_t::const_iterator iter = S3fsCurl::mimeTypes.find(ext);
-  // if the last extension matches a mimeType, then return
-  // that mime type
-  if (iter != S3fsCurl::mimeTypes.end()) {
-    result = (*iter).second;
+    // if we get here, then we have an extension (ext)
+    mimes_t::const_iterator iter = S3fsCurl::mimeTypes.find(ext);
+    // if the last extension matches a mimeType, then return
+    // that mime type
+    if (iter != S3fsCurl::mimeTypes.end()) {
+        result = (*iter).second;
+        return result;
+    }
+
+    // return with the default result if there isn't a second extension
+    if(first_pos == last_pos){
+        return result;
+    }
+
+    // Didn't find a mime-type for the first extension
+    // Look for second extension in mimeTypes, return if found
+    iter = S3fsCurl::mimeTypes.find(ext2);
+    if (iter != S3fsCurl::mimeTypes.end()) {
+        result = (*iter).second;
+        return result;
+    }
+
+    // neither the last extension nor the second-to-last extension
+    // matched a mimeType, return the default mime type 
     return result;
-  }
-
-  // return with the default result if there isn't a second extension
-  if(first_pos == last_pos){
-     return result;
-  }
-
-  // Didn't find a mime-type for the first extension
-  // Look for second extension in mimeTypes, return if found
-  iter = S3fsCurl::mimeTypes.find(ext2);
-  if (iter != S3fsCurl::mimeTypes.end()) {
-     result = (*iter).second;
-     return result;
-  }
-
-  // neither the last extension nor the second-to-last extension
-  // matched a mimeType, return the default mime type 
-  return result;
 }
 
-bool S3fsCurl::LocateBundle(void)
+bool S3fsCurl::LocateBundle()
 {
-  // See if environment variable CURL_CA_BUNDLE is set
-  // if so, check it, if it is a good path, then set the
-  // curl_ca_bundle variable to it
-  char *CURL_CA_BUNDLE; 
-
-  if(0 == S3fsCurl::curl_ca_bundle.size()){
-    CURL_CA_BUNDLE = getenv("CURL_CA_BUNDLE");
-    if(CURL_CA_BUNDLE != NULL)  {
-      // check for existence and readability of the file
-      ifstream BF(CURL_CA_BUNDLE);
-      if(!BF.good()){
-        S3FS_PRN_ERR("%s: file specified by CURL_CA_BUNDLE environment variable is not readable", program_name.c_str());
-        return false;
-      }
-      BF.close();
-      S3fsCurl::curl_ca_bundle.assign(CURL_CA_BUNDLE); 
-      return true;
+    // See if environment variable CURL_CA_BUNDLE is set
+    // if so, check it, if it is a good path, then set the
+    // curl_ca_bundle variable to it
+    if(S3fsCurl::curl_ca_bundle.empty()){
+        char* CURL_CA_BUNDLE = getenv("CURL_CA_BUNDLE");
+        if(CURL_CA_BUNDLE != NULL)  {
+            // check for existence and readability of the file
+            std::ifstream BF(CURL_CA_BUNDLE);
+            if(!BF.good()){
+                S3FS_PRN_ERR("%s: file specified by CURL_CA_BUNDLE environment variable is not readable", program_name.c_str());
+                return false;
+            }
+            BF.close();
+            S3fsCurl::curl_ca_bundle = CURL_CA_BUNDLE;
+            return true;
+        }
+    }else{
+        // Already set ca bundle variable
+        return true;
     }
-  }
 
-  // not set via environment variable, look in likely locations
+    // not set via environment variable, look in likely locations
 
-  ///////////////////////////////////////////
-  // from curl's (7.21.2) acinclude.m4 file
-  ///////////////////////////////////////////
-  // dnl CURL_CHECK_CA_BUNDLE
-  // dnl -------------------------------------------------
-  // dnl Check if a default ca-bundle should be used
-  // dnl
-  // dnl regarding the paths this will scan:
-  // dnl /etc/ssl/certs/ca-certificates.crt Debian systems
-  // dnl /etc/pki/tls/certs/ca-bundle.crt Redhat and Mandriva
-  // dnl /usr/share/ssl/certs/ca-bundle.crt old(er) Redhat
-  // dnl /usr/local/share/certs/ca-root.crt FreeBSD
-  // dnl /etc/ssl/cert.pem OpenBSD
-  // dnl /etc/ssl/certs/ (ca path) SUSE
-  ifstream BF("/etc/pki/tls/certs/ca-bundle.crt"); 
-  if(BF.good()){
-     BF.close();
-     S3fsCurl::curl_ca_bundle.assign("/etc/pki/tls/certs/ca-bundle.crt"); 
-  }else{
-    S3FS_PRN_ERR("%s: /etc/pki/tls/certs/ca-bundle.crt is not readable", program_name.c_str());
-    return false;
-  }
-  return true;
+    ///////////////////////////////////////////
+    // following comment from curl's (7.21.2) acinclude.m4 file
+    ///////////////////////////////////////////
+    // dnl CURL_CHECK_CA_BUNDLE
+    // dnl -------------------------------------------------
+    // dnl Check if a default ca-bundle should be used
+    // dnl
+    // dnl regarding the paths this will scan:
+    // dnl /etc/ssl/certs/ca-certificates.crt Debian systems
+    // dnl /etc/pki/tls/certs/ca-bundle.crt Redhat and Mandriva
+    // dnl /usr/share/ssl/certs/ca-bundle.crt old(er) Redhat
+    // dnl /usr/local/share/certs/ca-root.crt FreeBSD
+    // dnl /etc/ssl/cert.pem OpenBSD
+    // dnl /etc/ssl/certs/ (ca path) SUSE
+    ///////////////////////////////////////////
+    // Within CURL the above path should have been checked
+    // according to the OS. Thus, although we do not need
+    // to check files here, we will only examine some files.
+    //
+    std::ifstream BF("/etc/pki/tls/certs/ca-bundle.crt");
+    if(BF.good()){
+        BF.close();
+        S3fsCurl::curl_ca_bundle = "/etc/pki/tls/certs/ca-bundle.crt";
+    }else{
+        BF.open("/etc/ssl/certs/ca-certificates.crt");
+        if(BF.good()){
+            BF.close();
+            S3fsCurl::curl_ca_bundle = "/etc/ssl/certs/ca-certificates.crt";
+        }else{
+            BF.open("/usr/share/ssl/certs/ca-bundle.crt");
+            if(BF.good()){
+                BF.close();
+                S3fsCurl::curl_ca_bundle = "/usr/share/ssl/certs/ca-bundle.crt";
+            }else{
+                BF.open("/usr/local/share/certs/ca-root.crt");
+                if(BF.good()){
+                    BF.close();
+                    S3fsCurl::curl_ca_bundle = "/usr/share/ssl/certs/ca-bundle.crt";
+                }else{
+                    S3FS_PRN_ERR("%s: /.../ca-bundle.crt is not readable", program_name.c_str());
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 size_t S3fsCurl::WriteMemoryCallback(void* ptr, size_t blockSize, size_t numBlocks, void* data)
 {
-  BodyData* body  = static_cast<BodyData*>(data);
+    BodyData* body  = static_cast<BodyData*>(data);
 
-  if(!body->Append(ptr, blockSize, numBlocks)){
-    S3FS_PRN_CRIT("BodyData.Append() returned false.");
-    S3FS_FUSE_EXIT();
-    return -1;
-  }
-  return (blockSize * numBlocks);
+    if(!body->Append(ptr, blockSize, numBlocks)){
+        S3FS_PRN_CRIT("BodyData.Append() returned false.");
+        S3FS_FUSE_EXIT();
+        return -1;
+    }
+    return (blockSize * numBlocks);
 }
 
 size_t S3fsCurl::ReadCallback(void* ptr, size_t size, size_t nmemb, void* userp)
 {
-  S3fsCurl* pCurl = reinterpret_cast<S3fsCurl*>(userp);
+    S3fsCurl* pCurl = static_cast<S3fsCurl*>(userp);
 
-  if(1 > (size * nmemb)){
-    return 0;
-  }
-  if(0 >= pCurl->postdata_remaining){
-    return 0;
-  }
-  int copysize = std::min((int)(size * nmemb), pCurl->postdata_remaining);
-  memcpy(ptr, pCurl->postdata, copysize);
+    if(1 > (size * nmemb)){
+        return 0;
+    }
+    if(0 >= pCurl->postdata_remaining){
+        return 0;
+    }
+    size_t copysize = std::min(static_cast<off_t>(size * nmemb), pCurl->postdata_remaining);
+    memcpy(ptr, pCurl->postdata, copysize);
 
-  pCurl->postdata_remaining = (pCurl->postdata_remaining > copysize ? (pCurl->postdata_remaining - copysize) : 0);
-  pCurl->postdata          += static_cast<size_t>(copysize);
+    pCurl->postdata_remaining = (pCurl->postdata_remaining > static_cast<off_t>(copysize) ? (pCurl->postdata_remaining - copysize) : 0);
+    pCurl->postdata          += static_cast<size_t>(copysize);
 
-  return copysize;
+    return copysize;
 }
 
 size_t S3fsCurl::HeaderCallback(void* data, size_t blockSize, size_t numBlocks, void* userPtr)
 {
-  headers_t* headers = reinterpret_cast<headers_t*>(userPtr);
-  string header(reinterpret_cast<char*>(data), blockSize * numBlocks);
-  string key;
-  stringstream ss(header);
+    headers_t* headers = static_cast<headers_t*>(userPtr);
+    std::string header(static_cast<char*>(data), blockSize * numBlocks);
+    std::string key;
+    std::istringstream ss(header);
 
-  if(getline(ss, key, ':')){
-    // Force to lower, only "x-oss"
-    string lkey = key;
-    transform(lkey.begin(), lkey.end(), lkey.begin(), static_cast<int (*)(int)>(std::tolower));
-    if(lkey.compare(0, 5, "x-oss") == 0){
-      key = lkey;
+    if(getline(ss, key, ':')){
+        // Force to lower, only "x-oss"
+        std::string lkey = key;
+        transform(lkey.begin(), lkey.end(), lkey.begin(), static_cast<int (*)(int)>(std::tolower));
+        if(is_prefix(lkey.c_str(), "x-oss")){
+            key = lkey;
+        }
+        std::string value;
+        getline(ss, value);
+        (*headers)[key] = trim(value);
     }
-    string value;
-    getline(ss, value);
-    (*headers)[key] = trim(value);
-  }
-  return blockSize * numBlocks;
+    return blockSize * numBlocks;
 }
 
 size_t S3fsCurl::UploadReadCallback(void* ptr, size_t size, size_t nmemb, void* userp)
 {
-  S3fsCurl* pCurl = reinterpret_cast<S3fsCurl*>(userp);
+    S3fsCurl* pCurl = static_cast<S3fsCurl*>(userp);
 
-  if(1 > (size * nmemb)){
-    return 0;
-  }
-  if(-1 == pCurl->partdata.fd || 0 >= pCurl->partdata.size){
-    return 0;
-  }
-  // read size
-  ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
-  ssize_t readbytes;
-  ssize_t totalread;
-  // read and set
-  for(totalread = 0, readbytes = 0; totalread < copysize; totalread += readbytes){
-    readbytes = pread(pCurl->partdata.fd, &((char*)ptr)[totalread], (copysize - totalread), pCurl->partdata.startpos + totalread);
-    if(0 == readbytes){
-      // eof
-      break;
-    }else if(-1 == readbytes){
-      // error
-      S3FS_PRN_ERR("read file error(%d).", errno);
-      return 0;
+    if(1 > (size * nmemb)){
+        return 0;
     }
-  }
-  pCurl->partdata.startpos += totalread;
-  pCurl->partdata.size     -= totalread;
+    if(-1 == pCurl->partdata.fd || 0 >= pCurl->partdata.size){
+        return 0;
+    }
+    // read size
+    ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
+    ssize_t readbytes;
+    ssize_t totalread;
+    // read and set
+    for(totalread = 0, readbytes = 0; totalread < copysize; totalread += readbytes){
+        readbytes = pread(pCurl->partdata.fd, &((char*)ptr)[totalread], (copysize - totalread), pCurl->partdata.startpos + totalread);
+        if(0 == readbytes){
+            // eof
+            break;
+        }else if(-1 == readbytes){
+            // error
+            S3FS_PRN_ERR("read file error(%d).", errno);
+            return 0;
+        }
+    }
+    pCurl->partdata.startpos += totalread;
+    pCurl->partdata.size     -= totalread;
 
-  return totalread;
+    return totalread;
 }
 
 size_t S3fsCurl::DownloadWriteCallback(void* ptr, size_t size, size_t nmemb, void* userp)
 {
-  S3fsCurl* pCurl = reinterpret_cast<S3fsCurl*>(userp);
+    S3fsCurl* pCurl = static_cast<S3fsCurl*>(userp);
 
-  if(1 > (size * nmemb)){
-    return 0;
-  }
-  if(-1 == pCurl->partdata.fd || 0 >= pCurl->partdata.size){
-    return 0;
-  }
-
-  // write size
-  ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
-  ssize_t writebytes;
-  ssize_t totalwrite;
-
-  // write
-  for(totalwrite = 0, writebytes = 0; totalwrite < copysize; totalwrite += writebytes){
-    writebytes = pwrite(pCurl->partdata.fd, &((char*)ptr)[totalwrite], (copysize - totalwrite), pCurl->partdata.startpos + totalwrite);
-    if(0 == writebytes){
-      // eof?
-      break;
-    }else if(-1 == writebytes){
-      // error
-      S3FS_PRN_ERR("write file error(%d).", errno);
-      return 0;
+    if(1 > (size * nmemb)){
+        return 0;
     }
-  }
-  pCurl->partdata.startpos += totalwrite;
-  pCurl->partdata.size     -= totalwrite;
+    if(-1 == pCurl->partdata.fd || 0 >= pCurl->partdata.size){
+        return 0;
+    }
 
-  return totalwrite;
+    // Buffer initial bytes in case it is an XML error response.
+    if(pCurl->bodydata.size() < GET_OBJECT_RESPONSE_LIMIT){
+        pCurl->bodydata.Append(ptr, std::min(size * nmemb, GET_OBJECT_RESPONSE_LIMIT - pCurl->bodydata.size()));
+    }
+
+    // write size
+    ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
+    ssize_t writebytes;
+    ssize_t totalwrite;
+
+    // write
+    for(totalwrite = 0, writebytes = 0; totalwrite < copysize; totalwrite += writebytes){
+        writebytes = pwrite(pCurl->partdata.fd, &((char*)ptr)[totalwrite], (copysize - totalwrite), pCurl->partdata.startpos + totalwrite);
+        if(0 == writebytes){
+            // eof?
+            break;
+        }else if(-1 == writebytes){
+            // error
+            S3FS_PRN_ERR("write file error(%d).", errno);
+            return 0;
+        }
+    }
+    pCurl->partdata.startpos += totalwrite;
+    pCurl->partdata.size     -= totalwrite;
+
+    return totalwrite;
 }
 
-bool S3fsCurl::SetCheckCertificate(bool isCertCheck) {
-    bool old = S3fsCurl::is_cert_check;
-    S3fsCurl::is_cert_check = isCertCheck;
-    return old;
+bool S3fsCurl::SetCheckCertificate(bool isCertCheck)
+{
+      bool old = S3fsCurl::is_cert_check;
+      S3fsCurl::is_cert_check = isCertCheck;
+      return old;
 }
 
 bool S3fsCurl::SetDnsCache(bool isCache)
 {
-  bool old = S3fsCurl::is_dns_cache;
-  S3fsCurl::is_dns_cache = isCache;
-  return old;
+    bool old = S3fsCurl::is_dns_cache;
+    S3fsCurl::is_dns_cache = isCache;
+    return old;
+}
+
+void S3fsCurl::ResetOffset(S3fsCurl* pCurl)
+{
+    pCurl->partdata.startpos = pCurl->b_partdata_startpos;
+    pCurl->partdata.size     = pCurl->b_partdata_size;
 }
 
 bool S3fsCurl::SetSslSessionCache(bool isCache)
 {
-  bool old = S3fsCurl::is_ssl_session_cache;
-  S3fsCurl::is_ssl_session_cache = isCache;
-  return old;
+    bool old = S3fsCurl::is_ssl_session_cache;
+    S3fsCurl::is_ssl_session_cache = isCache;
+    return old;
 }
 
 long S3fsCurl::SetConnectTimeout(long timeout)
 {
-  long old = S3fsCurl::connect_timeout;
-  S3fsCurl::connect_timeout = timeout;
-  return old;
+    long old = S3fsCurl::connect_timeout;
+    S3fsCurl::connect_timeout = timeout;
+    return old;
 }
 
 time_t S3fsCurl::SetReadwriteTimeout(time_t timeout)
 {
-  time_t old = S3fsCurl::readwrite_timeout;
-  S3fsCurl::readwrite_timeout = timeout;
-  return old;
+    time_t old = S3fsCurl::readwrite_timeout;
+    S3fsCurl::readwrite_timeout = timeout;
+    return old;
 }
 
 int S3fsCurl::SetRetries(int count)
 {
-  int old = S3fsCurl::retries;
-  S3fsCurl::retries = count;
-  return old;
+    int old = S3fsCurl::retries;
+    S3fsCurl::retries = count;
+    return old;
 }
 
 bool S3fsCurl::SetPublicBucket(bool flag)
 {
-  bool old = S3fsCurl::is_public_bucket;
-  S3fsCurl::is_public_bucket = flag;
-  return old;
+    bool old = S3fsCurl::is_public_bucket;
+    S3fsCurl::is_public_bucket = flag;
+    return old;
 }
 
-string S3fsCurl::SetDefaultAcl(const char* acl)
+acl_t S3fsCurl::SetDefaultAcl(acl_t acl)
 {
-  string old = S3fsCurl::default_acl;
-  S3fsCurl::default_acl = acl ? acl : "";
-  return old;
+    acl_t old = S3fsCurl::default_acl;
+    S3fsCurl::default_acl = acl;
+    return old;
 }
 
-storage_class_t S3fsCurl::SetStorageClass(storage_class_t storage_class)
+acl_t S3fsCurl::GetDefaultAcl()
 {
-  storage_class_t old = S3fsCurl::storage_class;
-  S3fsCurl::storage_class = storage_class;
-  return old;
+    return S3fsCurl::default_acl;
 }
 
-bool S3fsCurl::PushbackSseKeys(string& onekey)
+std::string S3fsCurl::SetStorageClass(const std::string& storage_class)
 {
-  onekey = trim(onekey);
-  if(0 == onekey.size()){
-    return false;
-  }
-  if('#' == onekey[0]){
-    return false;
-  }
-  // make base64
-  char* pbase64_key;
-  if(NULL == (pbase64_key = s3fs_base64((unsigned char*)onekey.c_str(), onekey.length()))){
-    S3FS_PRN_ERR("Failed to convert base64 from SSE-C key %s", onekey.c_str());
-    return false;
-  }
-  string base64_key = pbase64_key;
-  free(pbase64_key);
+    std::string old = S3fsCurl::storage_class;
+    S3fsCurl::storage_class = storage_class;
+    // AWS requires uppercase storage class values
+    transform(S3fsCurl::storage_class.begin(), S3fsCurl::storage_class.end(), S3fsCurl::storage_class.begin(), ::toupper);
+    return old;
+}
 
-  // make MD5
-  string strMd5;
-  if(!make_md5_from_string(onekey.c_str(), strMd5)){
-    S3FS_PRN_ERR("Could not make MD5 from SSE-C keys(%s).", onekey.c_str());
-    return false;
-  }
-  // mapped MD5 = SSE Key
-  sseckeymap_t md5map;
-  md5map.clear();
-  md5map[strMd5] = base64_key;
-  S3fsCurl::sseckeys.push_back(md5map);
-  return true;
+bool S3fsCurl::PushbackSseKeys(const std::string& input)
+{
+    std::string onekey = trim(input);
+    if(onekey.empty()){
+        return false;
+    }
+    if('#' == onekey[0]){
+        return false;
+    }
+    // make base64 if the key is short enough, otherwise assume it is already so
+    std::string base64_key;
+    std::string raw_key;
+    if(onekey.length() > 256 / 8){
+        char* p_key;
+        size_t keylength;
+
+        if(NULL != (p_key = (char *)s3fs_decode64(onekey.c_str(), onekey.size(), &keylength))) {
+            raw_key = std::string(p_key, keylength);
+            base64_key = onekey;
+            delete[] p_key;
+        } else {
+            S3FS_PRN_ERR("Failed to convert base64 to SSE-C key %s", onekey.c_str());
+            return false;
+        }
+    } else {
+        char* pbase64_key;
+
+        if(NULL != (pbase64_key = s3fs_base64((unsigned char*)onekey.c_str(), onekey.length()))) {
+            raw_key = onekey;
+            base64_key = pbase64_key;
+            delete[] pbase64_key;
+        } else {
+            S3FS_PRN_ERR("Failed to convert base64 from SSE-C key %s", onekey.c_str());
+            return false;
+        }
+    }
+
+    // make MD5
+    std::string strMd5;
+    if(!make_md5_from_binary(raw_key.c_str(), raw_key.length(), strMd5)){
+        S3FS_PRN_ERR("Could not make MD5 from SSE-C keys(%s).", raw_key.c_str());
+        return false;
+    }
+    // mapped MD5 = SSE Key
+    sseckeymap_t md5map;
+    md5map.clear();
+    md5map[strMd5] = base64_key;
+    S3fsCurl::sseckeys.push_back(md5map);
+
+    return true;
 }
 
 sse_type_t S3fsCurl::SetSseType(sse_type_t type)
 {
-  sse_type_t    old = S3fsCurl::ssetype;
-  S3fsCurl::ssetype = type;
-  return old;
+    sse_type_t    old = S3fsCurl::ssetype;
+    S3fsCurl::ssetype = type;
+    return old;
 }
 
 bool S3fsCurl::SetSseCKeys(const char* filepath)
 {
-  if(!filepath){
-    S3FS_PRN_ERR("SSE-C keys filepath is empty.");
-    return false;
-  }
-  struct stat st;
-  if(0 != stat(filepath, &st)){
-    S3FS_PRN_ERR("could not open use_sse keys file(%s).", filepath);
-    return false;
-  }
-  if(st.st_mode & (S_IXUSR | S_IRWXG | S_IRWXO)){
-    S3FS_PRN_ERR("use_sse keys file %s should be 0600 permissions.", filepath);
-    return false;
-  }
+    if(!filepath){
+        S3FS_PRN_ERR("SSE-C keys filepath is empty.");
+        return false;
+    }
+    struct stat st;
+    if(0 != stat(filepath, &st)){
+        S3FS_PRN_ERR("could not open use_sse keys file(%s).", filepath);
+        return false;
+    }
+    if(st.st_mode & (S_IXUSR | S_IRWXG | S_IRWXO)){
+        S3FS_PRN_ERR("use_sse keys file %s should be 0600 permissions.", filepath);
+        return false;
+    }
 
-  S3fsCurl::sseckeys.clear();
+    S3fsCurl::sseckeys.clear();
 
-  ifstream ssefs(filepath);
-  if(!ssefs.good()){
-    S3FS_PRN_ERR("Could not open SSE-C keys file(%s).", filepath);
-    return false;
-  }
+    std::ifstream ssefs(filepath);
+    if(!ssefs.good()){
+        S3FS_PRN_ERR("Could not open SSE-C keys file(%s).", filepath);
+        return false;
+    }
 
-  string   line;
-  while(getline(ssefs, line)){
-    S3fsCurl::PushbackSseKeys(line);
-  }
-  if(0 == S3fsCurl::sseckeys.size()){
-    S3FS_PRN_ERR("There is no SSE Key in file(%s).", filepath);
-    return false;
-  }
-  return true;
+    std::string line;
+    while(getline(ssefs, line)){
+        S3fsCurl::PushbackSseKeys(line);
+    }
+    if(S3fsCurl::sseckeys.empty()){
+        S3FS_PRN_ERR("There is no SSE Key in file(%s).", filepath);
+        return false;
+    }
+    return true;
 }
 
 bool S3fsCurl::SetSseKmsid(const char* kmsid)
 {
-  if(!kmsid || '\0' == kmsid[0]){
-    S3FS_PRN_ERR("SSE-KMS kms id is empty.");
-    return false;
-  }
-  S3fsCurl::ssekmsid = kmsid;
-  return true;
+    if(!kmsid || '\0' == kmsid[0]){
+        S3FS_PRN_ERR("SSE-KMS kms id is empty.");
+        return false;
+    }
+    S3fsCurl::ssekmsid = kmsid;
+    return true;
 }
 
 // [NOTE]
 // Because SSE is set by some options and environment, 
 // this function check the integrity of the SSE data finally.
-bool S3fsCurl::FinalCheckSse(void)
+bool S3fsCurl::FinalCheckSse()
 {
-  if(SSE_DISABLE == S3fsCurl::ssetype){
-    S3fsCurl::ssekmsid.erase();
-  }else if(SSE_OSS == S3fsCurl::ssetype){
-    S3fsCurl::ssekmsid.erase();
-  }else if(SSE_C == S3fsCurl::ssetype){
-    if(0 == S3fsCurl::sseckeys.size()){
-      S3FS_PRN_ERR("sse type is SSE-C, but there is no custom key.");
-      return false;
+    switch(S3fsCurl::ssetype){
+        case sse_type_t::SSE_DISABLE:
+            S3fsCurl::ssekmsid.erase();
+            return true;
+        case sse_type_t::SSE_OSS:
+            S3fsCurl::ssekmsid.erase();
+            return true;
+        case sse_type_t::SSE_C:
+            if(S3fsCurl::sseckeys.empty()){
+                S3FS_PRN_ERR("sse type is SSE-C, but there is no custom key.");
+                return false;
+            }
+            S3fsCurl::ssekmsid.erase();
+            return true;
+        case sse_type_t::SSE_KMS:
+            if(S3fsCurl::ssekmsid.empty()){
+                S3FS_PRN_ERR("sse type is SSE-KMS, but there is no specified kms id.");
+                return false;
+            }
+            // if(S3fsCurl::GetSignatureType() == V2_ONLY){
+            //     S3FS_PRN_ERR("sse type is SSE-KMS, but signature type is not v4. SSE-KMS require signature v4.");
+            //     return false;
+            // }
+            return true;
     }
-    S3fsCurl::ssekmsid.erase();
-  }else if(SSE_KMS == S3fsCurl::ssetype){
-    if(S3fsCurl::ssekmsid.empty()){
-      S3FS_PRN_ERR("sse type is SSE-KMS, but there is no specified kms id.");
-      return false;
-    }
-    if(!S3fsCurl::IsSignatureV4()){
-      S3FS_PRN_ERR("sse type is SSE-KMS, but signature type is not v4. SSE-KMS require signature v4.");
-      return false;
-    }
-  }else{
-    S3FS_PRN_ERR("sse type is unknown(%d).", S3fsCurl::ssetype);
+    S3FS_PRN_ERR("sse type is unknown(%d).", static_cast<int>(S3fsCurl::ssetype));
+
     return false;
-  }
-  return true;
 }
                                                                                                                                                    
-bool S3fsCurl::LoadEnvSseCKeys(void)
+bool S3fsCurl::LoadEnvSseCKeys()
 {
-  char* envkeys = getenv("OSSSSECKEYS");
-  if(NULL == envkeys){
-    // nothing to do
-    return true;
-  }
-  S3fsCurl::sseckeys.clear();
+    char* envkeys = getenv("OSSSSECKEYS");
+    if(NULL == envkeys){
+        // nothing to do
+        return true;
+    }
+    S3fsCurl::sseckeys.clear();
 
-  istringstream fullkeys(envkeys);
-  string        onekey;
-  while(getline(fullkeys, onekey, ':')){
-    S3fsCurl::PushbackSseKeys(onekey);
-  }
-  if(0 == S3fsCurl::sseckeys.size()){
-    S3FS_PRN_ERR("There is no SSE Key in environment(OSSSSECKEYS=%s).", envkeys);
-    return false;
-  }
-  return true;
+    std::istringstream fullkeys(envkeys);
+    std::string        onekey;
+    while(getline(fullkeys, onekey, ':')){
+        S3fsCurl::PushbackSseKeys(onekey);
+    }
+    if(S3fsCurl::sseckeys.empty()){
+        S3FS_PRN_ERR("There is no SSE Key in environment(OSSSSECKEYS=%s).", envkeys);
+        return false;
+    }
+    return true;
 }
 
-bool S3fsCurl::LoadEnvSseKmsid(void)
+bool S3fsCurl::LoadEnvSseKmsid()
 {
-  char* envkmsid = getenv("OSSSSEKMSID");
-  if(NULL == envkmsid){
-    // nothing to do
-    return true;
-  }
-  return S3fsCurl::SetSseKmsid(envkmsid);
+    char* envkmsid = getenv("OSSSSEKMSID");
+    if(NULL == envkmsid){
+        // nothing to do
+        return true;
+    }
+    return S3fsCurl::SetSseKmsid(envkmsid);
 }
 
 //
 // If md5 is empty, returns first(current) sse key.
 //
-bool S3fsCurl::GetSseKey(string& md5, string& ssekey)
+bool S3fsCurl::GetSseKey(std::string& md5, std::string& ssekey)
 {
-  for(sseckeylist_t::const_iterator iter = S3fsCurl::sseckeys.begin(); iter != S3fsCurl::sseckeys.end(); ++iter){
-    if(0 == md5.length() || md5 == (*iter).begin()->first){
-      md5    = iter->begin()->first;
-      ssekey = iter->begin()->second;
-      return true;
+    for(sseckeylist_t::const_iterator iter = S3fsCurl::sseckeys.begin(); iter != S3fsCurl::sseckeys.end(); ++iter){
+        if(md5.empty() || md5 == (*iter).begin()->first){
+            md5    = iter->begin()->first;
+            ssekey = iter->begin()->second;
+            return true;
+        }
     }
-  }
-  return false;
+    return false;
 }
 
-bool S3fsCurl::GetSseKeyMd5(int pos, string& md5)
+bool S3fsCurl::GetSseKeyMd5(size_t pos, std::string& md5)
 {
-  if(pos < 0){
-    return false;
-  }
-  if(S3fsCurl::sseckeys.size() <= static_cast<size_t>(pos)){
-    return false;
-  }
-  int cnt = 0;
-  for(sseckeylist_t::const_iterator iter = S3fsCurl::sseckeys.begin(); iter != S3fsCurl::sseckeys.end(); ++iter, ++cnt){
-    if(pos == cnt){
-      md5 = iter->begin()->first;
-      return true;
+    if(S3fsCurl::sseckeys.size() <= static_cast<size_t>(pos)){
+        return false;
     }
-  }
-  return false;
+    size_t cnt = 0;
+    for(sseckeylist_t::const_iterator iter = S3fsCurl::sseckeys.begin(); iter != S3fsCurl::sseckeys.end(); ++iter, ++cnt){
+        if(pos == cnt){
+            md5 = iter->begin()->first;
+            return true;
+        }
+    }
+    return false;
 }
 
-int S3fsCurl::GetSseKeyCount(void)
+size_t S3fsCurl::GetSseKeyCount()
 {
-  return S3fsCurl::sseckeys.size();
+    return S3fsCurl::sseckeys.size();
 }
 
 bool S3fsCurl::SetContentMd5(bool flag)
 {
-  bool old = S3fsCurl::is_content_md5;
-  S3fsCurl::is_content_md5 = flag;
-  return old;
+    bool old = S3fsCurl::is_content_md5;
+    S3fsCurl::is_content_md5 = flag;
+    return old;
 }
 
 bool S3fsCurl::SetVerbose(bool flag)
 {
-  bool old = S3fsCurl::is_verbose;
-  S3fsCurl::is_verbose = flag;
-  return old;
+    bool old = S3fsCurl::is_verbose;
+    S3fsCurl::is_verbose = flag;
+    return old;
 }
 
-bool S3fsCurl::SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey)
+bool S3fsCurl::SetDumpBody(bool flag)
 {
-  if(!AccessKeyId || '\0' == AccessKeyId[0] || !SecretAccessKey || '\0' == SecretAccessKey[0]){
-    return false;
-  }
-  OSSAccessKeyId     = AccessKeyId;
-  OSSSecretAccessKey = SecretAccessKey;
-  return true;
+    bool old = S3fsCurl::is_dump_body;
+    S3fsCurl::is_dump_body = flag;
+    return old;
 }
 
 long S3fsCurl::SetSslVerifyHostname(long value)
 {
-  if(0 != value && 1 != value){
-    return -1;
-  }
-  long old = S3fsCurl::ssl_verify_hostname;
-  S3fsCurl::ssl_verify_hostname = value;
-  return old;
-}
-
-string S3fsCurl::SetRAMRole(const char* role)
-{
-  string old = S3fsCurl::RAM_role;
-  S3fsCurl::RAM_role = role ? role : "";
-  return old;
+    if(0 != value && 1 != value){
+        return -1;
+    }
+    long old = S3fsCurl::ssl_verify_hostname;
+    S3fsCurl::ssl_verify_hostname = value;
+    return old;
 }
 
 bool S3fsCurl::SetMultipartSize(off_t size)
 {
-  size = size * 1024 * 1024;
-  if(size < MIN_MULTIPART_SIZE){
-    return false;
-  }
-  S3fsCurl::multipart_size = size;
-  return true;
+    size = size * 1024 * 1024;
+    if(size < MIN_MULTIPART_SIZE){
+        return false;
+    }
+    S3fsCurl::multipart_size = size;
+    return true;
+}
+
+bool S3fsCurl::SetMultipartCopySize(off_t size)
+{
+    size = size * 1024 * 1024;
+    if(size < MIN_MULTIPART_SIZE){
+        return false;
+    }
+    S3fsCurl::multipart_copy_size = size;
+    return true;
 }
 
 int S3fsCurl::SetMaxParallelCount(int value)
 {
-  int old = S3fsCurl::max_parallel_cnt;
-  S3fsCurl::max_parallel_cnt = value;
-  return old;
+    int old = S3fsCurl::max_parallel_cnt;
+    S3fsCurl::max_parallel_cnt = value;
+    return old;
+}
+
+int S3fsCurl::SetMaxMultiRequest(int max)
+{
+    int old = S3fsCurl::max_multireq;
+    S3fsCurl::max_multireq = max;
+    return old;
 }
 
 bool S3fsCurl::UploadMultipartPostCallback(S3fsCurl* s3fscurl)
 {
-  if(!s3fscurl){
-    return false;
-  }
-  // check etag(md5);
-  // XXX oss etag requires upper case.
-  if(NULL == strstr(s3fscurl->headdata->str(), upper(s3fscurl->partdata.etag).c_str())){
-    return false;
-  }
-  s3fscurl->partdata.etaglist->at(s3fscurl->partdata.etagpos).assign(s3fscurl->partdata.etag);
-  s3fscurl->partdata.uploaded = true;
+    if(!s3fscurl){
+        return false;
+    }
 
-  return true;
+    return s3fscurl->UploadMultipartPostComplete();
+}
+
+bool S3fsCurl::MixMultipartPostCallback(S3fsCurl* s3fscurl)
+{
+    if(!s3fscurl){
+        return false;
+    }
+
+    return s3fscurl->MixMultipartPostComplete();
 }
 
 S3fsCurl* S3fsCurl::UploadMultipartPostRetryCallback(S3fsCurl* s3fscurl)
 {
-  if(!s3fscurl){
-    return NULL;
-  }
-  // parse and get part_num, upload_id.
-  string upload_id;
-  string part_num_str;
-  int    part_num;
-  if(!get_keyword_value(s3fscurl->url, "uploadId", upload_id)){
-    return NULL;
-  }
-  if(!get_keyword_value(s3fscurl->url, "partNumber", part_num_str)){
-    return NULL;
-  }
-  part_num = atoi(part_num_str.c_str());
+    if(!s3fscurl){
+        return NULL;
+    }
+    // parse and get part_num, upload_id.
+    std::string upload_id;
+    std::string part_num_str;
+    int part_num;
+    off_t  tmp_part_num = 0;
+    if(!get_keyword_value(s3fscurl->url, "uploadId", upload_id)){
+        return NULL;
+    }
+    if(!get_keyword_value(s3fscurl->url, "partNumber", part_num_str)){
+        return NULL;
+    }
+    if(!s3fs_strtoofft(&tmp_part_num, part_num_str.c_str(), /*base=*/ 10)){
+        return NULL;
+    }
+    part_num = static_cast<int>(tmp_part_num);
 
-  if(s3fscurl->retry_count >= S3fsCurl::retries){
-    S3FS_PRN_ERR("Over retry count(%d) limit(%s:%d).", s3fscurl->retry_count, s3fscurl->path.c_str(), part_num);
-    return NULL;
-  }
+    if(s3fscurl->retry_count >= S3fsCurl::retries){
+        S3FS_PRN_ERR("Over retry count(%d) limit(%s:%d).", s3fscurl->retry_count, s3fscurl->path.c_str(), part_num);
+        return NULL;
+    }
 
-  // duplicate request
-  S3fsCurl* newcurl            = new S3fsCurl(s3fscurl->IsUseAhbe());
-  newcurl->partdata.etaglist   = s3fscurl->partdata.etaglist;
-  newcurl->partdata.etagpos    = s3fscurl->partdata.etagpos;
-  newcurl->partdata.fd         = s3fscurl->partdata.fd;
-  newcurl->partdata.startpos   = s3fscurl->b_partdata_startpos;
-  newcurl->partdata.size       = s3fscurl->b_partdata_size;
-  newcurl->b_partdata_startpos = s3fscurl->b_partdata_startpos;
-  newcurl->b_partdata_size     = s3fscurl->b_partdata_size;
-  newcurl->retry_count         = s3fscurl->retry_count + 1;
+    // duplicate request
+    S3fsCurl* newcurl            = new S3fsCurl(s3fscurl->IsUseAhbe());
+    newcurl->partdata.petag      = s3fscurl->partdata.petag;
+    newcurl->partdata.fd         = s3fscurl->partdata.fd;
+    newcurl->partdata.startpos   = s3fscurl->b_partdata_startpos;
+    newcurl->partdata.size       = s3fscurl->b_partdata_size;
+    newcurl->b_partdata_startpos = s3fscurl->b_partdata_startpos;
+    newcurl->b_partdata_size     = s3fscurl->b_partdata_size;
+    newcurl->retry_count         = s3fscurl->retry_count + 1;
+    newcurl->op                  = s3fscurl->op;
+    newcurl->type                = s3fscurl->type;
 
-  // setup new curl object
-  if(0 != newcurl->UploadMultipartPostSetup(s3fscurl->path.c_str(), part_num, upload_id)){
-    S3FS_PRN_ERR("Could not duplicate curl object(%s:%d).", s3fscurl->path.c_str(), part_num);
-    delete newcurl;
-    return NULL;
-  }
-  return newcurl;
+    // setup new curl object
+    if(0 != newcurl->UploadMultipartPostSetup(s3fscurl->path.c_str(), part_num, upload_id)){
+        S3FS_PRN_ERR("Could not duplicate curl object(%s:%d).", s3fscurl->path.c_str(), part_num);
+        delete newcurl;
+        return NULL;
+    }
+    return newcurl;
+}
+
+S3fsCurl* S3fsCurl::CopyMultipartPostRetryCallback(S3fsCurl* s3fscurl)
+{
+    if(!s3fscurl){
+        return NULL;
+    }
+    // parse and get part_num, upload_id.
+    std::string upload_id;
+    std::string part_num_str;
+    int part_num;
+    off_t  tmp_part_num = 0;
+    if(!get_keyword_value(s3fscurl->url, "uploadId", upload_id)){
+        return NULL;
+    }
+    if(!get_keyword_value(s3fscurl->url, "partNumber", part_num_str)){
+        return NULL;
+    }
+    if(!s3fs_strtoofft(&tmp_part_num, part_num_str.c_str(), /*base=*/ 10)){
+        return NULL;
+    }
+    part_num = static_cast<int>(tmp_part_num);
+
+    if(s3fscurl->retry_count >= S3fsCurl::retries){
+        S3FS_PRN_ERR("Over retry count(%d) limit(%s:%d).", s3fscurl->retry_count, s3fscurl->path.c_str(), part_num);
+        return NULL;
+    }
+
+    // duplicate request
+    S3fsCurl* newcurl            = new S3fsCurl(s3fscurl->IsUseAhbe());
+    newcurl->partdata.petag      = s3fscurl->partdata.petag;
+    newcurl->b_from              = s3fscurl->b_from;
+    newcurl->b_meta              = s3fscurl->b_meta;
+    newcurl->retry_count         = s3fscurl->retry_count + 1;
+    newcurl->op                  = s3fscurl->op;
+    newcurl->type                = s3fscurl->type;
+
+    // setup new curl object
+    if(0 != newcurl->CopyMultipartPostSetup(s3fscurl->b_from.c_str(), s3fscurl->path.c_str(), part_num, upload_id, s3fscurl->b_meta)){
+        S3FS_PRN_ERR("Could not duplicate curl object(%s:%d).", s3fscurl->path.c_str(), part_num);
+        delete newcurl;
+        return NULL;
+    }
+    return newcurl;
+}
+
+S3fsCurl* S3fsCurl::MixMultipartPostRetryCallback(S3fsCurl* s3fscurl)
+{
+    if(!s3fscurl){
+        return NULL;
+    }
+
+    S3fsCurl* pcurl;
+    if(-1 == s3fscurl->partdata.fd){
+        pcurl = S3fsCurl::CopyMultipartPostRetryCallback(s3fscurl);
+    }else{
+        pcurl = S3fsCurl::UploadMultipartPostRetryCallback(s3fscurl);
+    }
+    return pcurl;
+}
+
+int S3fsCurl::MapPutErrorResponse(int result)
+{
+    if(result != 0){
+        return result;
+    }
+    // PUT returns 200 status code with something error, thus
+    // we need to check body.
+    //
+    // example error body:
+    //     <?xml version="1.0" encoding="UTF-8"?>
+    //     <Error>
+    //       <Code>AccessDenied</Code>
+    //       <Message>Access Denied</Message>
+    //       <RequestId>E4CA6F6767D6685C</RequestId>
+    //       <HostId>BHzLOATeDuvN8Es1wI8IcERq4kl4dc2A9tOB8Yqr39Ys6fl7N4EJ8sjGiVvu6wLP</HostId>
+    //     </Error>
+    //
+    const char* pstrbody = bodydata.str();
+    std::string code;
+    if(!pstrbody || simple_parse_xml(pstrbody, bodydata.size(), "Code", code)){
+        S3FS_PRN_ERR("Put request get 200 status response, but it included error body(or NULL). The request failed during copying the object in OSS.  Code: %s", code.c_str());
+        // TODO: parse more specific error from <Code>
+        result = -EIO;
+    }
+    return result;
 }
 
 int S3fsCurl::ParallelMultipartUploadRequest(const char* tpath, headers_t& meta, int fd)
 {
-  int            result;
-  string         upload_id;
-  struct stat    st;
-  int            fd2;
-  etaglist_t     list;
-  off_t          remaining_bytes;
-  S3fsCurl       s3fscurl(true);
+    int            result;
+    std::string    upload_id;
+    struct stat    st;
+    int            fd2;
+    etaglist_t     list;
+    off_t          remaining_bytes;
+    S3fsCurl       s3fscurl(true);
 
-  S3FS_PRN_INFO3("[tpath=%s][fd=%d]", SAFESTRPTR(tpath), fd);
+    S3FS_PRN_INFO3("[tpath=%s][fd=%d]", SAFESTRPTR(tpath), fd);
 
-  // duplicate fd
-  if(-1 == (fd2 = dup(fd)) || 0 != lseek(fd2, 0, SEEK_SET)){
-    S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
-    if(-1 != fd2){
-      close(fd2);
+    // duplicate fd
+    if(-1 == (fd2 = dup(fd)) || 0 != lseek(fd2, 0, SEEK_SET)){
+        S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
+        if(-1 != fd2){
+            close(fd2);
+        }
+        return -errno;
     }
-    return -errno;
-  }
-  if(-1 == fstat(fd2, &st)){
-    S3FS_PRN_ERR("Invalid file descriptor(errno=%d)", errno);
-    close(fd2);
-    return -errno;
-  }
+    if(-1 == fstat(fd2, &st)){
+        S3FS_PRN_ERR("Invalid file descriptor(errno=%d)", errno);
+        close(fd2);
+        return -errno;
+    }
 
-  if(0 != (result = s3fscurl.PreMultipartPostRequest(tpath, meta, upload_id, false))){
-    close(fd2);
-    return result;
-  }
-  s3fscurl.DestroyCurlHandle();
-
-  // cycle through open fd, pulling off 10MB chunks at a time
-  for(remaining_bytes = st.st_size; 0 < remaining_bytes; ){
-    S3fsMultiCurl curlmulti;
-    int           para_cnt;
-    off_t         chunk;
+    if(0 != (result = s3fscurl.PreMultipartPostRequest(tpath, meta, upload_id, false))){
+        close(fd2);
+        return result;
+    }
+    s3fscurl.DestroyCurlHandle();
 
     // Initialize S3fsMultiCurl
+    S3fsMultiCurl curlmulti(GetMaxParallelCount());
     curlmulti.SetSuccessCallback(S3fsCurl::UploadMultipartPostCallback);
     curlmulti.SetRetryCallback(S3fsCurl::UploadMultipartPostRetryCallback);
 
-    // Loop for setup parallel upload(multipart) request.
-    for(para_cnt = 0; para_cnt < S3fsCurl::max_parallel_cnt && 0 < remaining_bytes; para_cnt++, remaining_bytes -= chunk){
-      // chunk size
-      chunk = remaining_bytes > S3fsCurl::multipart_size ? S3fsCurl::multipart_size : remaining_bytes;
+    // cycle through open fd, pulling off 10MB chunks at a time
+    for(remaining_bytes = st.st_size; 0 < remaining_bytes; ){
+        off_t chunk = remaining_bytes > S3fsCurl::multipart_size ? S3fsCurl::multipart_size : remaining_bytes;
 
-      // s3fscurl sub object
-      S3fsCurl* s3fscurl_para            = new S3fsCurl(true);
-      s3fscurl_para->partdata.fd         = fd2;
-      s3fscurl_para->partdata.startpos   = st.st_size - remaining_bytes;
-      s3fscurl_para->partdata.size       = chunk;
-      s3fscurl_para->b_partdata_startpos = s3fscurl_para->partdata.startpos;
-      s3fscurl_para->b_partdata_size     = s3fscurl_para->partdata.size;
-      s3fscurl_para->partdata.add_etag_list(&list);
+        // s3fscurl sub object
+        S3fsCurl* s3fscurl_para            = new S3fsCurl(true);
+        s3fscurl_para->partdata.fd         = fd2;
+        s3fscurl_para->partdata.startpos   = st.st_size - remaining_bytes;
+        s3fscurl_para->partdata.size       = chunk;
+        s3fscurl_para->b_partdata_startpos = s3fscurl_para->partdata.startpos;
+        s3fscurl_para->b_partdata_size     = s3fscurl_para->partdata.size;
+        s3fscurl_para->partdata.add_etag_list(list);
 
-      // initiate upload part for parallel
-      if(0 != (result = s3fscurl_para->UploadMultipartPostSetup(tpath, list.size(), upload_id))){
-        S3FS_PRN_ERR("failed uploading part setup(%d)", result);
-        close(fd2);
-        delete s3fscurl_para;
-        return result;
-      }
+        // initiate upload part for parallel
+        if(0 != (result = s3fscurl_para->UploadMultipartPostSetup(tpath, s3fscurl_para->partdata.get_part_number(), upload_id))){
+            S3FS_PRN_ERR("failed uploading part setup(%d)", result);
+            close(fd2);
+            delete s3fscurl_para;
+            return result;
+        }
 
-      // set into parallel object
-      if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
-        S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
-        close(fd2);
-        delete s3fscurl_para;
-        return -1;
-      }
+        // set into parallel object
+        if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
+            S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
+            close(fd2);
+            delete s3fscurl_para;
+            return -EIO;
+        }
+        remaining_bytes -= chunk;
     }
 
     // Multi request
     if(0 != (result = curlmulti.Request())){
-      S3FS_PRN_ERR("error occuered in multi request(errno=%d).", result);
-      break;
+        S3FS_PRN_ERR("error occurred in multi request(errno=%d).", result);
+
+        S3fsCurl s3fscurl_abort(true);
+        int result2 = s3fscurl_abort.AbortMultipartUpload(tpath, upload_id);
+        s3fscurl_abort.DestroyCurlHandle();
+        if(result2 != 0){
+            S3FS_PRN_ERR("error aborting multipart upload(errno=%d).", result2);
+        }
+
+        return result;
     }
 
-    // reinit for loop.
-    curlmulti.Clear();
-  }
-  close(fd2);
+    close(fd2);
 
-  if(0 != (result = s3fscurl.CompleteMultipartPostRequest(tpath, upload_id, list))){
-    return result;
-  }
-  return 0;
+    if(0 != (result = s3fscurl.CompleteMultipartPostRequest(tpath, upload_id, list))){
+        return result;
+    }
+    return 0;
+}
+
+int S3fsCurl::ParallelMixMultipartUploadRequest(const char* tpath, headers_t& meta, int fd, const fdpage_list_t& mixuppages)
+{
+    int            result;
+    std::string    upload_id;
+    struct stat    st;
+    int            fd2;
+    etaglist_t     list;
+    S3fsCurl       s3fscurl(true);
+
+    S3FS_PRN_INFO3("[tpath=%s][fd=%d]", SAFESTRPTR(tpath), fd);
+
+    // duplicate fd
+    if(-1 == (fd2 = dup(fd)) || 0 != lseek(fd2, 0, SEEK_SET)){
+        S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
+        if(-1 != fd2){
+            close(fd2);
+        }
+        return -errno;
+    }
+    if(-1 == fstat(fd2, &st)){
+        S3FS_PRN_ERR("Invalid file descriptor(errno=%d)", errno);
+        close(fd2);
+        return -errno;
+    }
+
+    if(0 != (result = s3fscurl.PreMultipartPostRequest(tpath, meta, upload_id, true))){
+        close(fd2);
+        return result;
+    }
+    s3fscurl.DestroyCurlHandle();
+
+    // for copy multipart
+    std::string srcresource;
+    std::string srcurl;
+    MakeUrlResource(get_realpath(tpath).c_str(), srcresource, srcurl);
+    meta["Content-Type"]      = S3fsCurl::LookupMimeType(std::string(tpath));
+    meta["x-oss-copy-source"] = srcresource;
+
+    // Initialize S3fsMultiCurl
+    S3fsMultiCurl curlmulti(GetMaxParallelCount());
+    curlmulti.SetSuccessCallback(S3fsCurl::MixMultipartPostCallback);
+    curlmulti.SetRetryCallback(S3fsCurl::MixMultipartPostRetryCallback);
+
+    for(fdpage_list_t::const_iterator iter = mixuppages.begin(); iter != mixuppages.end(); ++iter){
+        if(iter->modified){
+            // Multipart upload
+            S3fsCurl* s3fscurl_para              = new S3fsCurl(true);
+
+            s3fscurl_para->partdata.fd         = fd2;
+            s3fscurl_para->partdata.startpos   = iter->offset;
+            s3fscurl_para->partdata.size       = iter->bytes;
+            s3fscurl_para->b_partdata_startpos = s3fscurl_para->partdata.startpos;
+            s3fscurl_para->b_partdata_size     = s3fscurl_para->partdata.size;
+            s3fscurl_para->partdata.add_etag_list(list);
+
+            S3FS_PRN_INFO3("Upload Part [tpath=%s][start=%lld][size=%lld][part=%d]", SAFESTRPTR(tpath), static_cast<long long>(iter->offset), static_cast<long long>(iter->bytes), s3fscurl_para->partdata.get_part_number());
+
+            // initiate upload part for parallel
+            if(0 != (result = s3fscurl_para->UploadMultipartPostSetup(tpath, s3fscurl_para->partdata.get_part_number(), upload_id))){
+                S3FS_PRN_ERR("failed uploading part setup(%d)", result);
+                close(fd2);
+                delete s3fscurl_para;
+                return result;
+            }
+
+            // set into parallel object
+            if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
+                S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
+                close(fd2);
+                delete s3fscurl_para;
+                return -EIO;
+            }
+        }else{
+            // Multipart copy
+            for(off_t i = 0, bytes = 0; i < iter->bytes; i += bytes){
+                S3fsCurl* s3fscurl_para              = new S3fsCurl(true);
+
+                bytes = std::min(static_cast<off_t>(GetMultipartCopySize()), iter->bytes - i);
+                /* every part should be larger than MIN_MULTIPART_SIZE and smaller than FIVE_GB */
+                off_t remain_bytes = iter->bytes - i - bytes;
+
+                if ((MIN_MULTIPART_SIZE > remain_bytes) && (0 < remain_bytes)){
+                    if(FIVE_GB < (bytes + remain_bytes)){
+                        bytes = (bytes + remain_bytes)/2;
+                    } else{
+                        bytes += remain_bytes;
+                    }
+                }
+
+                std::ostringstream strrange;
+                strrange << "bytes=" << (iter->offset + i) << "-" << (iter->offset + i + bytes - 1);
+                meta["x-oss-copy-source-range"] = strrange.str();
+
+                s3fscurl_para->b_from   = SAFESTRPTR(tpath);
+                s3fscurl_para->b_meta   = meta;
+                s3fscurl_para->partdata.add_etag_list(list);
+
+                S3FS_PRN_INFO3("Copy Part [tpath=%s][start=%lld][size=%lld][part=%d]", SAFESTRPTR(tpath), static_cast<long long>(iter->offset + i), static_cast<long long>(bytes), s3fscurl_para->partdata.get_part_number());
+
+                // initiate upload part for parallel
+                if(0 != (result = s3fscurl_para->CopyMultipartPostSetup(tpath, tpath, s3fscurl_para->partdata.get_part_number(), upload_id, meta))){
+                    S3FS_PRN_ERR("failed uploading part setup(%d)", result);
+                    close(fd2);
+                    delete s3fscurl_para;
+                    return result;
+                }
+
+                // set into parallel object
+                if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
+                    S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
+                    close(fd2);
+                    delete s3fscurl_para;
+                    return -EIO;
+                }
+            }
+        }
+    }
+
+    // Multi request
+    if(0 != (result = curlmulti.Request())){
+        S3FS_PRN_ERR("error occurred in multi request(errno=%d).", result);
+
+        S3fsCurl s3fscurl_abort(true);
+        int result2 = s3fscurl_abort.AbortMultipartUpload(tpath, upload_id);
+        s3fscurl_abort.DestroyCurlHandle();
+        if(result2 != 0){
+            S3FS_PRN_ERR("error aborting multipart upload(errno=%d).", result2);
+        }
+        close(fd2);
+        return result;
+    }
+    close(fd2);
+
+    if(0 != (result = s3fscurl.CompleteMultipartPostRequest(tpath, upload_id, list))){
+        return result;
+    }
+    return 0;
 }
 
 S3fsCurl* S3fsCurl::ParallelGetObjectRetryCallback(S3fsCurl* s3fscurl)
 {
-  int result;
+    int result;
 
-  if(!s3fscurl){
-    return NULL;
-  }
-  if(s3fscurl->retry_count >= S3fsCurl::retries){
-    S3FS_PRN_ERR("Over retry count(%d) limit(%s).", s3fscurl->retry_count, s3fscurl->path.c_str());
-    return NULL;
-  }
+    if(!s3fscurl){
+        return NULL;
+    }
+    if(s3fscurl->retry_count >= S3fsCurl::retries){
+        S3FS_PRN_ERR("Over retry count(%d) limit(%s).", s3fscurl->retry_count, s3fscurl->path.c_str());
+        return NULL;
+    }
 
-  // duplicate request(setup new curl object)
-  S3fsCurl* newcurl = new S3fsCurl(s3fscurl->IsUseAhbe());
-  if(0 != (result = newcurl->PreGetObjectRequest(s3fscurl->path.c_str(), s3fscurl->partdata.fd,
-     s3fscurl->partdata.startpos, s3fscurl->partdata.size, s3fscurl->b_ssetype, s3fscurl->b_ssevalue)))
-  {
-    S3FS_PRN_ERR("failed downloading part setup(%d)", result);
-    delete newcurl;
-    return NULL;;
-  }
-  newcurl->retry_count = s3fscurl->retry_count + 1;
-
-  return newcurl;
-}
-
-int S3fsCurl::ParallelGetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size)
-{
-  S3FS_PRN_INFO3("[tpath=%s][fd=%d]", SAFESTRPTR(tpath), fd);
-
-  sse_type_t ssetype;
-  string     ssevalue;
-  if(!get_object_sse_type(tpath, ssetype, ssevalue)){
-    S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
-  }
-  int        result = 0;
-  ssize_t    remaining_bytes;
-
-  // cycle through open fd, pulling off 10MB chunks at a time
-  for(remaining_bytes = size; 0 < remaining_bytes; ){
-    S3fsMultiCurl curlmulti;
-    int           para_cnt;
-    off_t         chunk;
-
-    // Initialize S3fsMultiCurl
-    //curlmulti.SetSuccessCallback(NULL);   // not need to set success callback
-    curlmulti.SetRetryCallback(S3fsCurl::ParallelGetObjectRetryCallback);
-
-    // Loop for setup parallel upload(multipart) request.
-    for(para_cnt = 0; para_cnt < S3fsCurl::max_parallel_cnt && 0 < remaining_bytes; para_cnt++, remaining_bytes -= chunk){
-      // chunk size
-      chunk = remaining_bytes > S3fsCurl::multipart_size ? S3fsCurl::multipart_size : remaining_bytes;
-
-      // s3fscurl sub object
-      S3fsCurl* s3fscurl_para = new S3fsCurl();
-      if(0 != (result = s3fscurl_para->PreGetObjectRequest(tpath, fd, (start + size - remaining_bytes), chunk, ssetype, ssevalue))){
+    // duplicate request(setup new curl object)
+    S3fsCurl* newcurl = new S3fsCurl(s3fscurl->IsUseAhbe());
+    
+    if(0 != (result = newcurl->PreGetObjectRequest(s3fscurl->path.c_str(), s3fscurl->partdata.fd, s3fscurl->partdata.startpos, s3fscurl->partdata.size, s3fscurl->b_ssetype, s3fscurl->b_ssevalue))){
         S3FS_PRN_ERR("failed downloading part setup(%d)", result);
-        delete s3fscurl_para;
-        return result;
-      }
-
-      // set into parallel object
-      if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
-        S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
-        delete s3fscurl_para;
-        return -1;
-      }
+        delete newcurl;
+        return NULL;;
     }
+    newcurl->retry_count = s3fscurl->retry_count + 1;
 
-    // Multi request
-    if(0 != (result = curlmulti.Request())){
-      S3FS_PRN_ERR("error occuered in multi request(errno=%d).", result);
-      break;
-    }
-
-    // reinit for loop.
-    curlmulti.Clear();
-  }
-  return result;
+    return newcurl;
 }
 
-bool S3fsCurl::ParseRAMCredentialResponse(const char* response, ramcredmap_t& keyval)
+int S3fsCurl::ParallelGetObjectRequest(const char* tpath, int fd, off_t start, off_t size)
 {
-  if(!response){
-    return false;
-  }
-  istringstream sscred(response);
-  string        oneline;
-  keyval.clear();
-  while(getline(sscred, oneline, '\n')){
-    string::size_type pos;
-    string            key;
-    string            val;
-    if(string::npos != (pos = oneline.find(RAMCRED_ACCESSKEYID))){
-      key = RAMCRED_ACCESSKEYID;
-    }else if(string::npos != (pos = oneline.find(RAMCRED_SECRETACCESSKEY))){
-      key = RAMCRED_SECRETACCESSKEY;
-    }else if (string::npos != (pos = oneline.find(RAMCRED_ACCESSKEYSECRET))) {
-      key = RAMCRED_SECRETACCESSKEY;
-    }else if(string::npos != (pos = oneline.find(RAMCRED_ACCESSTOKEN))){
-      key = RAMCRED_ACCESSTOKEN;
-    }else if(string::npos != (pos = oneline.find(RAMCRED_EXPIRATION))){
-      key = RAMCRED_EXPIRATION;
-    }else{
-      continue;
+    S3FS_PRN_INFO3("[tpath=%s][fd=%d]", SAFESTRPTR(tpath), fd);
+
+    sse_type_t ssetype = sse_type_t::SSE_DISABLE;
+    std::string ssevalue;
+    if(!get_object_sse_type(tpath, ssetype, ssevalue)){
+        S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
     }
-    if(string::npos == (pos = oneline.find(':', pos + key.length()))){
-      continue;
+    int        result = 0;
+    off_t      remaining_bytes;
+
+    // cycle through open fd, pulling off 10MB chunks at a time
+    for(remaining_bytes = size; 0 < remaining_bytes; ){
+        S3fsMultiCurl curlmulti(GetMaxParallelCount());
+        int           para_cnt;
+        off_t         chunk;
+
+        // Initialize S3fsMultiCurl
+        //curlmulti.SetSuccessCallback(NULL);   // not need to set success callback
+        curlmulti.SetRetryCallback(S3fsCurl::ParallelGetObjectRetryCallback);
+
+        // Loop for setup parallel upload(multipart) request.
+        for(para_cnt = 0; para_cnt < S3fsCurl::max_parallel_cnt && 0 < remaining_bytes; para_cnt++, remaining_bytes -= chunk){
+            // chunk size
+            chunk = remaining_bytes > S3fsCurl::multipart_size ? S3fsCurl::multipart_size : remaining_bytes;
+
+            // s3fscurl sub object
+            S3fsCurl* s3fscurl_para = new S3fsCurl();
+            if(0 != (result = s3fscurl_para->PreGetObjectRequest(tpath, fd, (start + size - remaining_bytes), chunk, ssetype, ssevalue))){
+                S3FS_PRN_ERR("failed downloading part setup(%d)", result);
+                delete s3fscurl_para;
+                return result;
+            }
+
+            // set into parallel object
+            if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
+                S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
+                delete s3fscurl_para;
+                return -EIO;
+            }
+        }
+
+        // Multi request
+        if(0 != (result = curlmulti.Request())){
+            S3FS_PRN_ERR("error occurred in multi request(errno=%d).", result);
+            break;
+        }
+
+        // reinit for loop.
+        curlmulti.Clear();
     }
-    if(string::npos == (pos = oneline.find('\"', pos))){
-      continue;
-    }
-    oneline = oneline.substr(pos + sizeof(char));
-    if(string::npos == (pos = oneline.find('\"'))){
-      continue;
-    }
-    val = oneline.substr(0, pos);
-    keyval[key] = val;
-  }
-  return true;
+    return result;
 }
 
-bool S3fsCurl::SetRAMCredentials(const char* response)
+bool S3fsCurl::UploadMultipartPostSetCurlOpts(S3fsCurl* s3fscurl)
 {
-  S3FS_PRN_INFO3("RAM credential response = \"%s\"", response);
+    if(!s3fscurl){
+        return false;
+    }
+    if(!s3fscurl->CreateCurlHandle()){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_URL, s3fscurl->url.c_str())){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_UPLOAD, true)){              // HTTP PUT
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEDATA, (void*)(&s3fscurl->bodydata))){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_HEADERDATA, (void*)&(s3fscurl->responseHeaders))){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(s3fscurl->partdata.size))){ // Content-Length
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_READFUNCTION, UploadReadCallback)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_READDATA, (void*)s3fscurl)){
+        return false;
+    }
+    if(!S3fsCurl::AddUserAgent(s3fscurl->hCurl)){                            // put User-Agent
+        return false;
+    }
 
-  ramcredmap_t keyval;
-
-  if(!ParseRAMCredentialResponse(response, keyval)){
-    return false;
-  }
-  if(RAMCRED_KEYCOUNT != keyval.size()){
-    return false;
-  }
-
-  S3fsCurl::OSSAccessKeyId       = keyval[string(RAMCRED_ACCESSKEYID)];
-  S3fsCurl::OSSSecretAccessKey   = keyval[string(RAMCRED_SECRETACCESSKEY)];
-  S3fsCurl::OSSAccessToken       = keyval[string(RAMCRED_ACCESSTOKEN)];
-  S3fsCurl::OSSAccessTokenExpire = cvtRAMExpireStringToTime(keyval[string(RAMCRED_EXPIRATION)].c_str());
-
-  return true;
-}
-
-bool S3fsCurl::CheckRAMCredentialUpdate(void)
-{
-  if(0 == S3fsCurl::RAM_role.size()){
     return true;
-  }
-  if(time(NULL) + RAM_EXPIRE_MERGIN <= S3fsCurl::OSSAccessTokenExpire){
-    return true;
-  }
-  // update
-  S3fsCurl s3fscurl;
-  if(0 != s3fscurl.GetRAMCredentials()){
-    return false;
-  }
-  return true;
 }
 
-int S3fsCurl::CurlDebugFunc(CURL* hcurl, curl_infotype type, char* data, size_t size, void* userptr)
+bool S3fsCurl::CopyMultipartPostSetCurlOpts(S3fsCurl* s3fscurl)
 {
-  if(!hcurl){
-    // something wrong...
+    if(!s3fscurl){
+        return false;
+    }
+    if(!s3fscurl->CreateCurlHandle()){
+        return false;
+    }
+
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_URL, s3fscurl->url.c_str())){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_UPLOAD, true)){                // HTTP PUT
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEDATA, (void*)(&s3fscurl->bodydata))){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_HEADERDATA, (void*)(&s3fscurl->headdata))){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_HEADERFUNCTION, WriteMemoryCallback)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_INFILESIZE, 0)){               // Content-Length
+        return false;
+    }
+    if(!S3fsCurl::AddUserAgent(s3fscurl->hCurl)){                            // put User-Agent
+        return false;
+    }
+
+    return true;
+}
+
+bool S3fsCurl::PreGetObjectRequestSetCurlOpts(S3fsCurl* s3fscurl)
+{
+    if(!s3fscurl){
+        return false;
+    }
+    if(!s3fscurl->CreateCurlHandle()){
+        return false;
+    }
+
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_URL, s3fscurl->url.c_str())){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEFUNCTION, DownloadWriteCallback)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEDATA, (void*)s3fscurl)){
+        return false;
+    }
+    if(!S3fsCurl::AddUserAgent(s3fscurl->hCurl)){                            // put User-Agent
+        return false;
+    }
+
+    return true;
+}
+
+bool S3fsCurl::PreHeadRequestSetCurlOpts(S3fsCurl* s3fscurl)
+{
+    if(!s3fscurl){
+        return false;
+    }
+    if(!s3fscurl->CreateCurlHandle()){
+        return false;
+    }
+
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_URL, s3fscurl->url.c_str())){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_NOBODY, true)){   // HEAD
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_FILETIME, true)){ // Last-Modified
+        return false;
+    }
+
+    // responseHeaders
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_HEADERDATA, (void*)&(s3fscurl->responseHeaders))){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback)){
+        return false;
+    }
+    if(!S3fsCurl::AddUserAgent(s3fscurl->hCurl)){                            // put User-Agent
+        return false;
+    }
+
+    return true;
+}
+
+bool S3fsCurl::AddUserAgent(CURL* hCurl)
+{
+    if(!hCurl){
+        return false;
+    }
+    if(S3fsCurl::IsUserAgentFlag()){
+        curl_easy_setopt(hCurl, CURLOPT_USERAGENT, S3fsCurl::userAgent.c_str());
+    }
+    return true;
+}
+
+int S3fsCurl::CurlDebugFunc(const CURL* hcurl, curl_infotype type, char* data, size_t size, void* userptr)
+{
+    return S3fsCurl::RawCurlDebugFunc(hcurl, type, data, size, userptr, CURLINFO_END);
+}
+
+int S3fsCurl::CurlDebugBodyInFunc(const CURL* hcurl, curl_infotype type, char* data, size_t size, void* userptr)
+{
+    return S3fsCurl::RawCurlDebugFunc(hcurl, type, data, size, userptr, CURLINFO_DATA_IN);
+}
+
+int S3fsCurl::CurlDebugBodyOutFunc(const CURL* hcurl, curl_infotype type, char* data, size_t size, void* userptr)
+{
+    return S3fsCurl::RawCurlDebugFunc(hcurl, type, data, size, userptr, CURLINFO_DATA_OUT);
+}
+
+int S3fsCurl::RawCurlDebugFunc(const CURL* hcurl, curl_infotype type, char* data, size_t size, void* userptr, curl_infotype datatype)
+{
+    if(!hcurl){
+        // something wrong...
+        return 0;
+    }
+
+    switch(type){
+        case CURLINFO_TEXT:
+            // Swap tab indentation with spaces so it stays pretty in syslog
+            int indent;
+            indent = 0;
+            while (*data == '\t' && size > 0) {
+                indent += 4;
+                size--;
+                data++;
+            }
+            if(foreground && 0 < size && '\n' == data[size - 1]){
+                size--;
+            }
+            S3FS_PRN_CURL("* %*s%.*s", indent, "", (int)size, data);
+            break;
+
+        case CURLINFO_DATA_IN:
+        case CURLINFO_DATA_OUT:
+            if(type != datatype || !S3fsCurl::is_dump_body){
+                // not put
+                break;
+            }
+        case CURLINFO_HEADER_IN:
+        case CURLINFO_HEADER_OUT:
+            size_t remaining;
+            char* p;
+
+            // Print each line individually for tidy output
+            remaining = size;
+            p = data;
+            do {
+                char* eol = (char*)memchr(p, '\n', remaining);
+                int newline = 0;
+                if (eol == NULL) {
+                    eol = (char*)memchr(p, '\r', remaining);
+                } else {
+                    if (eol > p && *(eol - 1) == '\r') {
+                        newline++;
+                    }
+                    newline++;
+                    eol++;
+                }
+                size_t length = eol - p;
+                S3FS_PRN_CURL("%s %.*s", getCurlDebugHead(type), (int)length - newline, p);
+                remaining -= length;
+                p = eol;
+            } while (p != NULL && remaining > 0);
+            break;
+
+        case CURLINFO_SSL_DATA_IN:
+        case CURLINFO_SSL_DATA_OUT:
+            // not put
+            break;
+        default:
+            // why
+            break;
+    }
     return 0;
-  }
-  switch(type){
-    case CURLINFO_TEXT:
-    case CURLINFO_HEADER_IN:
-    case CURLINFO_HEADER_OUT:
-      char* buff;
-      if(NULL == (buff = reinterpret_cast<char*>(malloc(size + 2 + 1)))){
-        // could not allocation memory
-        S3FS_PRN_CRIT("could not allocate memory");
-        break;
-      }
-      buff[size + 2] = '\0';
-      sprintf(buff, "%c ", (CURLINFO_TEXT == type ? '*' : CURLINFO_HEADER_IN == type ? '<' : '>'));
-      memcpy(&buff[2], data, size);
-      S3FS_PRN_CURL("%s", buff);      // no blocking
-      free(buff);
-      break;
-    case CURLINFO_DATA_IN:
-    case CURLINFO_DATA_OUT:
-    case CURLINFO_SSL_DATA_IN:
-    case CURLINFO_SSL_DATA_OUT:
-      // not put
-      break;
-    default:
-      // why
-      break;
-  }
-  return 0;
 }
 
 //-------------------------------------------------------------------
 // Methods for S3fsCurl
 //-------------------------------------------------------------------
 S3fsCurl::S3fsCurl(bool ahbe) : 
-    hCurl(NULL), path(""), base_path(""), saved_path(""), url(""), requestHeaders(NULL),
-    bodydata(NULL), headdata(NULL), LastResponseCode(-1), postdata(NULL), postdata_remaining(0), is_use_ahbe(ahbe),
+    hCurl(NULL), type(REQTYPE_UNSET), requestHeaders(NULL),
+    LastResponseCode(S3FSCURL_RESPONSECODE_NOTSET), postdata(NULL), postdata_remaining(0), is_use_ahbe(ahbe),
     retry_count(0), b_infile(NULL), b_postdata(NULL), b_postdata_remaining(0), b_partdata_startpos(0), b_partdata_size(0),
-    b_ssekey_pos(-1), b_ssevalue(""), b_ssetype(SSE_DISABLE)
+    b_ssekey_pos(-1), b_ssetype(sse_type_t::SSE_DISABLE),
+    sem(NULL), completed_tids_lock(NULL), completed_tids(NULL), fpLazySetup(NULL), curlCode(CURLE_OK)
 {
-  type = REQTYPE_UNSET;
+    if(!S3fsCurl::ps3fscred){
+        S3FS_PRN_CRIT("The object of S3fs Credential class is not initialized.");
+        abort();
+    }
 }
 
 S3fsCurl::~S3fsCurl()
 {
-  DestroyCurlHandle();
+    DestroyCurlHandle();
 }
 
-bool S3fsCurl::ResetHandle(void)
+bool S3fsCurl::ResetHandle(bool lock_already_held)
 {
-  curl_easy_reset(hCurl);
-  curl_easy_setopt(hCurl, CURLOPT_NOSIGNAL, 1);
-  curl_easy_setopt(hCurl, CURLOPT_FOLLOWLOCATION, true);
-  curl_easy_setopt(hCurl, CURLOPT_CONNECTTIMEOUT, S3fsCurl::connect_timeout);
-  curl_easy_setopt(hCurl, CURLOPT_NOPROGRESS, 0);
-  curl_easy_setopt(hCurl, CURLOPT_PROGRESSFUNCTION, S3fsCurl::CurlProgress);
-  curl_easy_setopt(hCurl, CURLOPT_PROGRESSDATA, hCurl);
-  // curl_easy_setopt(hCurl, CURLOPT_FORBID_REUSE, 1);
-
-  if(type != REQTYPE_RAMCRED){
-    // REQTYPE_RAMCRED is always HTTP
-    if(0 == S3fsCurl::ssl_verify_hostname){
-      curl_easy_setopt(hCurl, CURLOPT_SSL_VERIFYHOST, 0);
+    bool run_once;
+    {
+        AutoLock lock(&S3fsCurl::curl_warnings_lock);
+        run_once = curl_warnings_once;
+        curl_warnings_once = true;
     }
-    if(S3fsCurl::curl_ca_bundle.size() != 0){
-      curl_easy_setopt(hCurl, CURLOPT_CAINFO, S3fsCurl::curl_ca_bundle.c_str());
-    }
-  }
-  if((S3fsCurl::is_dns_cache || S3fsCurl::is_ssl_session_cache) && S3fsCurl::hCurlShare){
-    curl_easy_setopt(hCurl, CURLOPT_SHARE, S3fsCurl::hCurlShare);
-  }
-  if(!S3fsCurl::is_cert_check) {
-    S3FS_PRN_DBG("'no_check_certificate' option in effect.")
-    S3FS_PRN_DBG("The server certificate won't be checked against the available certificate authorities.")
-    curl_easy_setopt(hCurl, CURLOPT_SSL_VERIFYPEER, false);
-  }
-  if(S3fsCurl::is_verbose){
-    curl_easy_setopt(hCurl, CURLOPT_VERBOSE, true);
-    if(!foreground){
-      curl_easy_setopt(hCurl, CURLOPT_DEBUGFUNCTION, S3fsCurl::CurlDebugFunc);
-    }
-  }
 
-  S3fsCurl::curl_times[hCurl]    = time(0);
-  S3fsCurl::curl_progress[hCurl] = progress_t(-1, -1);
+    curl_easy_reset(hCurl);
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_NOSIGNAL, 1)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_FOLLOWLOCATION, true)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_CONNECTTIMEOUT, S3fsCurl::connect_timeout)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_NOPROGRESS, 0)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_PROGRESSFUNCTION, S3fsCurl::CurlProgress)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_PROGRESSDATA, hCurl)){
+        return false;
+    }
+    // curl_easy_setopt(hCurl, CURLOPT_FORBID_REUSE, 1);
+    if(CURLE_OK != curl_easy_setopt(hCurl, S3FS_CURLOPT_TCP_KEEPALIVE, 1) && !run_once){
+        S3FS_PRN_WARN("The CURLOPT_TCP_KEEPALIVE option could not be set. For maximize performance you need to enable this option and you should use libcurl 7.25.0 or later.");
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, S3FS_CURLOPT_SSL_ENABLE_ALPN, 0) && !run_once){
+        S3FS_PRN_WARN("The CURLOPT_SSL_ENABLE_ALPN option could not be unset. OSS server does not support ALPN, then this option should be disabled to maximize performance. you need to use libcurl 7.36.0 or later.");
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, S3FS_CURLOPT_KEEP_SENDING_ON_ERROR, 1) && !run_once){
+        S3FS_PRN_WARN("The S3FS_CURLOPT_KEEP_SENDING_ON_ERROR option could not be set. For maximize performance you need to enable this option and you should use libcurl 7.51.0 or later.");
+    }
 
-  return true;
+    if(type != REQTYPE_IAMCRED && type != REQTYPE_IAMROLE){
+        // REQTYPE_IAMCRED and REQTYPE_IAMROLE are always HTTP
+        if(0 == S3fsCurl::ssl_verify_hostname){
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_SSL_VERIFYHOST, 0)){
+                return false;
+            }
+        }
+        if(!S3fsCurl::curl_ca_bundle.empty()){
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_CAINFO, S3fsCurl::curl_ca_bundle.c_str())){
+                return false;
+            }
+        }
+    }
+    if((S3fsCurl::is_dns_cache || S3fsCurl::is_ssl_session_cache) && S3fsCurl::hCurlShare){
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_SHARE, S3fsCurl::hCurlShare)){
+            return false;
+        }
+    }
+    if(!S3fsCurl::is_cert_check) {
+        S3FS_PRN_DBG("'no_check_certificate' option in effect.");
+        S3FS_PRN_DBG("The server certificate won't be checked against the available certificate authorities.");
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_SSL_VERIFYPEER, false)){
+            return false;
+        }
+    }
+    if(S3fsCurl::is_verbose){
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_VERBOSE, true)){
+            return false;
+        }
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_DEBUGFUNCTION, S3fsCurl::CurlDebugFunc)){
+            return false;
+        }
+    }
+    if(!cipher_suites.empty()) {
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_SSL_CIPHER_LIST, cipher_suites.c_str())){
+            return false;
+        }
+    }
+
+    AutoLock lock(&S3fsCurl::curl_handles_lock, lock_already_held ? AutoLock::ALREADY_LOCKED : AutoLock::NONE);
+    S3fsCurl::curl_times[hCurl]    = time(0);
+    S3fsCurl::curl_progress[hCurl] = progress_t(-1, -1);
+
+    return true;
 }
 
-bool S3fsCurl::CreateCurlHandle(bool force)
+bool S3fsCurl::CreateCurlHandle(bool only_pool, bool remake)
 {
-  pthread_mutex_lock(&S3fsCurl::curl_handles_lock);
+    AutoLock lock(&S3fsCurl::curl_handles_lock);
 
-  if(hCurl){
-    if(!force){
-      S3FS_PRN_WARN("already create handle.");
-      return false;
+    if(hCurl && remake){
+        if(!DestroyCurlHandle(false)){
+            S3FS_PRN_ERR("could not destroy handle.");
+            return false;
+        }
+        S3FS_PRN_INFO3("already has handle, so destroyed it or restored it to pool.");
     }
-    if(!DestroyCurlHandle()){
-      S3FS_PRN_ERR("could not destroy handle.");
-      return false;
+
+    if(!hCurl){
+        if(NULL == (hCurl = sCurlPool->GetHandler(only_pool))){
+            if(!only_pool){
+                S3FS_PRN_ERR("Failed to create handle.");
+                return false;
+            }else{
+                // [NOTE]
+                // Further initialization processing is left to lazy processing to be executed later.
+                // (Currently we do not use only_pool=true, but this code is remained for the future)
+                return true;
+            }
+        }
     }
-    S3FS_PRN_INFO3("already has handle, so destroied it.");
-  }
+    ResetHandle(/*lock_already_held=*/ true);
 
-  if(NULL == (hCurl = sCurlPool->GetHandler())){
-    S3FS_PRN_ERR("Failed to create handle.");
-    return false;
-  }
-  type = REQTYPE_UNSET;
-  ResetHandle();
-
-  pthread_mutex_unlock(&S3fsCurl::curl_handles_lock);
-
-  return true;
+    return true;
 }
 
-bool S3fsCurl::DestroyCurlHandle(void)
+bool S3fsCurl::DestroyCurlHandle(bool restore_pool, bool clear_internal_data)
 {
-  if(!hCurl){
-    return false;
-  }
-  pthread_mutex_lock(&S3fsCurl::curl_handles_lock);
+    // [NOTE]
+    // If type is REQTYPE_IAMCRED or REQTYPE_IAMROLE, do not clear type.
+    // Because that type only uses HTTP protocol, then the special
+    // logic in ResetHandle function.
+    //
+    if(type != REQTYPE_IAMCRED && type != REQTYPE_IAMROLE){
+        type = REQTYPE_UNSET;
+    }
 
-  S3fsCurl::curl_times.erase(hCurl);
-  S3fsCurl::curl_progress.erase(hCurl);
-  sCurlPool->ReturnHandler(hCurl);
-  hCurl = NULL;
-  ClearInternalData();
+    if(clear_internal_data){
+        ClearInternalData();
+    }
 
-  pthread_mutex_unlock(&S3fsCurl::curl_handles_lock);
-  return true;
+    if(hCurl){
+        AutoLock lock(&S3fsCurl::curl_handles_lock);
+  
+        S3fsCurl::curl_times.erase(hCurl);
+        S3fsCurl::curl_progress.erase(hCurl);
+        sCurlPool->ReturnHandler(hCurl, restore_pool);
+        hCurl = NULL;
+    }else{
+        return false;
+    }
+    return true;
 }
 
-bool S3fsCurl::ClearInternalData(void)
+bool S3fsCurl::ClearInternalData()
 {
-  if(hCurl){
-    return false;
-  }
-  type      = REQTYPE_UNSET;
-  path      = "";
-  base_path = "";
-  saved_path= "";
-  url       = "";
-  if(requestHeaders){
-    curl_slist_free_all(requestHeaders);
-    requestHeaders = NULL;
-  }
-  responseHeaders.clear();
-  if(bodydata){
-    delete bodydata;
-    bodydata = NULL;
-  }
-  if(headdata){
-    delete headdata;
-    headdata = NULL;
-  }
-  LastResponseCode     = -1;
-  postdata             = NULL;
-  postdata_remaining   = 0;
-  retry_count          = 0;
-  b_infile             = NULL;
-  b_postdata           = NULL;
-  b_postdata_remaining = 0;
-  b_partdata_startpos  = 0;
-  b_partdata_size      = 0;
-  partdata.clear();
+    // Always clear internal data
+    //
+    type        = REQTYPE_UNSET;
+    path        = "";
+    base_path   = "";
+    saved_path  = "";
+    url         = "";
+    op          = "";
+    query_string= "";
+    if(requestHeaders){
+        curl_slist_free_all(requestHeaders);
+        requestHeaders = NULL;
+    }
+    responseHeaders.clear();
+    bodydata.Clear();
+    headdata.Clear();
+    LastResponseCode     = S3FSCURL_RESPONSECODE_NOTSET;
+    postdata             = NULL;
+    postdata_remaining   = 0;
+    retry_count          = 0;
+    b_infile             = NULL;
+    b_postdata           = NULL;
+    b_postdata_remaining = 0;
+    b_partdata_startpos  = 0;
+    b_partdata_size      = 0;
+    partdata.clear();
 
-  S3FS_MALLOCTRIM(0);
+    fpLazySetup          = NULL;
 
-  return true;
+    S3FS_MALLOCTRIM(0);
+
+    return true;
 }
 
 bool S3fsCurl::SetUseAhbe(bool ahbe)
 {
-  bool old = is_use_ahbe;
-  is_use_ahbe = ahbe;
-  return old;
+    bool old = is_use_ahbe;
+    is_use_ahbe = ahbe;
+    return old;
 }
 
-bool S3fsCurl::GetResponseCode(long& responseCode)
+bool S3fsCurl::GetResponseCode(long& responseCode, bool from_curl_handle)
 {
-  if(!hCurl){
-    return false;
-  }
-  responseCode = -1;
-  if(CURLE_OK != curl_easy_getinfo(hCurl, CURLINFO_RESPONSE_CODE, &LastResponseCode)){
-    return false;
-  }
-  responseCode = LastResponseCode;
-  return true;
+    responseCode = -1;
+
+    if(!from_curl_handle){
+        responseCode = LastResponseCode;
+    }else{
+        if(!hCurl){
+            return false;
+        }
+        if(CURLE_OK != curl_easy_getinfo(hCurl, CURLINFO_RESPONSE_CODE, &LastResponseCode)){
+            return false;
+        }
+        responseCode = LastResponseCode;
+    }
+    return true;
 }
 
 //
 // Reset all options for retrying
 //
-bool S3fsCurl::RemakeHandle(void)
+bool S3fsCurl::RemakeHandle()
 {
-  S3FS_PRN_INFO3("Retry request. [type=%d][url=%s][path=%s]", type, url.c_str(), path.c_str());
+    S3FS_PRN_INFO3("Retry request. [type=%d][url=%s][path=%s]", type, url.c_str(), path.c_str());
 
-  if(REQTYPE_UNSET == type){
-    return false;
-  }
-
-  // rewind file
-  struct stat st;
-  if(b_infile){
-    rewind(b_infile);
-    if(-1 == fstat(fileno(b_infile), &st)){
-      S3FS_PRN_WARN("Could not get file stat(fd=%d)", fileno(b_infile));
-      return false;
+    if(REQTYPE_UNSET == type){
+        return false;
     }
-  }
 
-  // reinitialize internal data
-  responseHeaders.clear();
-  if(bodydata){
-    bodydata->Clear();
-  }
-  if(headdata){
-    headdata->Clear();
-  }
-  LastResponseCode   = -1;
+    // rewind file
+    struct stat st;
+    if(b_infile){
+        rewind(b_infile);
+        if(-1 == fstat(fileno(b_infile), &st)){
+            S3FS_PRN_WARN("Could not get file stat(fd=%d)", fileno(b_infile));
+            return false;
+        }
+    }
 
-  // count up(only use for multipart)
-  retry_count++;
+    // reinitialize internal data
+    requestHeaders = curl_slist_remove(requestHeaders, "Authorization");
+    responseHeaders.clear();
+    bodydata.Clear();
+    headdata.Clear();
+    LastResponseCode   = S3FSCURL_RESPONSECODE_NOTSET;
 
-  // set from backup
-  postdata           = b_postdata;
-  postdata_remaining = b_postdata_remaining;
-  partdata.startpos  = b_partdata_startpos;
-  partdata.size      = b_partdata_size;
+    // count up(only use for multipart)
+    retry_count++;
 
-  // reset handle
-  ResetHandle();
+    // set from backup
+    postdata           = b_postdata;
+    postdata_remaining = b_postdata_remaining;
+    partdata.startpos  = b_partdata_startpos;
+    partdata.size      = b_partdata_size;
 
-  // set options
-  switch(type){
-    case REQTYPE_DELETE:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE");
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+    // reset handle
+    ResetHandle();
 
-    case REQTYPE_HEAD:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_NOBODY, true);
-      curl_easy_setopt(hCurl, CURLOPT_FILETIME, true);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      // responseHeaders
-      curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&responseHeaders);
-      curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback);
-      break;
+    // set options
+    switch(type){
+        case REQTYPE_DELETE:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE")){
+                return false;
+            }
+            break;
 
-    case REQTYPE_PUTHEAD:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_HEAD:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_NOBODY, true)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_FILETIME, true)){
+                return false;
+            }
+            // responseHeaders
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&responseHeaders)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_PUT:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      if(b_infile){
-        curl_easy_setopt(hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(st.st_size));
-        curl_easy_setopt(hCurl, CURLOPT_INFILE, b_infile);
-      }else{
-        curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0);
-      }
-      break;
+        case REQTYPE_PUTHEAD:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_GET:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, S3fsCurl::DownloadWriteCallback);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)this);
-      break;
+        case REQTYPE_PUT:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(b_infile){
+                if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(st.st_size))){
+                    return false;
+                }
+                if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILE, b_infile)){
+                    return false;
+                }
+            }else{
+                if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0)){
+                    return false;
+                }
+            }
+            break;
 
-    case REQTYPE_CHKBUCKET:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-	  // XXX 
-      //curl_easy_setopt(hCurl, CURLOPT_FAILONERROR, true);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_GET:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, S3fsCurl::DownloadWriteCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)this)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_LISTBUCKET:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_CHKBUCKET:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_PREMULTIPOST:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_POST, true);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, 0);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_LISTBUCKET:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_COMPLETEMULTIPOST:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      curl_easy_setopt(hCurl, CURLOPT_POST, true);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, static_cast<curl_off_t>(postdata_remaining));
-      curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this);
-      curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::ReadCallback);
-      break;
+        case REQTYPE_PREMULTIPOST:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POST, true)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, 0)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_UPLOADMULTIPOST:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)headdata);
-      curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(partdata.size));
-      curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::UploadReadCallback);
-      curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_COMPLETEMULTIPOST:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POST, true)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, static_cast<curl_off_t>(postdata_remaining))){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::ReadCallback)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_COPYMULTIPOST:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)headdata);
-      curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_UPLOADMULTIPOST:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&responseHeaders)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(partdata.size))){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::UploadReadCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_MULTILIST:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_COPYMULTIPOST:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&headdata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_RAMCRED:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-      curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-      break;
+        case REQTYPE_MULTILIST:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            break;
 
-    case REQTYPE_ABORTMULTIUPLOAD:
-      curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE");
-      curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-      break;
+        case REQTYPE_IAMCRED:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(S3fsCurl::ps3fscred->IsIBMIAMAuth()){
+                if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POST, true)){
+                    return false;
+                }
+                if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, static_cast<curl_off_t>(postdata_remaining))){
+                    return false;
+                }
+                if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this)){
+                    return false;
+                }
+                if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::ReadCallback)){
+                    return false;
+                }
+            }
+            break;
 
-    default:
-      S3FS_PRN_ERR("request type is unknown(%d)", type);
-      return false;
-  }
-  return true;
+        case REQTYPE_ABORTMULTIUPLOAD:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE")){
+                return false;
+            }
+            break;
+
+        case REQTYPE_IAMROLE:
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            break;
+
+        default:
+            S3FS_PRN_ERR("request type is unknown(%d)", type);
+            return false;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return false;
+    }
+
+    return true;
 }
 
 //
 // returns curl return code
 //
-int S3fsCurl::RequestPerform(void)
+int S3fsCurl::RequestPerform(bool dontAddAuthHeaders /*=false*/)
 {
-  // Add the user-agent info
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", skUserAgent.c_str());
-  if(IS_S3FS_LOG_DBG()){
-    char* ptr_url = NULL;
-    curl_easy_getinfo(hCurl, CURLINFO_EFFECTIVE_URL , &ptr_url);
-    S3FS_PRN_DBG("connecting to URL %s", SAFESTRPTR(ptr_url));
-  }
+    if(S3fsLog::IsS3fsLogDbg()){
+        char* ptr_url = NULL;
+        curl_easy_getinfo(hCurl, CURLINFO_EFFECTIVE_URL , &ptr_url);
+        S3FS_PRN_DBG("connecting to URL %s", SAFESTRPTR(ptr_url));
+    }
 
-  // 1 attempt + retries...
-  for(int retrycnt = S3fsCurl::retries; 0 < retrycnt; retrycnt--){
-    // Requests
-	// XXX
-	//curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&responseHeaders); 
-	//curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback); 
-    CURLcode curlCode = curl_easy_perform(hCurl);
-	SetCurlCode(curlCode);
+    LastResponseCode  = S3FSCURL_RESPONSECODE_NOTSET;
+    long responseCode = S3FSCURL_RESPONSECODE_NOTSET;
+    int result        = S3FSCURL_PERFORM_RESULT_NOTSET;
 
-    // Check result
-    switch(curlCode){
-      case CURLE_OK:
-        // Need to look at the HTTP response code
-        if(0 != curl_easy_getinfo(hCurl, CURLINFO_RESPONSE_CODE, &LastResponseCode)){
-          S3FS_PRN_ERR("curl_easy_getinfo failed while trying to retrieve HTTP response code");
-          return -EIO;
-        }
-        if(400 > LastResponseCode){
-          S3FS_PRN_INFO3("HTTP response code %ld", LastResponseCode);
-          return 0;
-        }
-        if(500 <= LastResponseCode){
-          S3FS_PRN_INFO3("HTTP response code %ld", LastResponseCode);
-          sleep(4);
-          break; 
+    // 1 attempt + retries...
+    for(int retrycnt = 0; S3FSCURL_PERFORM_RESULT_NOTSET == result && retrycnt < S3fsCurl::retries; ++retrycnt){
+        // Reset response code
+        responseCode = S3FSCURL_RESPONSECODE_NOTSET;
+        
+        // Insert headers
+        if(!dontAddAuthHeaders) {
+             insertAuthHeaders();
         }
 
-        // Service response codes which are >= 400 && < 500
-        switch(LastResponseCode){
-          case 400:
-            S3FS_PRN_INFO3("HTTP response code 400 was returned, returing EIO.");
-            S3FS_PRN_DBG("Body Text: %s", (bodydata ? bodydata->str() : ""));
-            return -EIO;
-
-          case 403:
-            S3FS_PRN_INFO3("HTTP response code 403 was returned, returning EPERM");
-            S3FS_PRN_DBG("Body Text: %s", (bodydata ? bodydata->str() : ""));
-            return -EPERM;
-
-          case 404:
-            S3FS_PRN_INFO3("HTTP response code 404 was returned, returning ENOENT");
-            S3FS_PRN_DBG("Body Text: %s", (bodydata ? bodydata->str() : ""));
-            return -ENOENT;
-
-          default:
-            S3FS_PRN_INFO3("HTTP response code = %ld, returning EIO", LastResponseCode);
-            S3FS_PRN_DBG("Body Text: %s", (bodydata ? bodydata->str() : ""));
-            return -EIO;
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders)){
+            return false;
         }
-        break;
 
-      case CURLE_WRITE_ERROR:
-        S3FS_PRN_ERR("### CURLE_WRITE_ERROR");
-        sleep(2);
-        break; 
+        // Requests
+        curlCode = curl_easy_perform(hCurl);
 
-      case CURLE_OPERATION_TIMEDOUT:
-        S3FS_PRN_ERR("### CURLE_OPERATION_TIMEDOUT");
-        sleep(2);
-        break; 
+        // Check result
+        switch(curlCode){
+            case CURLE_OK:
+                // Need to look at the HTTP response code
+                if(0 != curl_easy_getinfo(hCurl, CURLINFO_RESPONSE_CODE, &responseCode)){
+                    S3FS_PRN_ERR("curl_easy_getinfo failed while trying to retrieve HTTP response code");
+                    responseCode = S3FSCURL_RESPONSECODE_FATAL_ERROR;
+                    result       = -EIO;
+                    break;
+                }
+                if(responseCode >= 200 && responseCode < 300){
+                    S3FS_PRN_INFO3("HTTP response code %ld", responseCode);
+                    result = 0;
+                    break;
+                }
 
-      case CURLE_COULDNT_RESOLVE_HOST:
-        S3FS_PRN_ERR("### CURLE_COULDNT_RESOLVE_HOST");
-        sleep(2);
-        break; 
+                {
+                    // Try to parse more specific AWS error code otherwise fall back to HTTP error code.
+                    std::string value;
+                    if(simple_parse_xml(bodydata.str(), bodydata.size(), "Code", value)){
+                        // TODO: other error codes
+                        if(value == "EntityTooLarge"){
+                            result = -EFBIG;
+                            break;
+                        }else if(value == "InvalidObjectState"){
+                            result = -EREMOTE;
+                            break;
+                        }else if(value == "KeyTooLongError"){
+                            result = -ENAMETOOLONG;
+                            break;
+                        }
+                    }
+                }
 
-      case CURLE_COULDNT_CONNECT:
-        S3FS_PRN_ERR("### CURLE_COULDNT_CONNECT");
-        sleep(4);
-        break; 
+                // Service response codes which are >= 300 && < 500
+                switch(responseCode){
+                    case 301:
+                    case 307:
+                        S3FS_PRN_ERR("HTTP response code 301(Moved Permanently: also happens when bucket's region is incorrect), returning EIO. Body Text: %s", bodydata.str());
+                        S3FS_PRN_ERR("The options of url and endpoint may be useful for solving, please try to use both options.");
+                        result = -EIO;
+                        break;
 
-      case CURLE_GOT_NOTHING:
-        S3FS_PRN_ERR("### CURLE_GOT_NOTHING");
-        sleep(4);
-        break; 
+                    case 400:
+                        if(op == "HEAD"){
+                            if(path.size() > 1024){
+                                S3FS_PRN_ERR("HEAD HTTP response code %ld with path longer than 1024, returning ENAMETOOLONG.", responseCode);
+                                return -ENAMETOOLONG;
+                            }
+                            S3FS_PRN_ERR("HEAD HTTP response code %ld, returning EPERM.", responseCode);
+                            result = -EPERM;
+                        }else{
+                            S3FS_PRN_ERR("HTTP response code %ld, returning EIO. Body Text: %s", responseCode, bodydata.str());
+                            result = -EIO;
+                        }
+                        break;
 
-      case CURLE_ABORTED_BY_CALLBACK:
-        S3FS_PRN_ERR("### CURLE_ABORTED_BY_CALLBACK");
-        sleep(4);
-        S3fsCurl::curl_times[hCurl] = time(0);
-        break; 
+                    case 403:
+                        S3FS_PRN_ERR("HTTP response code %ld, returning EPERM. Body Text: %s", responseCode, bodydata.str());
+                        result = -EPERM;
+                        break;
 
-      case CURLE_PARTIAL_FILE:
-        S3FS_PRN_ERR("### CURLE_PARTIAL_FILE");
-        sleep(4);
-        break; 
+                    case 404:
+                        S3FS_PRN_INFO3("HTTP response code 404 was returned, returning ENOENT");
+                        S3FS_PRN_DBG("Body Text: %s", bodydata.str());
+                        result = -ENOENT;
+                        break;
 
-      case CURLE_SEND_ERROR:
-        S3FS_PRN_ERR("### CURLE_SEND_ERROR");
-        sleep(2);
-        break;
+                    case 416:
+                        S3FS_PRN_INFO3("HTTP response code 416 was returned, returning EIO");
+                        result = -EIO;
+                        break;
 
-      case CURLE_RECV_ERROR:
-        S3FS_PRN_ERR("### CURLE_RECV_ERROR");
-        sleep(2);
-        break;
+                    case 501:
+                        S3FS_PRN_INFO3("HTTP response code 501 was returned, returning ENOTSUP");
+                        S3FS_PRN_DBG("Body Text: %s", bodydata.str());
+                        result = -ENOTSUP;
+                        break;
 
-      case CURLE_SSL_CONNECT_ERROR:
-        S3FS_PRN_ERR("### CURLE_SSL_CONNECT_ERROR");
-        sleep(2);
-        break;
+                    case 500:
+                    case 503: {
+                        S3FS_PRN_INFO3("HTTP response code %ld was returned, slowing down", responseCode);
+                        S3FS_PRN_DBG("Body Text: %s", bodydata.str());
+                        // Add jitter to avoid thundering herd.
+                        unsigned int sleep_time = 2 << retry_count;
+                        sleep(sleep_time + static_cast<unsigned int>(random()) % sleep_time);
+                        break;
+                    }
+                    default:
+                        S3FS_PRN_ERR("HTTP response code %ld, returning EIO. Body Text: %s", responseCode, bodydata.str());
+                        result = -EIO;
+                        break;
+                }
+                break;
 
-      case CURLE_SSL_CACERT:
-        S3FS_PRN_ERR("### CURLE_SSL_CACERT");
+            case CURLE_WRITE_ERROR:
+                S3FS_PRN_ERR("### CURLE_WRITE_ERROR");
+                sleep(2);
+                break; 
 
-        // try to locate cert, if successful, then set the
-        // option and continue
-        if(0 == S3fsCurl::curl_ca_bundle.size()){
-          if(!S3fsCurl::LocateBundle()){
-            S3FS_PRN_CRIT("could not get CURL_CA_BUNDLE.");
-            exit(EXIT_FAILURE);
-          }
-          break; // retry with CAINFO
-        }
-        S3FS_PRN_CRIT("curlCode: %d  msg: %s", curlCode, curl_easy_strerror(curlCode));
-        exit(EXIT_FAILURE);
-        break;
+            case CURLE_OPERATION_TIMEDOUT:
+                S3FS_PRN_ERR("### CURLE_OPERATION_TIMEDOUT");
+                sleep(2);
+                break; 
+
+            case CURLE_COULDNT_RESOLVE_HOST:
+                S3FS_PRN_ERR("### CURLE_COULDNT_RESOLVE_HOST");
+                sleep(2);
+                break; 
+
+            case CURLE_COULDNT_CONNECT:
+                S3FS_PRN_ERR("### CURLE_COULDNT_CONNECT");
+                sleep(4);
+                break; 
+
+            case CURLE_GOT_NOTHING:
+                S3FS_PRN_ERR("### CURLE_GOT_NOTHING");
+                sleep(4);
+                break; 
+
+            case CURLE_ABORTED_BY_CALLBACK:
+                S3FS_PRN_ERR("### CURLE_ABORTED_BY_CALLBACK");
+                sleep(4);
+                {
+                    AutoLock lock(&S3fsCurl::curl_handles_lock);
+                    S3fsCurl::curl_times[hCurl] = time(0);
+                }
+                break; 
+
+            case CURLE_PARTIAL_FILE:
+                S3FS_PRN_ERR("### CURLE_PARTIAL_FILE");
+                sleep(4);
+                break; 
+
+            case CURLE_SEND_ERROR:
+                S3FS_PRN_ERR("### CURLE_SEND_ERROR");
+                sleep(2);
+                break;
+
+            case CURLE_RECV_ERROR:
+                S3FS_PRN_ERR("### CURLE_RECV_ERROR");
+                sleep(2);
+                break;
+
+            case CURLE_SSL_CONNECT_ERROR:
+                S3FS_PRN_ERR("### CURLE_SSL_CONNECT_ERROR");
+                sleep(2);
+                break;
+
+            case CURLE_SSL_CACERT:
+                S3FS_PRN_ERR("### CURLE_SSL_CACERT");
+
+                // try to locate cert, if successful, then set the
+                // option and continue
+                if(S3fsCurl::curl_ca_bundle.empty()){
+                    if(!S3fsCurl::LocateBundle()){
+                        S3FS_PRN_ERR("could not get CURL_CA_BUNDLE.");
+                        result = -EIO;
+                    }
+                    // retry with CAINFO
+                }else{
+                    S3FS_PRN_ERR("curlCode: %d  msg: %s", curlCode, curl_easy_strerror(curlCode));
+                    result = -EIO;
+                }
+                break;
 
 #ifdef CURLE_PEER_FAILED_VERIFICATION
-      case CURLE_PEER_FAILED_VERIFICATION:
-        S3FS_PRN_ERR("### CURLE_PEER_FAILED_VERIFICATION");
+            case CURLE_PEER_FAILED_VERIFICATION:
+                S3FS_PRN_ERR("### CURLE_PEER_FAILED_VERIFICATION");
 
-        first_pos = bucket.find_first_of(".");
-        if(first_pos != string::npos){
-          S3FS_PRN_INFO("curl returned a CURL_PEER_FAILED_VERIFICATION error");
-          S3FS_PRN_INFO("security issue found: buckets with periods in their name are incompatible with http");
-          S3FS_PRN_INFO("This check can be over-ridden by using the -o ssl_verify_hostname=0");
-          S3FS_PRN_INFO("The certificate will still be checked but the hostname will not be verified.");
-          S3FS_PRN_INFO("A more secure method would be to use a bucket name without periods.");
-        }else{
-          S3FS_PRN_INFO("my_curl_easy_perform: curlCode: %d -- %s", curlCode, curl_easy_strerror(curlCode));
-        }
-        exit(EXIT_FAILURE);
-        break;
+                first_pos = S3fsCred::GetBucket().find_first_of('.');
+                if(first_pos != std::string::npos){
+                    S3FS_PRN_INFO("curl returned a CURL_PEER_FAILED_VERIFICATION error");
+                    S3FS_PRN_INFO("security issue found: buckets with periods in their name are incompatible with http");
+                    S3FS_PRN_INFO("This check can be over-ridden by using the -o ssl_verify_hostname=0");
+                    S3FS_PRN_INFO("The certificate will still be checked but the hostname will not be verified.");
+                    S3FS_PRN_INFO("A more secure method would be to use a bucket name without periods.");
+                }else{
+                    S3FS_PRN_INFO("my_curl_easy_perform: curlCode: %d -- %s", curlCode, curl_easy_strerror(curlCode));
+                }
+                result = -EIO;
+                break;
 #endif
 
-      // This should be invalid since curl option HTTP FAILONERROR is now off
-      case CURLE_HTTP_RETURNED_ERROR:
-        S3FS_PRN_ERR("### CURLE_HTTP_RETURNED_ERROR");
+            // This should be invalid since curl option HTTP FAILONERROR is now off
+            case CURLE_HTTP_RETURNED_ERROR:
+                S3FS_PRN_ERR("### CURLE_HTTP_RETURNED_ERROR");
 
-        if(0 != curl_easy_getinfo(hCurl, CURLINFO_RESPONSE_CODE, &LastResponseCode)){
-          return -EIO;
-        }
-        S3FS_PRN_INFO3("HTTP response code =%ld", LastResponseCode);
+                if(0 != curl_easy_getinfo(hCurl, CURLINFO_RESPONSE_CODE, &responseCode)){
+                    result = -EIO;
+                }else{
+                    S3FS_PRN_INFO3("HTTP response code =%ld", responseCode);
 
-        // Let's try to retrieve the 
-        if(404 == LastResponseCode){
-          return -ENOENT;
-        }
-        if(500 > LastResponseCode){
-          return -EIO;
-        }
-        break;
+                    // Let's try to retrieve the 
+                    if(404 == responseCode){
+                        result = -ENOENT;
+                    }else if(500 > responseCode){
+                        result = -EIO;
+                    }
+                }
+                break;
 
-      // Unknown CURL return code
-      default:
-        S3FS_PRN_CRIT("###curlCode: %d  msg: %s", curlCode, curl_easy_strerror(curlCode));
-        exit(EXIT_FAILURE);
-        break;
+            // Unknown CURL return code
+            default:
+                S3FS_PRN_ERR("###curlCode: %d  msg: %s", curlCode, curl_easy_strerror(curlCode));
+                result = -EIO;
+                break;
+        } // switch
+
+        if(S3FSCURL_PERFORM_RESULT_NOTSET == result){
+            S3FS_PRN_INFO("### retrying...");
+
+            if(!RemakeHandle()){
+                S3FS_PRN_INFO("Failed to reset handle and internal data for retrying.");
+                result = -EIO;
+                break;
+            }
+        }
+    } // for
+
+    // set last response code
+    if(S3FSCURL_RESPONSECODE_NOTSET == responseCode){
+        LastResponseCode = S3FSCURL_RESPONSECODE_FATAL_ERROR;
+    }else{
+        LastResponseCode = responseCode;
     }
-    S3FS_PRN_INFO("### retrying...");
 
-    if(!RemakeHandle()){
-      S3FS_PRN_INFO("Failed to reset handle and internal data for retrying.");
-      return -EIO;
+    if(S3FSCURL_PERFORM_RESULT_NOTSET == result){
+        S3FS_PRN_ERR("### giving up");
+        result = -EIO;
     }
-  }
-  S3FS_PRN_ERR("### giving up");
-
-  return -EIO;
+    return result;
 }
 
 //
-// Returns the Aliyun OSS signature for the given parameters.
+// Returns the Amazon AWS signature for the given parameters.
 //
 // @param method e.g., "GET"
 // @param content_type e.g., "application/x-directory"
 // @param date e.g., get_date_rfc850()
 // @param resource e.g., "/pub"
 //
-string S3fsCurl::CalcSignature(string method, string strMD5, string content_type, string date, string resource)
+std::string S3fsCurl::CalcSignatureV2(const std::string& method, const std::string& strMD5, const std::string& content_type, const std::string& date, const std::string& resource, const std::string& secret_access_key, const std::string& access_token)
 {
-  string Signature;
-  string StringToSign;
+    std::string Signature;
+    std::string StringToSign;
 
-  if(0 < S3fsCurl::RAM_role.size()){
-    if(!S3fsCurl::CheckRAMCredentialUpdate()){
-      S3FS_PRN_ERR("Something error occurred in checking RAM credential.");
-      return Signature;  // returns empty string, then it occures error.
+    if(!access_token.empty()){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", access_token.c_str());
     }
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", S3fsCurl::OSSAccessToken.c_str());
-  }
 
-  StringToSign += method + "\n";
-  StringToSign += strMD5 + "\n";        // md5
-  StringToSign += content_type + "\n";
-  StringToSign += date + "\n";
-  StringToSign += get_canonical_headers(requestHeaders);
-  StringToSign += resource;
+    StringToSign += method + "\n";
+    StringToSign += strMD5 + "\n";        // md5
+    StringToSign += content_type + "\n";
+    StringToSign += date + "\n";
+    StringToSign += get_canonical_headers(requestHeaders, true);
+    StringToSign += resource;
 
-  const void* key            = S3fsCurl::OSSSecretAccessKey.data();
-  int key_len                = S3fsCurl::OSSSecretAccessKey.size();
-  const unsigned char* sdata = reinterpret_cast<const unsigned char*>(StringToSign.data());
-  int sdata_len              = StringToSign.size();
-  unsigned char* md          = NULL;
-  unsigned int md_len        = 0;;
+    const void* key            = secret_access_key.data();
+    size_t key_len             = secret_access_key.size();
+    const unsigned char* sdata = reinterpret_cast<const unsigned char*>(StringToSign.data());
+    size_t sdata_len           = StringToSign.size();
+    unsigned char* md          = NULL;
+    unsigned int md_len        = 0;;
 
-  s3fs_HMAC(key, key_len, sdata, sdata_len, &md, &md_len);
+    s3fs_HMAC(key, key_len, sdata, sdata_len, &md, &md_len);
 
-  char* base64;
-  if(NULL == (base64 = s3fs_base64(md, md_len))){
-    free(md);
-    return string("");  // ENOMEM
-  }
-  free(md);
+    char* base64;
+    if(NULL == (base64 = s3fs_base64(md, md_len))){
+        delete[] md;
+        return std::string("");  // ENOMEM
+    }
+    delete[] md;
 
-  Signature = base64;
-  free(base64);
+    Signature = base64;
+    delete[] base64;
 
-  return Signature;
+    return Signature;
 }
 
-// XML in BodyData has UploadId, Parse XML body for UploadId
-bool S3fsCurl::GetUploadId(string& upload_id)
+std::string S3fsCurl::CalcSignature(const std::string& method, const std::string& canonical_uri, const std::string& query_string, const std::string& strdate, const std::string& payload_hash, const std::string& date8601, const std::string& secret_access_key, const std::string& access_token)
 {
-  bool result = false;
+    std::string Signature, StringCQ, StringToSign;
+    std::string uriencode;
 
-  if(!bodydata){
-    return result;
-  }
-  upload_id.clear();
-
-  xmlDocPtr doc;
-  if(NULL == (doc = xmlReadMemory(bodydata->str(), bodydata->size(), "", NULL, 0))){
-    return result;
-  }
-  if(NULL == doc->children){
-    S3FS_XMLFREEDOC(doc);
-    return result;
-  }
-  for(xmlNodePtr cur_node = doc->children->children; NULL != cur_node; cur_node = cur_node->next){
-    // For DEBUG
-    // string cur_node_name(reinterpret_cast<const char *>(cur_node->name));
-    // printf("cur_node_name: %s\n", cur_node_name.c_str());
-
-    if(XML_ELEMENT_NODE == cur_node->type){
-      string elementName = reinterpret_cast<const char*>(cur_node->name);
-      // For DEBUG
-      // printf("elementName: %s\n", elementName.c_str());
-
-      if(cur_node->children){
-        if(XML_TEXT_NODE == cur_node->children->type){
-          if(elementName == "UploadId") {
-            upload_id = reinterpret_cast<const char *>(cur_node->children->content);
-            result    = true;
-            break;
-          }
-        }
-      }
+    if(!access_token.empty()){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", access_token.c_str());
     }
-  }
-  S3FS_XMLFREEDOC(doc);
 
-  return result;
+    uriencode = urlEncode(canonical_uri);
+    StringCQ  = method + "\n";
+    if(method == "HEAD" || method == "PUT" || method == "DELETE"){
+        StringCQ += uriencode + "\n";
+    }else if(method == "GET" && uriencode.empty()){
+        StringCQ +="/\n";
+    }else if(method == "GET" && is_prefix(uriencode.c_str(), "/")){
+        StringCQ += uriencode +"\n";
+    }else if(method == "GET" && !is_prefix(uriencode.c_str(), "/")){
+        StringCQ += "/\n" + urlEncode2(canonical_uri) +"\n";
+    }else if(method == "POST"){
+        StringCQ += uriencode + "\n";
+    }
+    StringCQ += urlEncode2(query_string) + "\n";
+    StringCQ += get_canonical_headers(requestHeaders) + "\n";
+    StringCQ += get_sorted_header_keys(requestHeaders) + "\n";
+    StringCQ += payload_hash;
+
+    std::string   kSecret = "AWS4" + secret_access_key;
+    unsigned char *kDate, *kRegion, *kService, *kSigning, *sRequest               = NULL;
+    unsigned int  kDate_len,kRegion_len, kService_len, kSigning_len, sRequest_len = 0;
+
+    s3fs_HMAC256(kSecret.c_str(), kSecret.size(), reinterpret_cast<const unsigned char*>(strdate.data()), strdate.size(), &kDate, &kDate_len);
+    s3fs_HMAC256(kDate, kDate_len, reinterpret_cast<const unsigned char*>(endpoint.c_str()), endpoint.size(), &kRegion, &kRegion_len);
+    s3fs_HMAC256(kRegion, kRegion_len, reinterpret_cast<const unsigned char*>("s3"), sizeof("s3") - 1, &kService, &kService_len);
+    s3fs_HMAC256(kService, kService_len, reinterpret_cast<const unsigned char*>("aws4_request"), sizeof("aws4_request") - 1, &kSigning, &kSigning_len);
+    delete[] kDate;
+    delete[] kRegion;
+    delete[] kService;
+
+    const unsigned char* cRequest     = reinterpret_cast<const unsigned char*>(StringCQ.c_str());
+    size_t               cRequest_len = StringCQ.size();
+    s3fs_sha256(cRequest, cRequest_len, &sRequest, &sRequest_len);
+
+    StringToSign  = "AWS4-HMAC-SHA256\n";
+    StringToSign += date8601 + "\n";
+    StringToSign += strdate + "/" + endpoint + "/s3/aws4_request\n";
+    StringToSign += s3fs_hex_lower(sRequest, sRequest_len);
+    delete[] sRequest;
+
+    const unsigned char* cscope     = reinterpret_cast<const unsigned char*>(StringToSign.c_str());
+    size_t               cscope_len = StringToSign.size();
+    unsigned char*       md         = NULL;
+    unsigned int         md_len     = 0;
+
+    s3fs_HMAC256(kSigning, kSigning_len, cscope, cscope_len, &md, &md_len);
+    delete[] kSigning;
+
+    Signature = s3fs_hex_lower(md, md_len);
+    delete[] md;
+
+    return Signature;
+}
+
+void S3fsCurl::insertV4Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token)
+{
+    std::string server_path = type == REQTYPE_LISTBUCKET ? "/" : path;
+    std::string payload_hash;
+    switch (type) {
+        case REQTYPE_PUT:
+            if(GetUnsignedPayload()){
+                payload_hash = "UNSIGNED-PAYLOAD";
+            }else{
+                payload_hash = s3fs_sha256_hex_fd(b_infile == NULL ? -1 : fileno(b_infile), 0, -1);
+            }
+            break;
+
+        case REQTYPE_COMPLETEMULTIPOST:
+            {
+                size_t          cRequest_len = strlen(reinterpret_cast<const char *>(b_postdata));
+                unsigned char*  sRequest     = NULL;
+                unsigned int    sRequest_len = 0;
+                s3fs_sha256(b_postdata, cRequest_len, &sRequest, &sRequest_len);
+                payload_hash = s3fs_hex_lower(sRequest, sRequest_len);
+                delete[] sRequest;
+                break;
+            }
+
+        case REQTYPE_UPLOADMULTIPOST:
+            if(GetUnsignedPayload()){
+                payload_hash = "UNSIGNED-PAYLOAD";
+            }else{
+                payload_hash = s3fs_sha256_hex_fd(partdata.fd, partdata.startpos, partdata.size);
+            }
+            break;
+        default:
+            break;
+    }
+
+    if(b_infile != NULL && payload_hash.empty()){
+        S3FS_PRN_ERR("Failed to make SHA256.");
+        // TODO: propagate error
+    }
+
+    S3FS_PRN_INFO3("computing signature [%s] [%s] [%s] [%s]", op.c_str(), server_path.c_str(), query_string.c_str(), payload_hash.c_str());
+    std::string strdate;
+    std::string date8601;
+    get_date_sigv3(strdate, date8601);
+
+    std::string contentSHA256 = payload_hash.empty() ? EMPTY_PAYLOAD_HASH : payload_hash;
+    const std::string realpath = pathrequeststyle ? "/" + S3fsCred::GetBucket() + server_path : server_path;
+
+    //string canonical_headers, signed_headers;
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "host", get_bucket_host().c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-content-sha256", contentSHA256.c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-date", date8601.c_str());
+
+    if (S3fsCurl::IsRequesterPays()) {
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+    }
+
+    if(!S3fsCurl::IsPublicBucket()){
+        std::string Signature = CalcSignature(op, realpath, query_string + (type == REQTYPE_PREMULTIPOST || type == REQTYPE_MULTILIST ? "=" : ""), strdate, contentSHA256, date8601, secret_access_key, access_token);
+        std::string auth = "AWS4-HMAC-SHA256 Credential=" + access_key_id + "/" + strdate + "/" + endpoint + "/s3/aws4_request, SignedHeaders=" + get_sorted_header_keys(requestHeaders) + ", Signature=" + Signature;
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Authorization", auth.c_str());
+    }
+}
+
+void S3fsCurl::insertV2Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token)
+{
+    std::string resource;
+    std::string turl;
+    std::string server_path = type == REQTYPE_LISTBUCKET ? "/" : path;
+    MakeUrlResource(server_path.c_str(), resource, turl);
+    if(!query_string.empty() && type != REQTYPE_CHKBUCKET && type != REQTYPE_LISTBUCKET){
+        resource += "?" + query_string;
+    }
+
+    std::string date = get_date_rfc850();
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
+    if(op != "PUT" && op != "POST"){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
+    }
+
+    if(!S3fsCurl::IsPublicBucket()){
+        std::string Signature = CalcSignatureV2(op, get_header_value(requestHeaders, "Content-MD5"), get_header_value(requestHeaders, "Content-Type"), date, resource, secret_access_key, access_token);
+        requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", std::string("AWS " + access_key_id + ":" + Signature).c_str());
+    }
+}
+
+void S3fsCurl::insertIBMIAMHeaders(const std::string& access_key_id, const std::string& access_token)
+{
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Authorization", ("Bearer " + access_token).c_str());
+
+    if(op == "PUT" && path == mount_prefix + "/"){
+        // ibm-service-instance-id header is required for bucket creation requests
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "ibm-service-instance-id", access_key_id.c_str());
+    }
+}
+
+void S3fsCurl::insertAuthHeaders()
+{
+    std::string access_key_id;
+    std::string secret_access_key;
+    std::string access_token;
+
+    // check and get credential variables
+    if(!S3fsCurl::ps3fscred->CheckIAMCredentialUpdate(&access_key_id, &secret_access_key, &access_token)){
+        S3FS_PRN_ERR("An error occurred in checking IAM credential.");
+        return; // do not insert auth headers on error
+    }
+
+    // if(S3fsCurl::ps3fscred->IsIBMIAMAuth()){
+    //     insertIBMIAMHeaders(access_key_id, access_token);
+    // }else if(S3fsCurl::signature_type == V1_ONLY){
+    //     insertV2Headers(access_key_id, secret_access_key, access_token);
+    // }else{
+    //     insertV4Headers(access_key_id, secret_access_key, access_token);
+    // }
+    insertOSSV1Headers(access_key_id, secret_access_key, access_token);
+
 }
 
 int S3fsCurl::DeleteRequest(const char* tpath)
 {
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
-  if(!tpath){
-    return -1;
-  }
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
-
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(tpath);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("DELETE", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
-
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE");
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-
-  type = REQTYPE_DELETE;
-
-  return RequestPerform();
-}
-
-//
-// Get AccessKeyId/SecretAccessKey/AccessToken/Expiration by RAM role,
-// and Set these value to class valiable.
-//
-int S3fsCurl::GetRAMCredentials(void)
-{
-  S3FS_PRN_INFO3("[RAM role=%s]", S3fsCurl::RAM_role.c_str());
-
-  if(0 == S3fsCurl::RAM_role.size()){
-    S3FS_PRN_ERR("RAM role name is empty.");
-    return -EIO;
-  }
-  // at first set type for handle
-  type = REQTYPE_RAMCRED;
-
-  if(!CreateCurlHandle(true)){
-    return -EIO;
-  }
-
-  // url
-  url             = string(RAM_CRED_URL) + S3fsCurl::RAM_role;
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
-
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-
-  int result = RequestPerform();
-
-  // analizing response
-  if(0 == result && !S3fsCurl::SetRAMCredentials(bodydata->str())){
-    S3FS_PRN_ERR("Something error occurred, could not get RAM credential.");
-  }
-  delete bodydata;
-  bodydata = NULL;
-
-  return result;
-}
-
-bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_only_c, bool is_copy)
-{
-  if(SSE_OSS == ssetype){
-    if(!is_only_c){
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption", "AES256");
+    if(!tpath){
+        return -EINVAL;
     }
-  }else if(SSE_C == ssetype){
-    string sseckey;
-    if(S3fsCurl::GetSseKey(ssevalue, sseckey)){
-      if(is_copy){
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-copy-source-server-side-encryption-customer-algorithm", "AES256");
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-copy-source-server-side-encryption-customer-key",       sseckey.c_str());
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-copy-source-server-side-encryption-customer-key-md5",   ssevalue.c_str());
-      }else{
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-customer-algorithm", "AES256");
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-customer-key",       sseckey.c_str());
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-customer-key-md5",   ssevalue.c_str());
-      }
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+
+    op = "DELETE";
+    type = REQTYPE_DELETE;
+
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE")){
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
+
+    return RequestPerform();
+}
+
+int S3fsCurl::GetIAMv2ApiToken(const char* token_url, int token_ttl, const char* token_ttl_hdr, std::string& response)
+{
+    if(!token_url || !token_ttl_hdr){
+        S3FS_PRN_ERR("IAMv2 token url(%s) or ttl_hdr(%s) parameter are wrong.", token_url ? token_url : "null", token_ttl_hdr ? token_ttl_hdr : "null");
+        return -EIO;
+    }
+    response.erase();
+    url = std::string(token_url);
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
+
+    std::string ttlstr = str(token_ttl);
+    requestHeaders = curl_slist_sort_insert(requestHeaders, token_ttl_hdr, ttlstr.c_str());
+
+    // Curl appends an "Expect: 100-continue" header to the token request, 
+    // and aws responds with a 417 Expectation Failed. This ensures the 
+    // Expect header is empty before the request is sent.
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Expect", "");
+
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_PUT, true)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
+
+    // [NOTE]
+    // Be sure to give "dontAddAuthHeaders=true".
+    // If set to false(default), it will deadlock in S3fsCred.
+    //
+    int result = RequestPerform(true);
+
+    if(0 == result){
+        response = bodydata.str();
     }else{
-      S3FS_PRN_WARN("Failed to insert SSE-C header.");
+        S3FS_PRN_ERR("Error(%d) occurred, could not get IAMv2 api token.", result);
+    }
+    bodydata.Clear();
+
+    return result;
+}
+
+//
+// Get AccessKeyId/SecretAccessKey/AccessToken/Expiration by IAM role,
+// and Set these value to class variable.
+//
+bool S3fsCurl::GetRAMCredentials(const char* cred_url, const char* iam_v2_token, const char* ibm_secret_access_key, std::string& response)
+{
+    if(!cred_url){
+        S3FS_PRN_ERR("url is null.");
+        return false;
+    }
+    url = cred_url;
+    response.erase();
+
+    // at first set type for handle
+    type = REQTYPE_IAMCRED;
+
+    if(!CreateCurlHandle()){
+        return false;
+    }
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
+    std::string postContent;
+
+    if(ibm_secret_access_key){
+        // make contents
+        postContent += "grant_type=urn:ibm:params:oauth:grant-type:apikey";
+        postContent += "&response_type=cloud_iam";
+        postContent += "&apikey=" + std::string(ibm_secret_access_key);
+
+        // set postdata
+        postdata             = reinterpret_cast<const unsigned char*>(postContent.c_str());
+        b_postdata           = postdata;
+        postdata_remaining   = postContent.size(); // without null
+        b_postdata_remaining = postdata_remaining;
+
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Authorization", "Basic Yng6Yng=");
+
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POST, true)){              // POST
+            return false;
+        }
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, static_cast<curl_off_t>(postdata_remaining))){
+            return false;
+        }
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this)){
+            return false;
+        }
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::ReadCallback)){
+            return false;
+        }
     }
 
-  }else if(SSE_KMS == ssetype){
-	// Do not support KMS
-	return false;
-  }
-  return true;
+    if(iam_v2_token){
+        //requestHeaders = curl_slist_sort_insert(requestHeaders, S3fsCred::IAMv2_token_hdr, iam_v2_token);
+    }
+
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return false;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return false;
+    }
+
+    // [NOTE]
+    // Be sure to give "dontAddAuthHeaders=true".
+    // If set to false(default), it will deadlock in S3fsCred.
+    //
+    int result = RequestPerform(true);
+
+    // analyzing response
+    if(0 == result){
+        response = bodydata.str();
+    }else{
+        S3FS_PRN_ERR("Error(%d) occurred, could not get IAM role name.", result);
+    }
+    bodydata.Clear();
+
+    return (0 == result);
+}
+
+//
+// Get IAM role name automatically.
+//
+bool S3fsCurl::GetRAMRoleFromMetaData(const char* cred_url, const char* iam_v2_token, std::string& token)
+{
+    if(!cred_url){
+        S3FS_PRN_ERR("url is null.");
+        return false;
+    }
+    url = cred_url;
+    token.erase();
+
+    S3FS_PRN_INFO3("Get IAM Role name");
+
+    // at first set type for handle
+    type = REQTYPE_IAMROLE;
+
+    if(!CreateCurlHandle()){
+        return false;
+    }
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
+
+    if(iam_v2_token){
+        //requestHeaders = curl_slist_sort_insert(requestHeaders, S3fsCred::IAMv2_token_hdr, iam_v2_token);
+    }
+
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return false;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return false;
+    }
+
+    // [NOTE]
+    // Be sure to give "dontAddAuthHeaders=true".
+    // If set to false(default), it will deadlock in S3fsCred.
+    //
+    int result = RequestPerform(true);
+
+    // analyzing response
+    if(0 == result){
+        token = bodydata.str();
+    }else{
+        S3FS_PRN_ERR("Error(%d) occurred, could not get IAM role name from meta data.", result);
+    }
+    bodydata.Clear();
+
+    return (0 == result);
+}
+
+bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, const std::string& input, bool is_only_c, bool is_copy)
+{
+    std::string ssevalue = input;
+    switch(ssetype){
+        case sse_type_t::SSE_DISABLE:
+            return true;
+        case sse_type_t::SSE_OSS:
+            if(!is_only_c){
+                requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption", "AES256");
+            }
+            return true;
+        case sse_type_t::SSE_C:
+            {
+                std::string sseckey;
+                if(S3fsCurl::GetSseKey(ssevalue, sseckey)){
+                    if(is_copy){
+                        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-copy-source-server-side-encryption-customer-algorithm", "AES256");
+                        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-copy-source-server-side-encryption-customer-key",       sseckey.c_str());
+                        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-copy-source-server-side-encryption-customer-key-md5",   ssevalue.c_str());
+                    }else{
+                        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-customer-algorithm", "AES256");
+                        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-customer-key",       sseckey.c_str());
+                        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-customer-key-md5",   ssevalue.c_str());
+                    }
+                }else{
+                    S3FS_PRN_WARN("Failed to insert SSE-C header.");
+                }
+                return true;
+            }
+        case sse_type_t::SSE_KMS:
+            if(!is_only_c){
+                if(ssevalue.empty()){
+                    ssevalue = S3fsCurl::GetSseKmsId();
+                }
+                requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption", "KMS");
+                requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-key-id", ssevalue.c_str());
+            }
+            return true;
+    }
+    S3FS_PRN_ERR("sse type is unknown(%d).", static_cast<int>(S3fsCurl::ssetype));
+
+    return false;
 }
 
 //
@@ -2178,535 +3057,516 @@ bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_o
 // ssekey_pos : -1    means "not" SSE-C type
 //              0 - X means SSE-C type and position for SSE-C key(0 is latest key)
 //
-bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* savedpath, int ssekey_pos)
+bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* savedpath, size_t ssekey_pos)
 {
-  S3FS_PRN_INFO3("[tpath=%s][bpath=%s][save=%s][sseckeypos=%d]", SAFESTRPTR(tpath), SAFESTRPTR(bpath), SAFESTRPTR(savedpath), ssekey_pos);
+    S3FS_PRN_INFO3("[tpath=%s][bpath=%s][save=%s][sseckeypos=%zu]", SAFESTRPTR(tpath), SAFESTRPTR(bpath), SAFESTRPTR(savedpath), ssekey_pos);
 
-  if(!tpath){
-    return false;
-  }
-  if(!CreateCurlHandle(true)){
-    return false;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
-
-  // libcurl 7.17 does deep copy of url, deep copy "stable" url
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(tpath);
-  base_path       = SAFESTRPTR(bpath);
-  saved_path      = SAFESTRPTR(savedpath);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-
-  // requestHeaders
-  if(0 <= ssekey_pos){
-    string md5("");
-    if(!S3fsCurl::GetSseKeyMd5(ssekey_pos, md5) || !AddSseRequestHead(SSE_C, md5, true, false)){
-      S3FS_PRN_ERR("Failed to set SSE-C headers for sse-c key pos(%d)(=md5(%s)).", ssekey_pos, md5.c_str());
-      return false;
+    if(!tpath){
+        return false;
     }
-  }
-  b_ssekey_pos = ssekey_pos;
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
 
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "User-Agent", skUserAgent.c_str());
+    // libcurl 7.17 does deep copy of url, deep copy "stable" url
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    base_path       = SAFESTRPTR(bpath);
+    saved_path      = SAFESTRPTR(savedpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
 
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("HEAD", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
+    // requestHeaders
+    if(0 == ssekey_pos){
+        std::string md5;
+        if(!S3fsCurl::GetSseKeyMd5(ssekey_pos, md5) || !AddSseRequestHead(sse_type_t::SSE_C, md5, true, false)){
+            S3FS_PRN_ERR("Failed to set SSE-C headers for sse-c key pos(%zu)(=md5(%s)).", ssekey_pos, md5.c_str());
+            return false;
+        }
+    }
+    b_ssekey_pos = ssekey_pos;
 
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_NOBODY, true);   // HEAD
-  curl_easy_setopt(hCurl, CURLOPT_FILETIME, true); // Last-Modified
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
+    op = "HEAD";
+    type = REQTYPE_HEAD;
 
-  // responseHeaders
-  curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&responseHeaders);
-  curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    // set lazy function
+    fpLazySetup = PreHeadRequestSetCurlOpts;
 
-  type = REQTYPE_HEAD;
-
-  return true;
+    return true;
 }
 
 int S3fsCurl::HeadRequest(const char* tpath, headers_t& meta)
 {
-  int result = -1;
+    int result = -1;
 
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
-  // At first, try to get without SSE-C headers
-  if(!PreHeadRequest(tpath) || 0 != (result = RequestPerform())){
-    // If has SSE-C keys, try to get with all SSE-C keys.
-    for(int pos = 0; static_cast<size_t>(pos) < S3fsCurl::sseckeys.size(); pos++){
-      if(!DestroyCurlHandle()){
-        return result;
-      }
-      if(!PreHeadRequest(tpath, NULL, NULL, pos)){
-        return result;
-      }
-      if(0 == (result = RequestPerform())){
-        break;
-      }
+    // At first, try to get without SSE-C headers
+    if(!PreHeadRequest(tpath) || !fpLazySetup || !fpLazySetup(this) || 0 != (result = RequestPerform())){
+        // If has SSE-C keys, try to get with all SSE-C keys.
+        for(size_t pos = 0; pos < S3fsCurl::sseckeys.size(); pos++){
+            if(!DestroyCurlHandle()){
+                break;
+            }
+            if(!PreHeadRequest(tpath, NULL, NULL, pos)){
+                break;
+            }
+            if(!fpLazySetup || !fpLazySetup(this)){
+                S3FS_PRN_ERR("Failed to lazy setup in single head request.");
+                break;
+            }
+            if(0 == (result = RequestPerform())){
+                break;
+            }
+        }
+        if(0 != result){
+            DestroyCurlHandle();  // not check result.
+            return result;
+        }
     }
-    if(0 != result){
-      DestroyCurlHandle();  // not check result.
-      return result;
-    }
-  }
 
-  // file exists in s3
-  // fixme: clean this up.
-  meta.clear();
-  for(headers_t::iterator iter = responseHeaders.begin(); iter != responseHeaders.end(); ++iter){
-    string key   = lower(iter->first);
-    string value = iter->second;
-    if(key == "content-type"){
-      meta["Content-Type"] = value;
-    }else if(key == "content-length"){
-      meta["Content-Length"] = value;
-    }else if(key == "etag"){
-      meta["ETag"] = value;
-    }else if(key == "last-modified"){
-      meta["Last-Modified"] = value;
-    }else if(key.substr(0, 5) == "x-oss"){
-      meta[key] = value;		// key is lower case for "x-oss"
+    // file exists in s3
+    // fixme: clean this up.
+    meta.clear();
+    for(headers_t::iterator iter = responseHeaders.begin(); iter != responseHeaders.end(); ++iter){
+        std::string key   = lower(iter->first);
+        std::string value = iter->second;
+        if(key == "content-type"){
+            meta[iter->first] = value;
+        }else if(key == "content-length"){
+            meta[iter->first] = value;
+        }else if(key == "etag"){
+            meta[iter->first] = value;
+        }else if(key == "last-modified"){
+            meta[iter->first] = value;
+        }else if(is_prefix(key.c_str(), "x-oss")){
+            meta[key] = value;        // key is lower case for "x-oss"
+        }
     }
-  }
-  return 0;
+    return 0;
 }
 
 int S3fsCurl::PutHeadRequest(const char* tpath, headers_t& meta, bool is_copy)
 {
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
-  if(!tpath){
-    return -1;
-  }
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+    if(!tpath){
+        return -EINVAL;
+    }
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
 
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(tpath);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
 
-  // Make request headers
-  string ContentType;
-  for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
-    string key   = lower(iter->first);
-    string value = iter->second;
-    if(key == "content-type"){
-      ContentType    = value;
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key.substr(0, 9) == "x-oss-acl"){
-      // not set value, but after set it.
-    }else if(key.substr(0, 10) == "x-oss-meta"){
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key == "x-oss-copy-source"){
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key == "x-oss-server-side-encryption"){
-	  //XXX
-	  //requestHeaders = curl_slist_sort_insert(requestHeaders, string(key + ":" + value).c_str());
-      // Only copy mode.
-      if(is_copy && !AddSseRequestHead(SSE_OSS, value, false, true)){
-        S3FS_PRN_WARN("Failed to insert SSE-S3 header.");
-      }
-    }else if(key == "x-oss-server-side-encryption-customer-algorithm"){
-      // Only copy mode.
-      if(is_copy && !value.empty() && !AddSseRequestHead(SSE_KMS, value, false, true)){
-        S3FS_PRN_WARN("Failed to insert SSE-KMS header.");
-      }
-    }else if(key == "x-oss-server-side-encryption-customer-key-md5"){
-      // Only copy mode.
-      if(is_copy){
-        if(!AddSseRequestHead(SSE_C, value, true, true) || !AddSseRequestHead(SSE_C, value, true, false)){
-          S3FS_PRN_WARN("Failed to insert SSE-C header.");
+    std::string contype = S3fsCurl::LookupMimeType(std::string(tpath));
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
+
+    // Make request headers
+    for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
+        std::string key   = lower(iter->first);
+        std::string value = iter->second;
+        if(is_prefix(key.c_str(), "x-oss-acl")){
+            // not set value, but after set it.
+        }else if(is_prefix(key.c_str(), "x-oss-meta")){
+            requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
+        }else if(key == "x-oss-copy-source"){
+            requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
+        }else if(key == "x-oss-server-side-encryption" && value != "KMS"){
+            // Only copy mode.
+            if(is_copy && !AddSseRequestHead(sse_type_t::SSE_OSS, value, false, true)){
+                S3FS_PRN_WARN("Failed to insert SSE-OSS header.");
+            }
+        }else if(key == "x-oss-server-side-encryption-key-id"){
+            // Only copy mode.
+            if(is_copy && !value.empty() && !AddSseRequestHead(sse_type_t::SSE_KMS, value, false, true)){
+                S3FS_PRN_WARN("Failed to insert SSE-KMS header.");
+            }
+        }else if(key == "x-oss-server-side-encryption-customer-key-md5"){
+            // Only copy mode.
+            if(is_copy){
+                if(!AddSseRequestHead(sse_type_t::SSE_C, value, true, true) || !AddSseRequestHead(sse_type_t::SSE_C, value, true, false)){
+                    S3FS_PRN_WARN("Failed to insert SSE-C header.");
+                }
+            }
         }
-      }
     }
-  }
 
-  // "x-oss-acl", storage class, sse
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.c_str());
-  if(REDUCED_REDUNDANCY == GetStorageClass()){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", "REDUCED_REDUNDANCY");
-  } else if(STANDARD_IA == GetStorageClass()){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", "STANDARD_IA");
-  }
-  // SSE
-  if(!is_copy){
-    string ssevalue("");
-    if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
-      S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+    // "x-oss-acl", storage class, sse
+    if(S3fsCurl::default_acl != acl_t::PRIVATE){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.str());
     }
-  }
-  if(is_use_ahbe){
-    // set additional header by ahbe conf
-    requestHeaders = AdditionalHeader::get()->AddHeader(requestHeaders, tpath);
-  }
+    if(strcasecmp(GetStorageClass().c_str(), "STANDARD") != 0){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", GetStorageClass().c_str());
+    }
+    // SSE
+    if(!is_copy){
+        std::string ssevalue;
+        if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
+            S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+        }
+    }
+    if(is_use_ahbe){
+        // set additional header by ahbe conf
+        requestHeaders = AdditionalHeader::get()->AddHeader(requestHeaders, tpath);
+    }
 
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
+    op = "PUT";
+    type = REQTYPE_PUTHEAD;
 
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("PUT", "", ContentType, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){                // HTTP PUT
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0)){               // Content-Length
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
 
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);                // HTTP PUT
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0);               // Content-Length
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
+    S3FS_PRN_INFO3("copying... [path=%s]", tpath);
 
-  type = REQTYPE_PUTHEAD;
+    int result = RequestPerform();
+    result = MapPutErrorResponse(result);
+    bodydata.Clear();
 
-  S3FS_PRN_INFO3("copying... [path=%s]", tpath);
-
-  int result = RequestPerform();
-  delete bodydata;
-  bodydata = NULL;
-
-  return result;
+    return result;
 }
 
 int S3fsCurl::PutRequest(const char* tpath, headers_t& meta, int fd)
 {
-  struct stat st;
-  FILE*       file = NULL;
-  int         fd2;
+    struct stat st;
+    FILE*       file = NULL;
 
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
-  if(!tpath){
-    return -1;
-  }
-  if(-1 != fd){
-    // duplicate fd
-    if(-1 == (fd2 = dup(fd)) || -1 == fstat(fd2, &st) || 0 != lseek(fd2, 0, SEEK_SET) || NULL == (file = fdopen(fd2, "rb"))){
-      S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
-      if(-1 != fd2){
-        close(fd2);
-      }
-      return -errno;
+    if(!tpath){
+        return -EINVAL;
     }
-    b_infile = file;
-  }else{
-    // This case is creating zero byte obejct.(calling by create_file_object())
-    S3FS_PRN_INFO3("create zero byte file object.");
-  }
+    if(-1 != fd){
+        // duplicate fd
+        int fd2;
+        if(-1 == (fd2 = dup(fd)) || -1 == fstat(fd2, &st) || 0 != lseek(fd2, 0, SEEK_SET) || NULL == (file = fdopen(fd2, "rb"))){
+            S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
+            if(-1 != fd2){
+                close(fd2);
+            }
+            return -errno;
+        }
+        b_infile = file;
+    }else{
+        // This case is creating zero byte object.(calling by create_file_object())
+        S3FS_PRN_INFO3("create zero byte file object.");
+    }
 
-  if(!CreateCurlHandle(true)){
+    if(!CreateCurlHandle()){
+        if(file){
+            fclose(file);
+        }
+        return -EIO;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
+
+    // Make request headers
+    std::string strMD5;
+    if(S3fsCurl::is_content_md5){
+        if(-1 != fd){
+            strMD5 = s3fs_get_content_md5(fd);
+            if(0 == strMD5.length()){
+                S3FS_PRN_ERR("Failed to make MD5.");
+                return -EIO;
+            }
+        }else{
+            strMD5 = EMPTY_MD5_BASE64_HASH;
+        }
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-MD5", strMD5.c_str());
+    }
+
+    std::string contype = S3fsCurl::LookupMimeType(std::string(tpath));
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
+
+    for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
+        std::string key   = lower(iter->first);
+        std::string value = iter->second;
+        if(is_prefix(key.c_str(), "x-oss-acl")){
+            // not set value, but after set it.
+        }else if(is_prefix(key.c_str(), "x-oss-meta")){
+            requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
+        }else if(key == "x-oss-server-side-encryption" && value != "KMS"){
+            // skip this header, because this header is specified after logic.
+        }else if(key == "x-oss-server-side-encryption-key-id"){
+            // skip this header, because this header is specified after logic.
+        }else if(key == "x-oss-server-side-encryption-customer-key-md5"){
+            // skip this header, because this header is specified after logic.
+        }
+    }
+    // "x-oss-acl", storage class, sse
+    if(S3fsCurl::default_acl != acl_t::PRIVATE){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.str());
+    }
+    if(strcasecmp(GetStorageClass().c_str(), "STANDARD") != 0){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", GetStorageClass().c_str());
+    }
+    // SSE
+    std::string ssevalue;
+    // do not add SSE for create bucket
+    if(0 != strcmp(tpath, "/")){
+        if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
+            S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+        }
+    }
+    if(is_use_ahbe){
+        // set additional header by ahbe conf
+        requestHeaders = AdditionalHeader::get()->AddHeader(requestHeaders, tpath);
+    }
+
+    op = "PUT";
+    type = REQTYPE_PUT;
+
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){                // HTTP PUT
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
     if(file){
-      fclose(file);
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(st.st_size))){ // Content-Length
+            return -EIO;
+        }
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILE, file)){
+            return -EIO;
+        }
+    }else{
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0)){             // Content-Length: 0
+            return -EIO;
+        }
     }
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
-
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(tpath);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
-
-  // Make request headers
-  string strMD5;
-  if(-1 != fd && S3fsCurl::is_content_md5){
-    strMD5         = s3fs_get_content_md5(fd);
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-MD5", strMD5.c_str());
-  }
-
-  string ContentType;
-  for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
-    string key   = lower(iter->first);
-    string value = iter->second;
-    if(key == "content-type"){
-      ContentType    = value;
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key.substr(0, 9) == "x-oss-acl"){
-      // not set value, but after set it.
-    }else if(key.substr(0, 10) == "x-oss-meta"){
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key == "x-oss-server-side-encryption"){
-      // skip this header, because this header is specified after logic.
-    }else if(key == "x-oss-server-side-encryption-customer-algorithm"){
-      // skip this header, because this header is specified after logic.
-    }else if(key == "x-oss-server-side-encryption-customer-key-md5"){
-      // skip this header, because this header is specified after logic.
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
     }
-  }
-  // "x-oss-acl", storage class, sse
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.c_str());
-  if(REDUCED_REDUNDANCY == GetStorageClass()){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", "REDUCED_REDUNDANCY");
-  } else if(STANDARD_IA == GetStorageClass()){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", "STANDARD_IA");
-  }
-  // SSE
-  string ssevalue("");
-  if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
-    S3FS_PRN_WARN("Failed to set SSE header, but continue...");
-  }
-  if(is_use_ahbe){
-    // set additional header by ahbe conf
-    requestHeaders = AdditionalHeader::get()->AddHeader(requestHeaders, tpath);
-  }
 
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
+    S3FS_PRN_INFO3("uploading... [path=%s][fd=%d][size=%lld]", tpath, fd, static_cast<long long int>(-1 != fd ? st.st_size : 0));
 
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("PUT", strMD5, ContentType, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
-
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);                // HTTP PUT
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-  if(file){
-    curl_easy_setopt(hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(st.st_size)); // Content-Length
-    curl_easy_setopt(hCurl, CURLOPT_INFILE, file);
-  }else{
-    curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0);             // Content-Length: 0
-  }
-
-  type = REQTYPE_PUT;
-
-  S3FS_PRN_INFO3("uploading... [path=%s][fd=%d][size=%jd]", tpath, fd, (intmax_t)(-1 != fd ? st.st_size : 0));
-
-  int result = RequestPerform();
-  delete bodydata;
-  bodydata = NULL;
-  if(file){
-    fclose(file);
-  }
-
-  return result;
-}
-
-int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size, sse_type_t ssetype, string& ssevalue)
-{
-  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd]", SAFESTRPTR(tpath), (intmax_t)start, size);
-
-  if(!tpath || -1 == fd || 0 > start || 0 > size){
-    return -1;
-  }
-
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
-
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(tpath);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-
-  if(-1 != start && 0 < size){
-    string range = "bytes=";
-    range       += str(start);
-    range       += "-";
-    range       += str(start + size - 1);
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "Range", range.c_str());
-  }
-  // SSE
-  if(!AddSseRequestHead(ssetype, ssevalue, true, false)){
-    S3FS_PRN_WARN("Failed to set SSE header, but continue...");
-  }
-
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
-
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("GET", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
-
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, S3fsCurl::DownloadWriteCallback);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)this);
-
-  // set info for callback func.
-  // (use only fd, startpos and size, other member is not used.)
-  partdata.clear();
-  partdata.fd         = fd;
-  partdata.startpos   = start;
-  partdata.size       = size;
-  b_partdata_startpos = start;
-  b_partdata_size     = size;
-  b_ssetype           = ssetype;
-  b_ssevalue          = ssevalue;
-  b_ssekey_pos        = -1;         // not use this value for get object.
-
-  type = REQTYPE_GET;
-
-  return 0;
-}
-
-int S3fsCurl::GetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size)
-{
-  int result;
-
-  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd]", SAFESTRPTR(tpath), (intmax_t)start, size);
-
-  if(!tpath){
-    return -1;
-  }
-  sse_type_t ssetype;
-  string     ssevalue;
-  if(!get_object_sse_type(tpath, ssetype, ssevalue)){
-    S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
-  }
-
-  if(0 != (result = PreGetObjectRequest(tpath, fd, start, size, ssetype, ssevalue))){
+    int result = RequestPerform();
+    result = MapPutErrorResponse(result);
+    bodydata.Clear();
+    if(file){
+        fclose(file);
+    }
     return result;
-  }
-
-  S3FS_PRN_INFO3("downloading... [path=%s][fd=%d]", tpath, fd);
-
-  result = RequestPerform();
-  partdata.clear();
-
-  return result;
 }
 
-int S3fsCurl::CheckBucket(void)
+int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue)
 {
-  S3FS_PRN_INFO3("check a bucket.");
+    S3FS_PRN_INFO3("[tpath=%s][start=%lld][size=%lld]", SAFESTRPTR(tpath), static_cast<long long>(start), static_cast<long long>(size));
 
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-
-  std::string urlargs;
-  if(S3fsCurl::IsListObjectsV2()){
-    urlargs = "?list-type=2";
-  }
-  
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath("/").c_str(), resource, turl);
-
-  turl            += urlargs;
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath("/");
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
-
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("GET", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
-
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  //XXX
-  //curl_easy_setopt(hCurl, CURLOPT_FAILONERROR, true);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-
-  type = REQTYPE_CHKBUCKET;
-
-  int result = RequestPerform();
-  if (result != 0) {
-    S3FS_PRN_ERR("Check bucket failed, OSS response: %s", (bodydata ? bodydata->str() : ""));
-  }
-  return result;
-}
-
-int S3fsCurl::ListBucketRequest(const char* tpath, const char* query, string& signResource)
-{
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
-
-  if(!tpath){
-    return -1;
-  }
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource("", resource, turl);    // NOTICE: path is "".
-  if(query){
-    turl += "?";
-    turl += query;
-  }
-
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(tpath);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
-
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
-
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-    string sresource = resource + "/";
-    if (signResource != "") {
-      sresource += "?" + signResource;
+    if(!tpath || -1 == fd || 0 > start || 0 > size){
+        return -EINVAL;
     }
-    string Signature = CalcSignature("GET", "", "", date, sresource);
-    requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
 
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
 
-  type = REQTYPE_LISTBUCKET;
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
 
-  return RequestPerform();
+    if(0 < size){
+        std::string range = "bytes=";
+        range       += str(start);
+        range       += "-";
+        range       += str(start + size - 1);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Range", range.c_str());
+    }
+    // SSE
+    if(!AddSseRequestHead(ssetype, ssevalue, true, false)){
+        S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+    }
+
+    op = "GET";
+    type = REQTYPE_GET;
+
+    // set lazy function
+    fpLazySetup = PreGetObjectRequestSetCurlOpts;
+
+    // set info for callback func.
+    // (use only fd, startpos and size, other member is not used.)
+    partdata.clear();
+    partdata.fd         = fd;
+    partdata.startpos   = start;
+    partdata.size       = size;
+    b_partdata_startpos = start;
+    b_partdata_size     = size;
+    b_ssetype           = ssetype;
+    b_ssevalue          = ssevalue;
+    b_ssekey_pos        = -1;         // not use this value for get object.
+
+    return 0;
+}
+
+int S3fsCurl::GetObjectRequest(const char* tpath, int fd, off_t start, off_t size)
+{
+    int result;
+
+    S3FS_PRN_INFO3("[tpath=%s][start=%lld][size=%lld]", SAFESTRPTR(tpath), static_cast<long long>(start), static_cast<long long>(size));
+
+    if(!tpath){
+        return -EINVAL;
+    }
+    sse_type_t ssetype = sse_type_t::SSE_DISABLE;
+    std::string ssevalue;
+    if(!get_object_sse_type(tpath, ssetype, ssevalue)){
+        S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
+    }
+
+    if(0 != (result = PreGetObjectRequest(tpath, fd, start, size, ssetype, ssevalue))){
+        return result;
+    }
+    if(!fpLazySetup || !fpLazySetup(this)){
+        S3FS_PRN_ERR("Failed to lazy setup in single get object request.");
+        return -EIO;
+    }
+
+    S3FS_PRN_INFO3("downloading... [path=%s][fd=%d]", tpath, fd);
+
+    result = RequestPerform();
+    partdata.clear();
+
+    return result;
+}
+
+int S3fsCurl::CheckBucket()
+{
+    S3FS_PRN_INFO3("check a bucket.");
+
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+    std::string urlargs;
+    if(S3fsCurl::IsListObjectsV2()){
+        query_string = "list-type=2";
+        urlargs = "?" + query_string;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource("/", resource, turl);
+
+    turl           += urlargs;
+    url             = prepare_url(turl.c_str());
+    path            = "/";  // Only check the presence of the bucket, not the entire virtual path.
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
+
+    op = "GET";
+    type = REQTYPE_CHKBUCKET;
+
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UNRESTRICTED_AUTH, 1L)){
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
+
+    int result = RequestPerform();
+    if (result != 0) {
+        S3FS_PRN_ERR("Check bucket failed, OSS response: %s", bodydata.str());
+    }
+    return result;
+}
+
+int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
+{
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
+
+    if(!tpath){
+        return -EINVAL;
+    }
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource("", resource, turl);    // NOTICE: path is "".
+    if(query){
+        turl += "?";
+        turl += query;
+        query_string = query;
+    }
+
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
+
+    op = "GET";
+    type = REQTYPE_LISTBUCKET;
+
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(S3fsCurl::is_verbose){
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_DEBUGFUNCTION, S3fsCurl::CurlDebugBodyInFunc)){     // replace debug function
+            return -EIO;
+        }
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
+
+    return RequestPerform();
 }
 
 //
@@ -2716,294 +3576,299 @@ int S3fsCurl::ListBucketRequest(const char* tpath, const char* query, string& si
 //   POST /example-object?uploads HTTP/1.1
 //   Host: example-bucket.oss-cn-hangzhou.aliyuncs.com
 //   Date: Mon, 1 Nov 2010 20:34:56 GMT
-//   Authorization: OSS VGhpcyBtZXNzYWdlIHNpZ25lZCBieSBlbHZpbmc=
+//   Authorization: AWS VGhpcyBtZXNzYWdlIHNpZ25lZCBieSBlbHZpbmc=
 //
-int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, string& upload_id, bool is_copy)
+int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, std::string& upload_id, bool is_copy)
 {
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
-  if(!tpath){
-    return -1;
-  }
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+    if(!tpath){
+        return -EINVAL;
+    }
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
 
-  string query_string = "uploads";
-  //XXX
-  //query_string += "=";
-  turl          += "?" + query_string;
-  resource      += "?" + query_string;
-  url            = prepare_url(turl.c_str());
-  path           = get_realpath(tpath);
-  requestHeaders = NULL;
-  bodydata       = new BodyData();
-  responseHeaders.clear();
+    query_string   = "uploads";
+    turl          += "?" + query_string;
+    url            = prepare_url(turl.c_str());
+    path           = get_realpath(tpath);
+    requestHeaders = NULL;
+    bodydata.Clear();
+    responseHeaders.clear();
 
-  string contype = S3fsCurl::LookupMimeType(string(tpath));
+    std::string contype = S3fsCurl::LookupMimeType(std::string(tpath));
 
-  for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
-    string key   = lower(iter->first);
-    string value = iter->second;
-    if(key.substr(0, 9) == "x-oss-acl"){
-      // not set value, but after set it.
-    }else if(key.substr(0, 10) == "x-oss-meta"){
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key == "x-oss-server-side-encryption"){
-      // Only copy mode.
-      if(is_copy && !AddSseRequestHead(SSE_OSS, value, false, true)){
-        S3FS_PRN_WARN("Failed to insert SSE-S3 header.");
-      }
-    }else if(key == "x-oss-server-side-encryption-customer-algorithm"){
-      // Only copy mode.
-      if(is_copy && !value.empty() && !AddSseRequestHead(SSE_KMS, value, false, true)){
-        S3FS_PRN_WARN("Failed to insert SSE-KMS header.");
-      }
-    }else if(key == "x-oss-server-side-encryption-customer-key-md5"){
-      // Only copy mode.
-      if(is_copy){
-        if(!AddSseRequestHead(SSE_C, value, true, true) || !AddSseRequestHead(SSE_C, value, true, false)){
-          S3FS_PRN_WARN("Failed to insert SSE-C header.");
+    for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
+        std::string key   = lower(iter->first);
+        std::string value = iter->second;
+        if(is_prefix(key.c_str(), "x-oss-acl")){
+            // not set value, but after set it.
+        }else if(is_prefix(key.c_str(), "x-oss-meta")){
+            requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
+        }else if(key == "x-oss-server-side-encryption" && value != "KMS"){
+            // Only copy mode.
+            if(is_copy && !AddSseRequestHead(sse_type_t::SSE_OSS, value, false, true)){
+                S3FS_PRN_WARN("Failed to insert SSE-OSS header.");
+            }
+        }else if(key == "x-oss-server-side-encryption-key-id"){
+            // Only copy mode.
+            if(is_copy && !value.empty() && !AddSseRequestHead(sse_type_t::SSE_KMS, value, false, true)){
+                S3FS_PRN_WARN("Failed to insert SSE-KMS header.");
+            }
+        }else if(key == "x-oss-server-side-encryption-customer-key-md5"){
+            // Only copy mode.
+            if(is_copy){
+                if(!AddSseRequestHead(sse_type_t::SSE_C, value, true, true) || !AddSseRequestHead(sse_type_t::SSE_C, value, true, false)){
+                    S3FS_PRN_WARN("Failed to insert SSE-C header.");
+                }
+            }
         }
-      }
     }
-  }
-  // "x-oss-acl", storage class, sse
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.c_str());
-  if(REDUCED_REDUNDANCY == GetStorageClass()){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", "REDUCED_REDUNDANCY");
-  } else if(STANDARD_IA == GetStorageClass()){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", "STANDARD_IA");
-  }
-  // SSE
-  if(!is_copy){
-    string ssevalue("");
-    if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
-      S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+    // "x-oss-acl", storage class, sse
+    if(S3fsCurl::default_acl != acl_t::PRIVATE){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.str());
     }
-  }
-  if(is_use_ahbe){
-    // set additional header by ahbe conf
-    requestHeaders = AdditionalHeader::get()->AddHeader(requestHeaders, tpath);
-  }
+    if(strcasecmp(GetStorageClass().c_str(), "STANDARD") != 0){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", GetStorageClass().c_str());
+    }
+    // SSE
+    if(!is_copy){
+        std::string ssevalue;
+        if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
+            S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+        }
+    }
+    if(is_use_ahbe){
+        // set additional header by ahbe conf
+        requestHeaders = AdditionalHeader::get()->AddHeader(requestHeaders, tpath);
+    }
 
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Length", NULL);
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
 
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("POST", "", contype, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
+    op = "POST";
+    type = REQTYPE_PREMULTIPOST;
 
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_POST, true);              // POST
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, 0);
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POST, true)){              // POST
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, 0)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0)){           // Content-Length
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
 
-  type = REQTYPE_PREMULTIPOST;
+    // request
+    int result;
+    if(0 != (result = RequestPerform())){
+        bodydata.Clear();
+        return result;
+    }
 
-  // request
-  int result;
-  if(0 != (result = RequestPerform())){
-    delete bodydata;
-    bodydata = NULL;
+    if(!simple_parse_xml(bodydata.str(), bodydata.size(), "UploadId", upload_id)){
+        bodydata.Clear();
+        return -EIO;
+    }
+
+    bodydata.Clear();
+    return 0;
+}
+
+int S3fsCurl::CompleteMultipartPostRequest(const char* tpath, const std::string& upload_id, etaglist_t& parts)
+{
+    S3FS_PRN_INFO3("[tpath=%s][parts=%zu]", SAFESTRPTR(tpath), parts.size());
+
+    if(!tpath){
+        return -EINVAL;
+    }
+
+    // make contents
+    std::string postContent;
+    postContent += "<CompleteMultipartUpload>\n";
+    for(etaglist_t::iterator it = parts.begin(); it != parts.end(); ++it){
+        if(it->etag.empty()){
+            S3FS_PRN_ERR("%d file part is not finished uploading.", it->part_num);
+            return -EIO;
+        }
+        postContent += "<Part>\n";
+        postContent += "  <PartNumber>" + str(it->part_num) + "</PartNumber>\n";
+        postContent += "  <ETag>" + it->etag + "</ETag>\n";
+        postContent += "</Part>\n";
+    }
+    postContent += "</CompleteMultipartUpload>\n";
+
+    // set postdata
+    postdata             = reinterpret_cast<const unsigned char*>(postContent.c_str());
+    b_postdata           = postdata;
+    postdata_remaining   = postContent.size(); // without null
+    b_postdata_remaining = postdata_remaining;
+
+    if(!CreateCurlHandle()){
+        postdata   = NULL;
+        b_postdata = NULL;
+        return -EIO;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+
+    query_string         = "uploadId=" + upload_id;
+    turl                += "?" + query_string;
+    url                  = prepare_url(turl.c_str());
+    path                 = get_realpath(tpath);
+    requestHeaders       = NULL;
+    bodydata.Clear();
+    responseHeaders.clear();
+    std::string contype  = "application/xml";
+
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
+
+    op = "POST";
+    type = REQTYPE_COMPLETEMULTIPOST;
+
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POST, true)){              // POST
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, static_cast<curl_off_t>(postdata_remaining))){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::ReadCallback)){
+        return -EIO;
+    }
+    if(S3fsCurl::is_verbose){
+        if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_DEBUGFUNCTION, S3fsCurl::CurlDebugBodyOutFunc)){     // replace debug function
+            return -EIO;
+        }
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
+
+    // request
+    int result = RequestPerform();
+    bodydata.Clear();
+    postdata   = NULL;
+    b_postdata = NULL;
+
     return result;
-  }
-
-  // Parse XML body for UploadId
-  if(!S3fsCurl::GetUploadId(upload_id)){
-    delete bodydata;
-    bodydata = NULL;
-    return -1;
-  }
-
-  delete bodydata;
-  bodydata = NULL;
-  return 0;
 }
 
-int S3fsCurl::CompleteMultipartPostRequest(const char* tpath, string& upload_id, etaglist_t& parts)
+int S3fsCurl::MultipartListRequest(std::string& body)
 {
-  S3FS_PRN_INFO3("[tpath=%s][parts=%zu]", SAFESTRPTR(tpath), parts.size());
+    S3FS_PRN_INFO3("list request(multipart)");
 
-  if(!tpath){
-    return -1;
-  }
-
-  // make contents
-  string postContent;
-  postContent += "<CompleteMultipartUpload>\n";
-  for(int cnt = 0; cnt < (int)parts.size(); cnt++){
-    if(0 == parts[cnt].length()){
-      S3FS_PRN_ERR("%d file part is not finished uploading.", cnt + 1);
-      return -1;
+    if(!CreateCurlHandle()){
+        return -EIO;
     }
-    postContent += "<Part>\n";
-    postContent += "  <PartNumber>" + str(cnt + 1) + "</PartNumber>\n";
-    postContent += "  <ETag>\""     + upper(parts[cnt])   + "\"</ETag>\n";
-    postContent += "</Part>\n";
-  }  
-  postContent += "</CompleteMultipartUpload>\n";
+    std::string resource;
+    std::string turl;
+    path            = get_realpath("/");
+    MakeUrlResource(path.c_str(), resource, turl);
 
-  // set postdata
-  postdata             = reinterpret_cast<const unsigned char*>(postContent.c_str());
-  b_postdata           = postdata;
-  postdata_remaining   = postContent.size(); // without null
-  b_postdata_remaining = postdata_remaining;
+    query_string    = "uploads";
+    turl           += "?" + query_string;
+    url             = prepare_url(turl.c_str());
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
 
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
 
-  string query_string  = "uploadId=" + upload_id;
-  turl                += "?" + query_string;
-  resource            += "?" + query_string;
-  url                  = prepare_url(turl.c_str());
-  path                 = get_realpath(tpath);
-  requestHeaders       = NULL;
-  bodydata             = new BodyData();
-  responseHeaders.clear();
-  string contype       = S3fsCurl::LookupMimeType(string(tpath));
+    op = "GET";
+    type = REQTYPE_MULTILIST;
 
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
 
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("POST", "", contype, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
+    int result;
+    if(0 == (result = RequestPerform()) && 0 < bodydata.size()){
+        body = bodydata.str();
+    }else{
+        body = "";
+    }
+    bodydata.Clear();
 
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-  curl_easy_setopt(hCurl, CURLOPT_POST, true);              // POST
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_POSTFIELDSIZE, static_cast<curl_off_t>(postdata_remaining));
-  curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this);
-  curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::ReadCallback);
-
-  type = REQTYPE_COMPLETEMULTIPOST;
-
-  // request
-  int result = RequestPerform();
-  delete bodydata;
-  bodydata = NULL;
-  postdata = NULL;
-
-  return result;
+    return result;
 }
 
-int S3fsCurl::MultipartListRequest(string& body)
+int S3fsCurl::AbortMultipartUpload(const char* tpath, const std::string& upload_id)
 {
-  S3FS_PRN_INFO3("list request(multipart)");
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  path            = get_realpath("/");
-  MakeUrlResource(path.c_str(), resource, turl);
+    if(!tpath){
+        return -EINVAL;
+    }
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
 
-  turl           += "?uploads";
-  resource       += "?uploads";
-  url             = prepare_url(turl.c_str());
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
+    query_string    = "uploadId=" + upload_id;
+    turl           += "?" + query_string;
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
 
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
+    op = "DELETE";
+    type = REQTYPE_ABORTMULTIUPLOAD;
 
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("GET", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE")){
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
 
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-
-  type = REQTYPE_MULTILIST;
-
-  int result;
-  if(0 == (result = RequestPerform()) && 0 < bodydata->size()){
-    body = bodydata->str();
-  }else{
-    body = "";
-  }
-  delete bodydata;
-  bodydata = NULL;
-
-  return result;
-}
-
-int S3fsCurl::AbortMultipartUpload(const char* tpath, string& upload_id)
-{
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
-
-  if(!tpath){
-    return -1;
-  }
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
-
-  turl           += "?uploadId=" + upload_id;
-  resource       += "?uploadId=" + upload_id;
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(tpath);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("DELETE", "", "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
-
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_CUSTOMREQUEST, "DELETE");
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-
-  type = REQTYPE_ABORTMULTIUPLOAD;
-
-  return RequestPerform();
+    return RequestPerform();
 }
 
 //
@@ -3018,1105 +3883,457 @@ int S3fsCurl::AbortMultipartUpload(const char* tpath, string& upload_id)
 // Date:  Mon, 1 Nov 2010 20:34:56 GMT
 // Content-Length: 10485760
 // Content-MD5: pUNXr/BjKK5G2UKvaRRrOA==
-// Authorization: OSS VGhpcyBtZXNzYWdlIHNpZ25lZGGieSRlbHZpbmc=
+// Authorization: AWS VGhpcyBtZXNzYWdlIHNpZ25lZGGieSRlbHZpbmc=
 //
-
-int S3fsCurl::UploadMultipartPostSetup(const char* tpath, int part_num, string& upload_id)
+int S3fsCurl::UploadMultipartPostSetup(const char* tpath, int part_num, const std::string& upload_id)
 {
-  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd][part=%d]", SAFESTRPTR(tpath), (intmax_t)(partdata.startpos), partdata.size, part_num);
+    S3FS_PRN_INFO3("[tpath=%s][start=%lld][size=%lld][part=%d]", SAFESTRPTR(tpath), static_cast<long long int>(partdata.startpos), static_cast<long long int>(partdata.size), part_num);
 
-  if(-1 == partdata.fd || -1 == partdata.startpos || -1 == partdata.size){
-    return -1;
-  }
-
-  // make md5 and file pointer
-  unsigned char *md5raw = s3fs_md5hexsum(partdata.fd, partdata.startpos, partdata.size);
-  if(md5raw == NULL){
-    S3FS_PRN_ERR("Could not make md5 for file(part %d)", part_num);
-    return -1;
-  }
-  partdata.etag = s3fs_hex(md5raw, get_md5_digest_length());
-  char* md5base64p = s3fs_base64(md5raw, get_md5_digest_length());
-  std::string md5base64 = md5base64p;
-  free(md5base64p);
-  free(md5raw);
-
-  // create handle
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-
-  // make request
-  string request_uri = "partNumber=" + str(part_num) + "&uploadId=" + upload_id;
-  string urlargs     = "?" + request_uri;
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
-
-  resource          += urlargs;
-  turl              += urlargs;
-  url                = prepare_url(turl.c_str());
-  path               = get_realpath(tpath);
-  requestHeaders     = NULL;
-  bodydata           = new BodyData();
-  headdata           = new BodyData();
-  responseHeaders.clear();
-
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
-
-  string strMD5;
-  if(S3fsCurl::is_content_md5){
-	  strMD5 = md5base64;
-	  requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-MD5", strMD5.c_str());
-  }
-
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("PUT", strMD5, "", date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
-
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);              // HTTP PUT
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)headdata);
-  curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(partdata.size)); // Content-Length
-  curl_easy_setopt(hCurl, CURLOPT_READFUNCTION, S3fsCurl::UploadReadCallback);
-  curl_easy_setopt(hCurl, CURLOPT_READDATA, (void*)this);
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-
-  type = REQTYPE_UPLOADMULTIPOST;
-
-  return 0;
-}
-
-int S3fsCurl::UploadMultipartPostRequest(const char* tpath, int part_num, string& upload_id)
-{
-  int result;
-
-  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd][part=%d]", SAFESTRPTR(tpath), (intmax_t)(partdata.startpos), partdata.size, part_num);
-
-  // setup
-  if(0 != (result = S3fsCurl::UploadMultipartPostSetup(tpath, part_num, upload_id))){
-    return result;
-  }
-
-  // request
-  if(0 == (result = RequestPerform())){
-    // check etag
-	// oss's etag is upper case.
-    if(NULL != strstr(headdata->str(), upper(partdata.etag).c_str())){
-      partdata.uploaded = true;
-    }else{
-      result = -1;
+    if(-1 == partdata.fd || -1 == partdata.startpos || -1 == partdata.size){
+        return -EINVAL;
     }
-  }
 
-  // closing
-  delete bodydata;
-  bodydata = NULL;
-  delete headdata;
-  headdata = NULL;
+    requestHeaders = NULL;
 
-  return result;
-}
-
-int S3fsCurl::CopyMultipartPostRequest(const char* from, const char* to, int part_num, string& upload_id, headers_t& meta)
-{
-  S3FS_PRN_INFO3("[from=%s][to=%s][part=%d]", SAFESTRPTR(from), SAFESTRPTR(to), part_num);
-
-  if(!from || !to){
-    return -1;
-  }
-  if(!CreateCurlHandle(true)){
-    return -1;
-  }
-  string urlargs  = "?partNumber=" + str(part_num) + "&uploadId=" + upload_id;
-  string resource;
-  string turl;
-  MakeUrlResource(get_realpath(to).c_str(), resource, turl);
-
-  resource       += urlargs;
-  turl           += urlargs;
-  url             = prepare_url(turl.c_str());
-  path            = get_realpath(to);
-  requestHeaders  = NULL;
-  responseHeaders.clear();
-  bodydata        = new BodyData();
-  headdata        = new BodyData();
-
-  // Make request headers
-  string ContentType;
-  for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
-    string key   = lower(iter->first);
-    string value = iter->second;
-    if(key == "content-type"){
-      ContentType    = value;
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key == "x-oss-copy-source"){
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }else if(key == "x-oss-copy-source-range"){
-      requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
-    }
-    // NOTICE: x-oss-acl, x-oss-server-side-encryption is not set!
-  }
-
-  string date    = get_date_rfc850();
-  requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
-
-  if (S3fsCurl::IsRequesterPays()) {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
-  }
-  if(!S3fsCurl::IsPublicBucket()){
-	  string Signature = CalcSignature("PUT", "", ContentType, date, resource);
-	  requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("OSS " + OSSAccessKeyId + ":" + Signature).c_str());
-  }
-
-  // setopt
-  curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true);                // HTTP PUT
-  curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)bodydata);
-  curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)headdata);
-  curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0);               // Content-Length
-  curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
-
-  type = REQTYPE_COPYMULTIPOST;
-
-  // request
-  S3FS_PRN_INFO3("copying... [from=%s][to=%s][part=%d]", from, to, part_num);
-
-  int result = RequestPerform();
-  if(0 == result){
-    // parse ETag from response
-    xmlDocPtr doc;
-    if(NULL == (doc = xmlReadMemory(bodydata->str(), bodydata->size(), "", NULL, 0))){
-      return result;
-    }
-    if(NULL == doc->children){
-      S3FS_XMLFREEDOC(doc);
-      return result;
-    }
-    for(xmlNodePtr cur_node = doc->children->children; NULL != cur_node; cur_node = cur_node->next){
-      if(XML_ELEMENT_NODE == cur_node->type){
-        string elementName = reinterpret_cast<const char*>(cur_node->name);
-        if(cur_node->children){
-          if(XML_TEXT_NODE == cur_node->children->type){
-            if(elementName == "ETag") {
-              string etag = reinterpret_cast<const char *>(cur_node->children->content);
-              if(etag.size() >= 2 && *etag.begin() == '"' && *etag.rbegin() == '"'){
-                etag.assign(etag.substr(1, etag.size() - 2));
-              }
-              partdata.etag.assign(etag);
-              partdata.uploaded = true;
-            }
-          }
+    // make md5 and file pointer
+    if(S3fsCurl::is_content_md5){
+        unsigned char *md5raw = s3fs_md5_fd(partdata.fd, partdata.startpos, partdata.size);
+        if(md5raw == NULL){
+            S3FS_PRN_ERR("Could not make md5 for file(part %d)", part_num);
+            return -EIO;
         }
-      }
+        partdata.etag = s3fs_hex_lower(md5raw, get_md5_digest_length());
+        char* md5base64p = s3fs_base64(md5raw, get_md5_digest_length());
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-MD5", md5base64p);
+        delete[] md5base64p;
+        delete[] md5raw;
     }
-    S3FS_XMLFREEDOC(doc);
-  }
 
-  delete bodydata;
-  bodydata = NULL;
-  delete headdata;
-  headdata = NULL;
+    // make request
+    query_string        = "partNumber=" + str(part_num) + "&uploadId=" + upload_id;
+    std::string urlargs = "?" + query_string;
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
 
-  return result;
+    turl              += urlargs;
+    url                = prepare_url(turl.c_str());
+    path               = get_realpath(tpath);
+    bodydata.Clear();
+    headdata.Clear();
+    responseHeaders.clear();
+
+    // SSE
+    if(sse_type_t::SSE_C == S3fsCurl::GetSseType()){
+        std::string ssevalue;
+        if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
+            S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+        }
+    }
+
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
+
+    op = "PUT";
+    type = REQTYPE_UPLOADMULTIPOST;
+
+    // set lazy function
+    fpLazySetup = UploadMultipartPostSetCurlOpts;
+
+    return 0;
+}
+
+int S3fsCurl::UploadMultipartPostRequest(const char* tpath, int part_num, const std::string& upload_id)
+{
+    int result;
+
+    S3FS_PRN_INFO3("[tpath=%s][start=%lld][size=%lld][part=%d]", SAFESTRPTR(tpath), static_cast<long long int>(partdata.startpos), static_cast<long long int>(partdata.size), part_num);
+
+    // setup
+    if(0 != (result = S3fsCurl::UploadMultipartPostSetup(tpath, part_num, upload_id))){
+        return result;
+    }
+
+    if(!fpLazySetup || !fpLazySetup(this)){
+        S3FS_PRN_ERR("Failed to lazy setup in multipart upload post request.");
+        return -EIO;
+    }
+
+    // request
+    if(0 == (result = RequestPerform())){
+        // UploadMultipartPostComplete returns true on success -> convert to 0
+        result = !UploadMultipartPostComplete();
+    }
+
+    // closing
+    bodydata.Clear();
+    headdata.Clear();
+
+    return result;
+}
+
+int S3fsCurl::CopyMultipartPostSetup(const char* from, const char* to, int part_num, const std::string& upload_id, headers_t& meta)
+{
+    S3FS_PRN_INFO3("[from=%s][to=%s][part=%d]", SAFESTRPTR(from), SAFESTRPTR(to), part_num);
+
+    if(!from || !to){
+        return -EINVAL;
+    }
+    query_string = "partNumber=" + str(part_num) + "&uploadId=" + upload_id;
+    std::string urlargs = "?" + query_string;
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(to).c_str(), resource, turl);
+
+    turl           += urlargs;
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(to);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.Clear();
+    headdata.Clear();
+
+    std::string contype = S3fsCurl::LookupMimeType(std::string(to));
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
+
+    // Make request headers
+    for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
+        std::string key   = lower(iter->first);
+        std::string value = iter->second;
+        if(key == "x-oss-copy-source"){
+            requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
+        }else if(key == "x-oss-copy-source-range"){
+            requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
+        }
+        // NOTICE: x-oss-acl, x-oss-server-side-encryption is not set!
+    }
+
+    op = "PUT";
+    type = REQTYPE_COPYMULTIPOST;
+
+    // set lazy function
+    fpLazySetup = CopyMultipartPostSetCurlOpts;
+
+    // request
+    S3FS_PRN_INFO3("copying... [from=%s][to=%s][part=%d]", from, to, part_num);
+
+    return 0;
+}
+
+bool S3fsCurl::UploadMultipartPostComplete()
+{
+    headers_t::iterator it = responseHeaders.find("ETag");
+    if (it == responseHeaders.end()) {
+        return false;
+    }
+
+    // check etag(md5);
+    //
+    // The ETAG when using SSE_C and SSE_KMS does not reflect the MD5 we sent  
+    // SSE_C: https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPUT.html
+    // SSE_KMS is ignored in the above, but in the following it states the same in the highlights:  
+    // https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingKMSEncryption.html
+    //
+    if(S3fsCurl::is_content_md5 && sse_type_t::SSE_C != S3fsCurl::GetSseType() && sse_type_t::SSE_KMS != S3fsCurl::GetSseType()){
+        if(!etag_equals(it->second, partdata.etag)){
+            return false;
+        }
+    }
+    partdata.petag->etag = it->second;
+    partdata.uploaded = true;
+
+    return true;
+}
+
+bool S3fsCurl::CopyMultipartPostCallback(S3fsCurl* s3fscurl)
+{
+    if(!s3fscurl){
+        return false;
+    }
+
+    return s3fscurl->CopyMultipartPostComplete();
+}
+
+bool S3fsCurl::CopyMultipartPostComplete()
+{
+    std::string etag;
+    partdata.uploaded = simple_parse_xml(bodydata.str(), bodydata.size(), "ETag", etag);
+    if(etag.size() >= 2 && *etag.begin() == '"' && *etag.rbegin() == '"'){
+        etag.erase(etag.size() - 1);
+        etag.erase(0, 1);
+    }
+    partdata.petag->etag = etag;
+
+    bodydata.Clear();
+    headdata.Clear();
+
+    return true;
+}
+
+bool S3fsCurl::MixMultipartPostComplete()
+{
+    bool result;
+    if(-1 == partdata.fd){
+        result = CopyMultipartPostComplete();
+    }else{
+        result = UploadMultipartPostComplete();
+    }
+    return result;
 }
 
 int S3fsCurl::MultipartHeadRequest(const char* tpath, off_t size, headers_t& meta, bool is_copy)
 {
-  int            result;
-  string         upload_id;
-  off_t          chunk;
-  off_t          bytes_remaining;
-  etaglist_t     list;
-  stringstream   strrange;
+    int            result;
+    std::string    upload_id;
+    off_t          chunk;
+    off_t          bytes_remaining;
+    etaglist_t     list;
 
-  S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
+    S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));
 
-  if(0 != (result = PreMultipartPostRequest(tpath, meta, upload_id, is_copy))){
-    return result;
-  }
-  DestroyCurlHandle();
-
-  for(bytes_remaining = size, chunk = 0; 0 < bytes_remaining; bytes_remaining -= chunk){
-    chunk = bytes_remaining > MAX_MULTI_COPY_SOURCE_SIZE ? MAX_MULTI_COPY_SOURCE_SIZE : bytes_remaining;
-
-    strrange << "bytes=" << (size - bytes_remaining) << "-" << (size - bytes_remaining + chunk - 1);
-    meta["x-oss-copy-source-range"] = strrange.str();
-    strrange.str("");
-    strrange.clear(stringstream::goodbit);
-
-    if(0 != (result = CopyMultipartPostRequest(tpath, tpath, (list.size() + 1), upload_id, meta))){
-      return result;
+    if(0 != (result = PreMultipartPostRequest(tpath, meta, upload_id, is_copy))){
+        return result;
     }
-    list.push_back(partdata.etag);
     DestroyCurlHandle();
-  }
 
-  if(0 != (result = CompleteMultipartPostRequest(tpath, upload_id, list))){
-    return result;
-  }
-  return 0;
+    // Initialize S3fsMultiCurl
+    S3fsMultiCurl curlmulti(GetMaxParallelCount());
+    curlmulti.SetSuccessCallback(S3fsCurl::CopyMultipartPostCallback);
+    curlmulti.SetRetryCallback(S3fsCurl::CopyMultipartPostRetryCallback);
+
+    for(bytes_remaining = size, chunk = 0; 0 < bytes_remaining; bytes_remaining -= chunk){
+        chunk = bytes_remaining > GetMultipartCopySize() ? GetMultipartCopySize() : bytes_remaining;
+
+        std::ostringstream strrange;
+        strrange << "bytes=" << (size - bytes_remaining) << "-" << (size - bytes_remaining + chunk - 1);
+        meta["x-oss-copy-source-range"] = strrange.str();
+
+        // s3fscurl sub object
+        S3fsCurl* s3fscurl_para = new S3fsCurl(true);
+        s3fscurl_para->b_from   = SAFESTRPTR(tpath);
+        s3fscurl_para->b_meta   = meta;
+        s3fscurl_para->partdata.add_etag_list(list);
+
+        // initiate upload part for parallel
+        if(0 != (result = s3fscurl_para->CopyMultipartPostSetup(tpath, tpath, s3fscurl_para->partdata.get_part_number(), upload_id, meta))){
+            S3FS_PRN_ERR("failed uploading part setup(%d)", result);
+            delete s3fscurl_para;
+            return result;
+        }
+
+        // set into parallel object
+        if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
+            S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
+            delete s3fscurl_para;
+            return -EIO;
+        }
+    }
+
+    // Multi request
+    if(0 != (result = curlmulti.Request())){
+        S3FS_PRN_ERR("error occurred in multi request(errno=%d).", result);
+
+        S3fsCurl s3fscurl_abort(true);
+        int result2 = s3fscurl_abort.AbortMultipartUpload(tpath, upload_id);
+        s3fscurl_abort.DestroyCurlHandle();
+        if(result2 != 0){
+            S3FS_PRN_ERR("error aborting multipart upload(errno=%d).", result2);
+        }
+        return result;
+    }
+
+    if(0 != (result = CompleteMultipartPostRequest(tpath, upload_id, list))){
+        return result;
+    }
+    return 0;
 }
 
-int S3fsCurl::MultipartUploadRequest(const char* tpath, headers_t& meta, int fd, bool is_copy)
+int S3fsCurl::MultipartUploadRequest(const std::string& upload_id, const char* tpath, int fd, off_t offset, off_t size, etagpair* petagpair)
 {
-  int            result;
-  string         upload_id;
-  struct stat    st;
-  int            fd2;
-  etaglist_t     list;
-  off_t          remaining_bytes;
-  off_t          chunk;
+    S3FS_PRN_INFO3("[upload_id=%s][tpath=%s][fd=%d][offset=%lld][size=%lld]", upload_id.c_str(), SAFESTRPTR(tpath), fd, static_cast<long long int>(offset), static_cast<long long int>(size));
 
-  S3FS_PRN_INFO3("[tpath=%s][fd=%d]", SAFESTRPTR(tpath), fd);
-
-  // duplicate fd
-  if(-1 == (fd2 = dup(fd)) || 0 != lseek(fd2, 0, SEEK_SET)){
-    S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
-    if(-1 != fd2){
-      close(fd2);
+    // duplicate fd
+    int fd2;
+    if(-1 == (fd2 = dup(fd)) || 0 != lseek(fd2, 0, SEEK_SET)){
+        S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
+        if(-1 != fd2){
+            close(fd2);
+        }
+        return -errno;
     }
-    return -errno;
-  }
-  if(-1 == fstat(fd2, &st)){
-    S3FS_PRN_ERR("Invalid file descriptor(errno=%d)", errno);
-    close(fd2);
-    return -errno;
-  }
-
-  if(0 != (result = PreMultipartPostRequest(tpath, meta, upload_id, is_copy))){
-    close(fd2);
-    return result;
-  }
-  DestroyCurlHandle();
-
-  // cycle through open fd, pulling off 10MB chunks at a time
-  for(remaining_bytes = st.st_size; 0 < remaining_bytes; remaining_bytes -= chunk){
-    // chunk size
-    chunk = remaining_bytes > S3fsCurl::multipart_size ? S3fsCurl::multipart_size : remaining_bytes;
 
     // set
     partdata.fd         = fd2;
-    partdata.startpos   = st.st_size - remaining_bytes;
-    partdata.size       = chunk;
+    partdata.startpos   = offset;
+    partdata.size       = size;
     b_partdata_startpos = partdata.startpos;
     b_partdata_size     = partdata.size;
+    partdata.set_etag(petagpair);
 
     // upload part
-    if(0 != (result = UploadMultipartPostRequest(tpath, (list.size() + 1), upload_id))){
-      S3FS_PRN_ERR("failed uploading part(%d)", result);
-      close(fd2);
-      return result;
+    int   result;
+    if(0 != (result = UploadMultipartPostRequest(tpath, petagpair->part_num, upload_id))){
+        S3FS_PRN_ERR("failed uploading %d part by error(%d)", petagpair->part_num, result);
+        close(fd2);
+        return result;
     }
-    list.push_back(partdata.etag);
     DestroyCurlHandle();
-  }
-  close(fd2);
-
-  if(0 != (result = CompleteMultipartPostRequest(tpath, upload_id, list))){
-    return result;
-  }
-  return 0;
-}
-
-int S3fsCurl::MultipartUploadRequest(string upload_id, const char* tpath, int fd, off_t offset, size_t size, etaglist_t& list)
-{
-  S3FS_PRN_INFO3("[upload_id=%s][tpath=%s][fd=%d][offset=%jd][size=%jd]", upload_id.c_str(), SAFESTRPTR(tpath), fd, (intmax_t)offset, (intmax_t)size);
-
-  // duplicate fd
-  int fd2;
-  if(-1 == (fd2 = dup(fd)) || 0 != lseek(fd2, 0, SEEK_SET)){
-    S3FS_PRN_ERR("Could not duplicate file descriptor(errno=%d)", errno);
-    if(-1 != fd2){
-      close(fd2);
-    }
-    return -errno;
-  }
-
-  // set
-  partdata.fd         = fd2;
-  partdata.startpos   = offset;
-  partdata.size       = size;
-  b_partdata_startpos = partdata.startpos;
-  b_partdata_size     = partdata.size;
-
-  // upload part
-  int   result;
-  if(0 != (result = UploadMultipartPostRequest(tpath, (list.size() + 1), upload_id))){
-    S3FS_PRN_ERR("failed uploading part(%d)", result);
     close(fd2);
-    return result;
-  }
-  list.push_back(partdata.etag);
-  DestroyCurlHandle();
-  close(fd2);
 
-  return 0;
+    return 0;
 }
 
 int S3fsCurl::MultipartRenameRequest(const char* from, const char* to, headers_t& meta, off_t size)
 {
-  int            result;
-  string         upload_id;
-  off_t          chunk;
-  off_t          bytes_remaining;
-  etaglist_t     list;
-  stringstream   strrange;
+    int            result;
+    std::string    upload_id;
+    off_t          chunk;
+    off_t          bytes_remaining;
+    etaglist_t     list;
 
-  S3FS_PRN_INFO3("[from=%s][to=%s]", SAFESTRPTR(from), SAFESTRPTR(to));
+    S3FS_PRN_INFO3("[from=%s][to=%s]", SAFESTRPTR(from), SAFESTRPTR(to));
 
-  string srcresource;
-  string srcurl;
-  MakeUrlResource(get_realpath(from).c_str(), srcresource, srcurl);
+    std::string srcresource;
+    std::string srcurl;
+    MakeUrlResource(get_realpath(from).c_str(), srcresource, srcurl);
 
-  meta["Content-Type"]      = S3fsCurl::LookupMimeType(string(to));
-  meta["x-oss-copy-source"] = srcresource;
+    meta["Content-Type"]      = S3fsCurl::LookupMimeType(std::string(to));
+    meta["x-oss-copy-source"] = srcresource;
 
-  if(0 != (result = PreMultipartPostRequest(to, meta, upload_id, true))){
-    return result;
-  }
-  DestroyCurlHandle();
-
-  for(bytes_remaining = size, chunk = 0; 0 < bytes_remaining; bytes_remaining -= chunk){
-    chunk = bytes_remaining > MAX_MULTI_COPY_SOURCE_SIZE ? MAX_MULTI_COPY_SOURCE_SIZE : bytes_remaining;
-
-    strrange << "bytes=" << (size - bytes_remaining) << "-" << (size - bytes_remaining + chunk - 1);
-    meta["x-oss-copy-source-range"] = strrange.str();
-    strrange.str("");
-    strrange.clear(stringstream::goodbit);
-
-    if(0 != (result = CopyMultipartPostRequest(from, to, (list.size() + 1), upload_id, meta))){
-      return result;
+    if(0 != (result = PreMultipartPostRequest(to, meta, upload_id, true))){
+        return result;
     }
-    list.push_back(partdata.etag);
     DestroyCurlHandle();
-  }
 
-  if(0 != (result = CompleteMultipartPostRequest(to, upload_id, list))){
-    return result;
-  }
-  return 0;
-}
+    // Initialize S3fsMultiCurl
+    S3fsMultiCurl curlmulti(GetMaxParallelCount());
+    curlmulti.SetSuccessCallback(S3fsCurl::CopyMultipartPostCallback);
+    curlmulti.SetRetryCallback(S3fsCurl::CopyMultipartPostRetryCallback);
 
-//-------------------------------------------------------------------
-// Class S3fsMultiCurl 
-//-------------------------------------------------------------------
-#define MAX_MULTI_HEADREQ   20   // default: max request count in readdir curl_multi.
+    for(bytes_remaining = size, chunk = 0; 0 < bytes_remaining; bytes_remaining -= chunk){
+        chunk = bytes_remaining > GetMultipartCopySize() ? GetMultipartCopySize() : bytes_remaining;
 
-//-------------------------------------------------------------------
-// Class method for S3fsMultiCurl 
-//-------------------------------------------------------------------
-int S3fsMultiCurl::max_multireq = MAX_MULTI_HEADREQ;
+        std::ostringstream strrange;
+        strrange << "bytes=" << (size - bytes_remaining) << "-" << (size - bytes_remaining + chunk - 1);
+        meta["x-oss-copy-source-range"] = strrange.str();
 
-int S3fsMultiCurl::SetMaxMultiRequest(int max)
-{
-  int old = S3fsMultiCurl::max_multireq;
-  S3fsMultiCurl::max_multireq= max;
-  return old;
-}
+        // s3fscurl sub object
+        S3fsCurl* s3fscurl_para = new S3fsCurl(true);
+        s3fscurl_para->b_from   = SAFESTRPTR(from);
+        s3fscurl_para->b_meta   = meta;
+        s3fscurl_para->partdata.add_etag_list(list);
 
-//-------------------------------------------------------------------
-// method for S3fsMultiCurl 
-//-------------------------------------------------------------------
-S3fsMultiCurl::S3fsMultiCurl() : hMulti(NULL), SuccessCallback(NULL), RetryCallback(NULL)
-{
-}
-
-S3fsMultiCurl::~S3fsMultiCurl()
-{
-  Clear();
-}
-
-bool S3fsMultiCurl::ClearEx(bool is_all)
-{
-  s3fscurlmap_t::iterator iter;
-  for(iter = cMap_req.begin(); iter != cMap_req.end(); cMap_req.erase(iter++)){
-    CURL*     hCurl    = (*iter).first;
-    S3fsCurl* s3fscurl = (*iter).second;
-    if(hMulti && hCurl){
-      curl_multi_remove_handle(hMulti, hCurl);
-    }
-    if(s3fscurl){
-      s3fscurl->DestroyCurlHandle();
-      delete s3fscurl;  // with destroy curl handle.
-    }
-  }
-
-  if(hMulti){
-    curl_multi_cleanup(hMulti);
-    hMulti = NULL;
-  }
-
-  if(is_all){
-    for(iter = cMap_all.begin(); iter != cMap_all.end(); cMap_all.erase(iter++)){
-      S3fsCurl* s3fscurl = (*iter).second;
-      s3fscurl->DestroyCurlHandle();
-      delete s3fscurl;
-    }
-  }
-  S3FS_MALLOCTRIM(0);
-
-  return true;
-}
-
-S3fsMultiSuccessCallback S3fsMultiCurl::SetSuccessCallback(S3fsMultiSuccessCallback function)
-{
-  S3fsMultiSuccessCallback old = SuccessCallback;
-  SuccessCallback = function;
-  return old;
-}
-  
-S3fsMultiRetryCallback S3fsMultiCurl::SetRetryCallback(S3fsMultiRetryCallback function)
-{
-  S3fsMultiRetryCallback old = RetryCallback;
-  RetryCallback = function;
-  return old;
-}
-  
-bool S3fsMultiCurl::SetS3fsCurlObject(S3fsCurl* s3fscurl)
-{
-  if(hMulti){
-    S3FS_PRN_ERR("Internal error: hMulti is not null");
-    return false;
-  }
-  if(!s3fscurl){
-    return false;
-  }
-  if(cMap_all.end() != cMap_all.find(s3fscurl->hCurl)){
-    return false;
-  }
-  cMap_all[s3fscurl->hCurl] = s3fscurl;
-  return true;
-}
-
-int S3fsMultiCurl::MultiPerform(void)
-{
-  CURLMcode curlm_code;
-  int       still_running;
-
-  if(!hMulti){
-    return -1;
-  }
-
-  // Send multi request.
-  do{
-    // Start making requests and check running.
-    still_running = 0;
-    do {
-      curlm_code = curl_multi_perform(hMulti, &still_running);
-    } while(curlm_code == CURLM_CALL_MULTI_PERFORM);
-
-    if(curlm_code != CURLM_OK) {
-      S3FS_PRN_DBG("curl_multi_perform code: %d msg: %s", curlm_code, curl_multi_strerror(curlm_code));
-    }
-
-    // Set timer when still running
-    if(still_running) {
-      long milliseconds;
-      fd_set r_fd;
-      fd_set w_fd;
-      fd_set e_fd;
-      FD_ZERO(&r_fd);
-      FD_ZERO(&w_fd);
-      FD_ZERO(&e_fd);
-
-      if(CURLM_OK != (curlm_code = curl_multi_timeout(hMulti, &milliseconds))){
-        S3FS_PRN_DBG("curl_multi_timeout code: %d msg: %s", curlm_code, curl_multi_strerror(curlm_code));
-      }
-      if(milliseconds < 0){
-        milliseconds = 50;
-      }
-      if(milliseconds > 0) {
-        int max_fd;
-        struct timeval timeout;
-        timeout.tv_sec  = 1000 * milliseconds / 1000000;
-        timeout.tv_usec = 1000 * milliseconds % 1000000;
-
-        if(CURLM_OK != (curlm_code = curl_multi_fdset(hMulti, &r_fd, &w_fd, &e_fd, &max_fd))){
-          S3FS_PRN_ERR("curl_multi_fdset code: %d msg: %s", curlm_code, curl_multi_strerror(curlm_code));
-          return -EIO;
+        // initiate upload part for parallel
+        if(0 != (result = s3fscurl_para->CopyMultipartPostSetup(from, to, s3fscurl_para->partdata.get_part_number(), upload_id, meta))){
+            S3FS_PRN_ERR("failed uploading part setup(%d)", result);
+            delete s3fscurl_para;
+            return result;
         }
-        if (max_fd == -1) {
-          usleep(20000);
-        } else {
-          if(-1 == select(max_fd + 1, &r_fd, &w_fd, &e_fd, &timeout)){
-            S3FS_PRN_ERR("failed select - errno(%d)", errno);
-            return -errno;
-          }
-        }
-      }
-    }
-  }while(still_running);
 
-  return 0;
-}
-
-int S3fsMultiCurl::MultiRead(void)
-{
-  CURLMsg*  msg;
-  int       remaining_messages;
-  CURL*     hCurl    = NULL;
-  S3fsCurl* s3fscurl = NULL;
-  S3fsCurl* retrycurl= NULL;
-
-  while(NULL != (msg = curl_multi_info_read(hMulti, &remaining_messages))){
-    if(CURLMSG_DONE != msg->msg){
-      S3FS_PRN_ERR("curl_multi_info_read code: %d", msg->msg);
-      return -EIO;
-    }
-    hCurl    = msg->easy_handle;
-    s3fscurlmap_t::iterator iter;
-    if(cMap_req.end() != (iter = cMap_req.find(hCurl))){
-      s3fscurl = iter->second;
-    }else{
-      s3fscurl = NULL;
-    }
-    retrycurl= NULL;
-
-    if(s3fscurl){
-      bool isRetry = false;
-      if(CURLE_OK == msg->data.result){
-        long responseCode = -1;
-        if(s3fscurl->GetResponseCode(responseCode)){
-          if(400 > responseCode){
-            // add into stat cache
-            if(SuccessCallback && !SuccessCallback(s3fscurl)){
-              S3FS_PRN_WARN("error from callback function(%s).", s3fscurl->url.c_str());
-            }
-          }else if(400 == responseCode){
-            // as possibly in multipart
-            S3FS_PRN_WARN("failed a request(%ld: %s)", responseCode, s3fscurl->url.c_str());
-            isRetry = true;
-          }else if(404 == responseCode){
-            // not found
-            S3FS_PRN_WARN("failed a request(%ld: %s)", responseCode, s3fscurl->url.c_str());
-          }else if(500 == responseCode){
-            // case of all other result, do retry.(11/13/2013)
-            // because it was found that s3fs got 500 error from S3, but could success
-            // to retry it.
-            S3FS_PRN_WARN("failed a request(%ld: %s)", responseCode, s3fscurl->url.c_str());
-            isRetry = true;
-          }else{
-            // Retry in other case.
-            S3FS_PRN_WARN("failed a request(%ld: %s)", responseCode, s3fscurl->url.c_str());
-            isRetry = true;
-          }
-        }else{
-          S3FS_PRN_ERR("failed a request(Unknown respons code: %s)", s3fscurl->url.c_str());
-        }
-      }else{
-        S3FS_PRN_WARN("failed to read(remaining: %d code: %d  msg: %s), so retry this.",
-              remaining_messages, msg->data.result, curl_easy_strerror(msg->data.result));
-        isRetry = true;
-      }
-
-      if(!isRetry){
-        cMap_req.erase(hCurl);
-        curl_multi_remove_handle(hMulti, hCurl);
-
-        s3fscurl->DestroyCurlHandle();
-        delete s3fscurl;
-
-      }else{
-        cMap_req.erase(hCurl);
-        curl_multi_remove_handle(hMulti, hCurl);
-
-        // For retry
-        if(RetryCallback){
-          if(NULL != (retrycurl = RetryCallback(s3fscurl))){
-            cMap_all[retrycurl->hCurl] = retrycurl;
-          }else{
-            // Could not set up callback.
+        // set into parallel object
+        if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
+            S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", to);
+            delete s3fscurl_para;
             return -EIO;
-          }
         }
-        if(s3fscurl != retrycurl){
-          s3fscurl->DestroyCurlHandle();
-          delete s3fscurl;
+    }
+
+    // Multi request
+    if(0 != (result = curlmulti.Request())){
+        S3FS_PRN_ERR("error occurred in multi request(errno=%d).", result);
+
+        S3fsCurl s3fscurl_abort(true);
+        int result2 = s3fscurl_abort.AbortMultipartUpload(to, upload_id);
+        s3fscurl_abort.DestroyCurlHandle();
+        if(result2 != 0){
+            S3FS_PRN_ERR("error aborting multipart upload(errno=%d).", result2);
         }
-      }
-    }else{
-      assert(false);
+        return result;
     }
-  }
-  return 0;
+
+    if(0 != (result = CompleteMultipartPostRequest(to, upload_id, list))){
+        return result;
+    }
+    return 0;
 }
 
-int S3fsMultiCurl::Request(void)
+std::string S3fsCurl::CalcSignatureOSSV1(const std::string& method, const std::string& strMD5, const std::string& content_type, const std::string& date, const std::string& resource, const std::string& secret_access_key, const std::string& access_token)
 {
-  int       result;
-  CURLMcode curlm_code;
+    std::string Signature;
+    std::string StringToSign;
 
-  S3FS_PRN_INFO3("[count=%zu]", cMap_all.size());
-
-  if(hMulti){
-    S3FS_PRN_DBG("Warning: hMulti is not null, thus clear itself.");
-    ClearEx(false);
-  }
-
-  // Make request list.
-  //
-  // Send multi request loop( with retry )
-  // (When many request is sends, sometimes gets "Couldn't connect to server")
-  //
-  while(!cMap_all.empty()){
-    // populate the multi interface with an initial set of requests
-    if(NULL == (hMulti = curl_multi_init())){
-      Clear();
-      return -1;
+    if(!access_token.empty()){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", access_token.c_str());
     }
 
-    // set curl handle to multi handle
-    int                     cnt;
-    s3fscurlmap_t::iterator iter;
-    for(cnt = 0, iter = cMap_all.begin(); cnt < S3fsMultiCurl::max_multireq && iter != cMap_all.end(); cMap_all.erase(iter++), cnt++){
-      CURL*     hCurl    = (*iter).first;
-      S3fsCurl* s3fscurl = (*iter).second;
+    StringToSign += method + "\n";
+    StringToSign += strMD5 + "\n";        // md5
+    StringToSign += content_type + "\n";
+    StringToSign += date + "\n";
+    StringToSign += get_canonical_headers_oss(requestHeaders, true);
+    StringToSign += resource;
 
-      if(CURLM_OK != (curlm_code = curl_multi_add_handle(hMulti, hCurl))){
-        S3FS_PRN_ERR("curl_multi_add_handle code: %d msg: %s", curlm_code, curl_multi_strerror(curlm_code));
-        Clear();
-        return -EIO;
-      }
-      cMap_req[hCurl] = s3fscurl;
+    const void* key            = secret_access_key.data();
+    size_t key_len             = secret_access_key.size();
+    const unsigned char* sdata = reinterpret_cast<const unsigned char*>(StringToSign.data());
+    size_t sdata_len           = StringToSign.size();
+    unsigned char* md          = NULL;
+    unsigned int md_len        = 0;;
+
+    //S3FS_PRN_DBG("StringToSign: %.*s", (int)sdata_len, sdata);
+
+    s3fs_HMAC(key, key_len, sdata, sdata_len, &md, &md_len);
+
+    char* base64;
+    if(NULL == (base64 = s3fs_base64(md, md_len))){
+        delete[] md;
+        return std::string("");  // ENOMEM
     }
+    delete[] md;
 
-    // Send multi request.
-    if(0 != (result = MultiPerform())){
-      Clear();
-      return result;
-    }
+    Signature = base64;
+    delete[] base64;
 
-    // Read the result
-    if(0 != (result = MultiRead())){
-      Clear();
-      return result;
-    }
-
-    // Cleanup curl handle in multi handle
-    ClearEx(false);
-  }
-  return 0;
+    return Signature;
 }
 
-//-------------------------------------------------------------------
-// Class AdditionalHeader
-//-------------------------------------------------------------------
-AdditionalHeader AdditionalHeader::singleton;
-
-//-------------------------------------------------------------------
-// Class AdditionalHeader method
-//-------------------------------------------------------------------
-AdditionalHeader::AdditionalHeader()
+void S3fsCurl::insertOSSV1Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token)
 {
-  if(this == AdditionalHeader::get()){
-    is_enable = false;
-  }else{
-    assert(false);
-  }
-}
-
-AdditionalHeader::~AdditionalHeader()
-{
-  if(this == AdditionalHeader::get()){
-    Unload();
-  }else{
-    assert(false);
-  }
-}
-
-bool AdditionalHeader::Load(const char* file)
-{
-  if(!file){
-    S3FS_PRN_WARN("file is NULL.");
-    return false;
-  }
-  Unload();
-
-  ifstream AH(file);
-  if(!AH.good()){
-    S3FS_PRN_WARN("Could not open file(%s).", file);
-    return false;
-  }
-
-  // read file
-  string line;
-  while(getline(AH, line)){
-    if('#' == line[0]){
-      continue;
-    }
-    if(0 == line.size()){
-      continue;
-    }
-    // load a line
-    stringstream ss(line);
-    string       key("");       // suffix(key)
-    string       head;          // additional HTTP header
-    string       value;         // header value
-    if(0 == isblank(line[0])){
-      ss >> key;
-    }
-    if(ss){
-      ss >> head;
-      if(ss && static_cast<size_t>(ss.tellg()) < line.size()){
-        value = line.substr(static_cast<int>(ss.tellg()) + 1);
-      }
+    std::string resource;
+    std::string server_path = type == REQTYPE_LISTBUCKET ? "/" : path;
+    get_canonical_resource_oss(server_path.c_str(), resource);
+    if(!query_string.empty()) {
+        if(type != REQTYPE_CHKBUCKET && type != REQTYPE_LISTBUCKET){
+            resource += "?" + query_string;
+        } else if (type == REQTYPE_LISTBUCKET) {
+            //need sign continuation-token=xxxx
+            //if exist, It will appear at the beginning position
+            if (is_prefix(query_string.c_str(), "continuation-token=")) {
+                std::string::size_type pos;
+                std::string strval;
+                if(std::string::npos != (pos = query_string.find_first_of('&'))){
+                    strval = query_string.substr(19, pos-19);
+                }else{
+                    strval = query_string.substr(19);
+                }
+                resource += "?continuation-token=" + urlDecode(strval);
+            }
+        }
     }
 
-    // check it
-    if(0 == head.size()){
-      if(0 == key.size()){
-        continue;
-      }
-      S3FS_PRN_ERR("file format error: %s key(suffix) is no HTTP header value.", key.c_str());
-      Unload();
-      return false;
+    std::string date = get_date_rfc850();
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Date", date.c_str());
+    if(op != "PUT" && op != "POST"){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
     }
 
-    // set charcntlist
-    int keylen = key.size();
-    charcnt_list_t::iterator iter;
-    for(iter = charcntlist.begin(); iter != charcntlist.end(); ++iter){
-      if(keylen == (*iter)){
-        break;
-      }
-    }
-    if(iter == charcntlist.end()){
-      charcntlist.push_back(keylen);
-    }
-    // set addheader
-    addheader_t::iterator aiter;
-    if(addheader.end() == (aiter = addheader.find(key))){
-      headerpair_t hpair;
-      hpair[head]    = value;
-      addheader[key] = hpair;
-    }else{
-      aiter->second[head] = value;
-    }
-    // set flag
-    if(!is_enable){
-      is_enable = true;
-    }
-  }
-  return true;
-}
-
-void AdditionalHeader::Unload(void)
-{
-  is_enable = false;
-  charcntlist.clear();
-  addheader.clear();
-}
-
-bool AdditionalHeader::AddHeader(headers_t& meta, const char* path) const
-{
-  if(!is_enable){
-    return true;
-  }
-  if(!path){
-    S3FS_PRN_WARN("path is NULL.");
-    return false;
-  }
-  int nPathLen = strlen(path);
-  for(charcnt_list_t::const_iterator iter = charcntlist.begin(); iter != charcntlist.end(); ++iter){
-    // get target character count
-    if(nPathLen < (*iter)){
-      continue;
-    }
-    // make target suffix(same character count) & find
-    string suffix(&path[nPathLen - (*iter)]);
-    addheader_t::const_iterator aiter;
-    if(addheader.end() == (aiter = addheader.find(suffix))){
-      continue;
-    }
-    for(headerpair_t::const_iterator piter = aiter->second.begin(); piter != aiter->second.end(); ++piter){
-      // Adding header
-      meta[(*piter).first] = (*piter).second;
-    }
-  }
-  return true;
-}
-
-struct curl_slist* AdditionalHeader::AddHeader(struct curl_slist* list, const char* path) const
-{
-  headers_t meta;
-
-  if(!AddHeader(meta, path)){
-    return list;
-  }
-  for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
-    // Adding header
-    list = curl_slist_sort_insert(list, iter->first.c_str(), iter->second.c_str());
-  }
-  meta.clear();
-  S3FS_MALLOCTRIM(0);
-  return list;
-}
-
-bool AdditionalHeader::Dump(void) const
-{
-  if(!IS_S3FS_LOG_DBG()){
-    return true;
-  }
-  // character count list
-  stringstream ssdbg;
-  ssdbg << "Character count list[" << charcntlist.size() << "] = {";
-  for(charcnt_list_t::const_iterator citer = charcntlist.begin(); citer != charcntlist.end(); ++citer){
-    ssdbg << " " << (*citer);
-  }
-  ssdbg << " }\n";
-
-  // additional header
-  ssdbg << "Additional Header list[" << addheader.size() << "] = {\n";
-  for(addheader_t::const_iterator aiter = addheader.begin(); aiter != addheader.end(); ++aiter){
-    string key = (*aiter).first;
-    if(0 == key.size()){
-      key = "*";
-    }
-    for(headerpair_t::const_iterator piter = (*aiter).second.begin(); piter != (*aiter).second.end(); ++piter){
-      ssdbg << "    " << key << "\t--->\t" << (*piter).first << ": " << (*piter).second << "\n";
-    }
-  }
-  ssdbg << "}";
-
-  // print all
-  S3FS_PRN_DBG("%s", ssdbg.str().c_str());
-
-  return true;
-}
-
-//-------------------------------------------------------------------
-// Utility functions
-//-------------------------------------------------------------------
-//
-// curl_slist_sort_insert
-// This function is like curl_slist_append function, but this adds data by a-sorting.
-// Because OSS signature needs sorted header.
-//
-struct curl_slist* curl_slist_sort_insert(struct curl_slist* list, const char* data)
-{
-  if(!data){
-    return list;
-  }
-  string strkey = data;
-  string strval = "";
-
-  string::size_type pos = strkey.find(':', 0);
-  if(string::npos != pos){
-    strval = strkey.substr(pos + 1);
-    strkey = strkey.substr(0, pos);
-  }
-
-  return curl_slist_sort_insert(list, strkey.c_str(), strval.c_str());
-}
-
-struct curl_slist* curl_slist_sort_insert(struct curl_slist* list, const char* key, const char* value)
-{
-  struct curl_slist* curpos;
-  struct curl_slist* lastpos;
-  struct curl_slist* new_item;
-
-  if(!key){
-    return list;
-  }
-  if(NULL == (new_item = (struct curl_slist*)malloc(sizeof(struct curl_slist)))){
-    return list;
-  }
-
-  // key & value are trimed and lower(only key)
-  string strkey = trim(string(key));
-  string strval = trim(string(value ? value : ""));
-  string strnew = key + string(": ") + strval;
-  if(NULL == (new_item->data = strdup(strnew.c_str()))){
-    free(new_item);
-    return list;
-  }
-  new_item->next = NULL;
-
-  for(lastpos = NULL, curpos = list; curpos; lastpos = curpos, curpos = curpos->next){
-    string strcur = curpos->data;
-    size_t pos;
-    if(string::npos != (pos = strcur.find(':', 0))){
-      strcur = strcur.substr(0, pos);
+    if (S3fsCurl::IsRequesterPays()) {
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
     }
 
-    int result = strcasecmp(strkey.c_str(), strcur.c_str());
-    if(0 == result){
-      // same data, so replace it.
-      if(lastpos){
-        lastpos->next = new_item;
-      }else{
-        list = new_item;
-      }
-      new_item->next = curpos->next;
-      free(curpos->data);
-      free(curpos);
-      break;
-
-    }else if(0 > result){
-      // add data before curpos.
-      if(lastpos){
-        lastpos->next = new_item;
-      }else{
-        list = new_item;
-      }
-      new_item->next = curpos;
-      break;
+    if(!S3fsCurl::IsPublicBucket()){
+        std::string Signature = CalcSignatureOSSV1(op, get_header_value(requestHeaders, "Content-MD5"), get_header_value(requestHeaders, "Content-Type"), date, resource, secret_access_key, access_token);
+        requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", std::string("OSS " + access_key_id + ":" + Signature).c_str());
     }
-  }
-
-  if(!curpos){
-    // append to last pos
-    if(lastpos){
-      lastpos->next = new_item;
-    }else{
-      // a case of list is null
-      list = new_item;
-    }
-  }
-
-  return list;
-}
-
-string get_sorted_header_keys(const struct curl_slist* list)
-{
-  string sorted_headers;
-
-  if(!list){
-    return sorted_headers;
-  }
-
-  for( ; list; list = list->next){
-    string strkey = list->data;
-    size_t pos;
-    if(string::npos != (pos = strkey.find(':', 0))){
-      strkey = strkey.substr(0, pos);
-    }
-    if(0 < sorted_headers.length()){
-      sorted_headers += ";";
-    }
-    sorted_headers += lower(strkey);
-  }
-
-  return sorted_headers;
-}
-
-#if 0
-string get_canonical_headers(const struct curl_slist* list)
-{
-  string canonical_headers;
-
-  if(!list){
-    canonical_headers = "\n";
-    return canonical_headers;
-  }
-
-  for( ; list; list = list->next){
-    string strhead = list->data;
-    size_t pos;
-    if(string::npos != (pos = strhead.find(':', 0))){
-      string strkey = trim(lower(strhead.substr(0, pos)));
-      string strval = trim(strhead.substr(pos + 1));
-      strhead       = strkey + string(":") + strval;
-    }else{
-      strhead       = trim(lower(strhead));
-    }
-    canonical_headers += strhead;
-    canonical_headers += "\n";
-  }
-  return canonical_headers;
-}
-#endif
-
-string get_canonical_headers(const struct curl_slist* list)
-{
-  string canonical_headers;
-
-  if(!list){
-    canonical_headers = "\n";
-    return canonical_headers;
-  }
-
-  for( ; list; list = list->next){
-    string strhead = list->data;
-    size_t pos;
-    if(string::npos != (pos = strhead.find(':', 0))){
-      string strkey = trim(lower(strhead.substr(0, pos)));
-      string strval = trim(strhead.substr(pos + 1));
-      strhead       = strkey + string(":") + strval;
-    }else{
-      strhead       = trim(lower(strhead));
-    }
-    if(strhead.substr(0, 5) != "x-oss"){
-      continue;
-    }
-    canonical_headers += strhead;
-    canonical_headers += "\n";
-  }
-  return canonical_headers;
-}
-
-// function for using global values
-bool MakeUrlResource(const char* realpath, string& resourcepath, string& url)
-{
-  if(!realpath){
-    return false;
-  }
-  // XXX oss requires do not encode the resource.
-  resourcepath = service_path + bucket + realpath;
-  url          = host + urlEncode(resourcepath);
-  return true;
-}
-
-string prepare_url(const char* url)
-{
-  S3FS_PRN_INFO3("URL is %s", url);
-
-  string uri;
-  string host;
-  string path;
-  string url_str = str(url);
-  string token =  str("/" + bucket);
-  int bucket_pos = url_str.find(token);
-  int bucket_length = token.size();
-  int uri_length = 0;
-
-  if(!strncasecmp(url_str.c_str(), "https://", 8)){
-    uri_length = 8;
-  } else if(!strncasecmp(url_str.c_str(), "http://", 7)) {
-    uri_length = 7;
-  }
-  uri  = url_str.substr(0, uri_length);
-
-  if(!pathrequeststyle){
-    host = bucket + "." + url_str.substr(uri_length, bucket_pos - uri_length).c_str();
-    path = url_str.substr((bucket_pos + bucket_length));
-  }else{
-    host = url_str.substr(uri_length, bucket_pos - uri_length).c_str();
-    string part = url_str.substr((bucket_pos + bucket_length));
-    if('/' != part[0]){
-      part = "/" + part;
-    }
-    path = "/" + bucket + part;
-  }
-
-  url_str = uri + host + path;
-
-  S3FS_PRN_INFO3("URL changed is %s", url_str.c_str());
-
-  return str(url_str);
 }
 
 /*
@@ -4124,6 +4341,6 @@ string prepare_url(const char* url)
 * tab-width: 4
 * c-basic-offset: 4
 * End:
-* vim600: noet sw=4 ts=4 fdm=marker
-* vim<600: noet sw=4 ts=4
+* vim600: expandtab sw=4 ts=4 fdm=marker
+* vim<600: expandtab sw=4 ts=4
 */

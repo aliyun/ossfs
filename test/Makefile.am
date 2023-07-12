@@ -1,5 +1,5 @@
 ######################################################################
-# s3fs - FUSE-based file system backed by Aliyun OSS
+# ossfs - FUSE-based file system backed by Alibaba Cloud OSS
 #
 # Copyright 2007-2008 Randy Rizun <rrizun@gmail.com>
 #
@@ -17,14 +17,30 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 ######################################################################
+
 TESTS=small-integration-test.sh
 
 EXTRA_DIST = \
-   integration-test-common.sh \
-   require-root.sh \
-   small-integration-test.sh \
-   mergedir.sh \
-   sample_delcache.sh \
-   sample_ahbe.conf
+    integration-test-common.sh \
+    small-integration-test.sh \
+    mergedir.sh \
+    sample_delcache.sh \
+    sample_ahbe.conf
 
 testdir = test
+
+noinst_PROGRAMS = \
+    junk_data \
+    write_multiblock
+
+junk_data_SOURCES = junk_data.c
+write_multiblock_SOURCES = write_multiblock.cc
+
+#
+# Local variables:
+# tab-width: 4
+# c-basic-offset: 4
+# End:
+# vim600: expandtab sw=4 ts=4 fdm=marker
+# vim<600: expandtab sw=4 ts=4
+#

@@ -1,10 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Steps for building dist package:
-# 1. sudo yum install alidocker -b test
-# 2. sudo docker login reg.docker.alibaba-inc.com # obtain "HUB TOKEN" from http://docker.alibaba-inc.com/
-# 3. sudo python scripts/build-pkg.py
+# 1. install docker 
+# 2. build docker image
+# 3. python3 scripts/build-pkg.py
 # 4. packages are placed in dist/
 
 # Steps for debug
@@ -187,6 +187,7 @@ def command_test_package_centos70():
     test_dir = os.path.join(dest_dir, 'source/test')
     f = open(os.path.join(cmd_dir, 'test_package_centos70.sh'), 'w')
     f.write('#!/bin/bash\n')
+    f.write('yum -y update upgrade\n')
     f.write('yum -y localinstall %s/package/%s --nogpgcheck\n' % (dest_dir, pkg))
     command_test_package(f)
     f.close()
@@ -215,6 +216,7 @@ def command_test_package_centos(os_name):
     test_dir = os.path.join(dest_dir, 'source/test')
     f = open(os.path.join(cmd_dir, 'test_package_%s.sh'%os_name), 'w')
     f.write('#!/bin/bash\n')
+    f.write('yum -y update\n')
     f.write('yum -y localinstall %s/package/%s --nogpgcheck\n' % (dest_dir, pkg))
     command_test_package(f)
     f.close()
@@ -243,7 +245,8 @@ def command_test_package_ubuntu(os_name):
     test_dir = os.path.join(dest_dir, 'source/test')
     f = open(os.path.join(cmd_dir, 'test_package_%s.sh'%os_name), 'w')
     f.write('#!/bin/bash\n')
-    f.write('apt update\n')
+    f.write('apt-get update -y\n')
+    f.write('apt-get install gdebi-core -y\n')
     f.write('gdebi -n %s/package/%s\n' % (dest_dir,pkg))
     command_test_package(f)
     f.close()
@@ -272,9 +275,52 @@ def command_test_package_anolisos(os_name):
     test_dir = os.path.join(dest_dir, 'source/test')
     f = open(os.path.join(cmd_dir, 'test_package_%s.sh'%os_name), 'w')
     f.write('#!/bin/bash\n')
+    f.write('yum -y update\n')
     f.write('yum -y localinstall %s/package/%s --nogpgcheck\n' % (dest_dir, pkg))
     command_test_package(f)
     f.close()
+
+def build_docker_image():
+    #ubuntu:14.04
+    exec_cmd('docker pull ubuntu:14.04')
+    exec_cmd('docker tag ubuntu:14.04 ossfs-ubuntu14.04:test')
+    exec_cmd('docker build -t ossfs-ubuntu14.04:dev %s/scripts/docker-file/ubuntu/14.04'%ossfs_source_dir)
+
+    #ubuntu:16.04
+    exec_cmd('docker pull ubuntu:16.04')
+    exec_cmd('docker tag ubuntu:16.04 ossfs-ubuntu16.04:test')
+    exec_cmd('docker build -t ossfs-ubuntu16.04:dev %s/scripts/docker-file/ubuntu/16.04'%ossfs_source_dir)
+
+    #ubuntu:18.04
+    exec_cmd('docker pull ubuntu:18.04')
+    exec_cmd('docker tag ubuntu:18.04 ossfs-ubuntu18.04:test')
+    exec_cmd('docker build -t ossfs-ubuntu18.04:dev %s/scripts/docker-file/ubuntu/18.04'%ossfs_source_dir)
+
+    #ubuntu:20.04
+    exec_cmd('docker pull ubuntu:20.04')
+    exec_cmd('docker tag ubuntu:20.04 ossfs-ubuntu20.04:test')
+    exec_cmd('docker build -t ossfs-ubuntu20.04:dev %s/scripts/docker-file/ubuntu/20.04'%ossfs_source_dir)
+
+    #centos:7.x
+    exec_cmd('docker pull centos:centos7')
+    exec_cmd('docker tag centos:centos7 ossfs-centos7.0:test')
+    exec_cmd('docker build -t ossfs-centos7.0:dev %s/scripts/docker-file/centos/7.x'%ossfs_source_dir)
+
+    #centos:8.x
+    exec_cmd('docker pull centos:centos8')
+    exec_cmd('docker build -t ossfs-centos8.0:dev %s/scripts/docker-file/centos/8.x'%ossfs_source_dir)
+    exec_cmd('docker build -t ossfs-centos8.0:test %s/scripts/docker-file/centos/8.x'%ossfs_source_dir)
+
+    #anolisos:7.x
+    exec_cmd('docker pull openanolis/anolisos:7.9-x86_64')
+    exec_cmd('docker tag openanolis/anolisos:7.9-x86_64 ossfs-anolisos7.0:test')
+    exec_cmd('docker build -t ossfs-anolisos7.0:dev %s/scripts/docker-file/anolisos/7.x'%ossfs_source_dir)
+
+    #centos:8.x
+    exec_cmd('docker pull openanolis/anolisos:8.6')
+    exec_cmd('docker tag openanolis/anolisos:8.6 ossfs-anolisos8.0:test')
+    exec_cmd('docker build -t ossfs-anolisos8.0:dev %s/scripts/docker-file/anolisos/8.x'%ossfs_source_dir)
+    pass
 
 def build_package():
     prepare()
@@ -365,5 +411,6 @@ def build_package():
             docker_run(container_name, test_image, volumes, '/bin/bash %s/command/test_package_%s.sh' % (dest_dir, os_name))
 
 if __name__ == '__main__':
+    build_docker_image()
     build_package()
     subprocess.check_call(['ln', '-sfT', os.path.join(working_dir, 'package'), dist_dir])

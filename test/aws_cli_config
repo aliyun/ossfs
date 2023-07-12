@@ -1,0 +1,4 @@
+[default]
+region = cn-hangzhou
+s3 =
+  addressing_style = virtual

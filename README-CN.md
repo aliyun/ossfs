@@ -14,10 +14,14 @@ ossfs 能让您在Linux/Mac OS X 系统中把Aliyun OSS bucket 挂载到本地�
 
 ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
 
-* 支持POSIX 文件系统的大部分功能，包括文件读写，目录，链接操作，权限，
-  uid/gid，以及扩展属性（extended attributes）
-* 通过OSS 的multipart 功能上传大文件。
-* MD5 校验保证数据完整性。
+* 支持POSIX 文件系统的大部分功能，包括文件读写，目录，链接操作，权限，uid/gid，以及扩展属性（extended attributes）
+* 支持随机写和追加写
+* 大文件通过分片方式(multi-part api)上传
+* 重名名通过拷贝(single-part copy/multi-part copy)接口
+* 可选择开启服务端加密
+* 支持MD5校验保证数据完整性
+* 使用内存缓存元数据
+* 依赖本地文件作为缓存
 
 ### 安装
 
@@ -25,8 +29,9 @@ ossfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
 
 我们为常见的linux发行版制作了安装包：
 
-- Ubuntu-14.04
-- CentOS-7.0/6.5/5.11
+- Ubuntu-14.04 or later
+- CentOS-7.0 or later
+- Anolis-7 or later
 
 请从[版本发布页面][releases]选择对应的安装包下载安装，建议选择最新版本。
 
@@ -38,16 +43,16 @@ sudo apt-get install gdebi-core
 sudo gdebi your_ossfs_package
 ```
 
-- 对于CentOS6.5及以上，安装命令为：
+- 对于CentOS，安装命令为：
 
 ```
 sudo yum localinstall your_ossfs_package
 ```
 
-- 对于CentOS5，安装命令为：
+- 对于Anolis，安装命令为：
 
 ```
-sudo yum localinstall your_ossfs_package --nogpgcheck
+sudo yum localinstall your_ossfs_package
 ```
 
 #### 源码安装
@@ -79,21 +84,50 @@ make
 sudo make install
 ```
 
+其它平台，请参阅[编译说明](COMPILATION.md)
+
 ### 运行
 
-设置bucket name, access key/id信息，将其存放在/etc/passwd-ossfs 文件中，
-注意这个文件的权限必须正确设置，建议设为640。如果不使用默认的文件路径，文件权限建议设置为600。
+ossfs的密钥文件的默认路径如下:
+* 用户主目录中 `.passwd-ossfs` 文件 ( 例如 `${HOME}/.passwd-ossfs`)
+* 系统路径文件 `/etc/passwd-ossfs`
+
+设置bucket name, access key/id信息，将其存放在`${HOME}/.passwd-ossfs` 文件中，并设置成仅限所有者的权限，即600。
+如果密钥文件路径为`/etc/passwd-ossfs`, 可以设置成640
+
 
 ```
-echo my-bucket:my-access-key-id:my-access-key-secret > /etc/passwd-ossfs
-chmod 640 /etc/passwd-ossfs
+echo my-access-key-id:my-access-key-secret > ${HOME}/.passwd-ossfs
+chmod 600 ${HOME}/.passwd-ossfs
 ```
 
-将oss bucket mount到指定目录
+将 `my-bucket` 挂载到指定目录`/path/to/mountpoint`
 
 ```
-ossfs my-bucket my-mount-point -ourl=my-oss-endpoint
+ossfs my-bucket /path/to/mountpoint -ourl=my-oss-endpoint
 ```
+
+如果您在使用ossfs的过程中遇到错误，可以开启调试日志:
+
+```
+ossfs my-bucket /path/to/mountpoint -ourl=my-oss-endpoint -o dbglevel=info -f -o curldbg
+```
+
+您可以在`/etc/fstab`加入以下命令，在开机自动挂载目录:
+
+```
+my-bucket /path/to/mountpoint fuse.ossfs _netdev,allow_other,url=my-oss-endpoint 0 0
+```
+
+注意一: 您需要将密钥等信息写入`/etc/passwd-ossfs`文件里, 并将文件权限修改为640
+
+```
+echo my-access-key-id:my-access-key-secret > /etc/passwd-ossfs
+chmod 600 /etc/passwd-ossfs
+```
+
+注意二:您可能还需要确保`netfs`服务已经启动
+
 #### 示例
 
 将`my-bucket`这个bucket挂载到`/tmp/ossfs`目录下，AccessKeyId是`faint`，
@@ -121,12 +155,10 @@ fusermount -u /tmp/ossfs # non-root user
 
         ossfs my-bucket /tmp/ossfs -ourl=http://oss-cn-hangzhou-internal.aliyuncs.com
 
-- 在linux系统中，[updatedb][updatedb]会定期地扫描文件系统，如果不想
-  ossfs的挂载目录被扫描，可参考[FAQ][FAQ-updatedb]设置跳过挂载目录
-- 如果你没有使用[eCryptFs][ecryptfs]等需要[XATTR][xattr]的文件系统，可
-  以通过添加`-o noxattr`参数来提升性能
-- ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。当
-  有多组信息，写入passwd-ossfs的信息格式为：
+- 在linux系统中，[updatedb][updatedb]会定期地扫描文件系统，
+如果不想ossfs的挂载目录被扫描，可参考[FAQ][FAQ-updatedb]设置跳过挂载目录
+- ossfs允许用户指定多组bucket/access_key_id/access_key_secret信息。
+当有多组信息，写入passwd-ossfs的信息格式为：
 
         bucket1:access_key_id1:access_key_secret1
         bucket2:access_key_id2:access_key_secret2
@@ -161,21 +193,13 @@ fusermount -u /tmp/ossfs # non-root user
 
 ossfs提供的功能和性能和本地文件系统相比，具有一些局限性。具体包括：
 
-* 随机或者追加写文件会导致整个文件的重写。
-* 元数据操作，例如list directory，性能较差，因为需要远程访问oss服务器。
-* 文件/文件夹的rename操作不是原子的。
-* 多个客户端挂载同一个oss bucket时，依赖用户自行协调各个客户端的行为。例如避免多个客户端写同一个文件等等。
-* 不支持hard link。
+* 随机或者追加写文件会导致整个文件的重写
+* 元数据操作，例如list directory，性能较差，因为需要远程访问oss服务器
+* 文件/文件夹的rename操作不是原子的
+* 多个客户端挂载同一个oss bucket时，依赖用户自行协调各个客户端的行为。例如避免多个客户端写同一个文件等等
+* 不支持hard link
+* 仅检测本地修改，而不检测其他客户端或工具的外部修改
 * 不适合用在高并发读/写的场景，这样会让系统的load升高
-
-### 参与开发
-
-0. 开发流程参考：https://github.com/rockuw/oss-sdk-status#development-oss-members-only
-1. 提交代码后，确保travis CI是PASS的
-2. 每发布一个新的版本：
-  - 运行`scripts/build-pkg.py`生成相应的安装包
-  - 在[Release页面][releases]发布一个版本
-  - 将生成的安装包上传到相应的Release下面
 
 ### 常见问题
 
