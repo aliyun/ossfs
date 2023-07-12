@@ -316,6 +316,14 @@ Specify the path of the mime.types file.
 If this option is not specified, the existence of "/etc/mime.types" is checked, and that file is loaded as mime information.
 If this file does not exist on macOS, then "/etc/apache2/mime.types" is checked as well.
 .TP
+\fB\-o\fR upload_traffic_limit (default="0")
+The single-connection bandwidth throttling, in bit/s, for each upload request.
+The minimum value is 819200 bit/s and the maximum value is 838860800 bit/s. 0 value means disable.
+.TP
+\fB\-o\fR download_traffic_limit (default="0")
+The single-connection bandwidth throttling, in bit/s, for each download request.
+The minimum value is 819200 bit/s and the maximum value is 838860800 bit/s. 0 value means disable.
+.TP
 \fB\-o\fR logfile - specify the log output file.
 ossfs outputs the log file to syslog. Alternatively, if ossfs is started with the "-f" option specified, the log will be output to the stdout/stderr.
 You can use this option to specify the log file that ossfs outputs.

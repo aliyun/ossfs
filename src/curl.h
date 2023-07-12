@@ -156,6 +156,8 @@ class S3fsCurl
         static bool             is_ua;             // User-Agent
         static bool             listobjectsv2;
         static bool             requester_pays;
+        static long             upload_traffic_limit;
+        static long             download_traffic_limit;
 
         // variables
         CURL*                hCurl;
@@ -334,6 +336,8 @@ class S3fsCurl
         static bool IsListObjectsV2() { return S3fsCurl::listobjectsv2; }
         static bool SetRequesterPays(bool flag) { bool old_flag = S3fsCurl::requester_pays; S3fsCurl::requester_pays = flag; return old_flag; }
         static bool IsRequesterPays() { return S3fsCurl::requester_pays; }
+        static bool SetUploadTrafficLimit(long value) { bool old_value = S3fsCurl::upload_traffic_limit; S3fsCurl::upload_traffic_limit = value; return old_value; }
+        static bool SetDownloadTrafficLimit(long value) { bool old_value = S3fsCurl::download_traffic_limit; S3fsCurl::download_traffic_limit = value; return old_value; }
 
         // methods
         bool CreateCurlHandle(bool only_pool = false, bool remake = false);

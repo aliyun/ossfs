@@ -4294,6 +4294,16 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             mimetype_file = strchr(arg, '=') + sizeof(char);
             return 0;
         }
+        if(is_prefix(arg, "upload_traffic_limit=")){
+            long traffic_limit = static_cast<long>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            S3fsCurl::SetUploadTrafficLimit(traffic_limit);
+            return 0;
+        }
+        if(is_prefix(arg, "download_traffic_limit=")){
+            long traffic_limit = static_cast<long>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            S3fsCurl::SetDownloadTrafficLimit(traffic_limit);
+            return 0;
+        }
         //
         // log file option
         //
