@@ -172,6 +172,13 @@ mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir
         mode = (!strpath.empty() && '/' == *strpath.rbegin()) ? 0750 : 0640;
     }
 
+    // Checking the new ossfs symlink format
+    if(!(mode & S_IFMT)){
+        if(meta.end() != meta.find("x-oss-meta-symlink-target")) {
+            mode |= (S_IFLNK | S_IRWXU | S_IRWXG | S_IRWXO);
+        }
+    }
+
     // Checking the bitmask, if the last 3 bits are all zero then process as a regular
     // file type (S_IFDIR or S_IFREG), otherwise return mode unmodified so that S_IFIFO,
     // S_IFSOCK, S_IFCHR, S_IFLNK and S_IFBLK devices can be processed properly by fuse.
@@ -384,6 +391,33 @@ bool merge_headers(headers_t& base, const headers_t& additional, bool add_noexis
     }
     return added;
 }
+
+off_t get_symlink_size(const headers_t& meta)
+{
+    headers_t::const_iterator iter = meta.find("x-oss-meta-symlink-target");
+    if(meta.end() == iter){
+        return 0;
+    }
+
+    std::string::size_type pos1 = iter->second.find(':', 0);
+    if(std::string::npos == pos1){
+        return 0;
+    }
+
+    std::string::size_type pos2 = iter->second.find(':', pos1 + 1);
+    if(std::string::npos == pos2){
+        return 0;
+    }
+
+    if (pos1 + 1 == pos2) {
+        return 0;
+    }
+    std::string size = iter->second.substr(pos1 + 1, pos2 - (pos1 + 1));
+
+    off_t ret = get_size(size.c_str());
+    return ret < 0 ? 0 : ret;
+}
+
 
 /*
 * Local variables:

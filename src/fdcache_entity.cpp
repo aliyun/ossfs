@@ -982,6 +982,40 @@ bool FdEntity::SetContentType(const char* path)
     return true;
 }
 
+bool FdEntity::GetSymlinkAttr(std::string& type, std::string& symlink)
+{
+    AutoLock auto_lock(&fdent_lock);
+    headers_t::const_iterator iter = orgmeta.find("x-oss-meta-symlink-target");
+    if(iter == orgmeta.end()){
+        return false;
+    }    
+    std::string value = (*iter).second;
+    std::string::size_type pos = value.find(':', 0);
+    if(std::string::npos != pos){
+        type = value.substr(0, pos);
+    }
+
+    pos = value.find(':', pos + 1);
+    if(std::string::npos != pos){
+        symlink = urlDecode(value.substr(pos + 1));
+    }
+
+    return true;
+}
+
+bool FdEntity::SetSymlinkAttr(const std::string& type, const std::string& symlink)
+{
+    AutoLock auto_lock(&fdent_lock);
+    orgmeta.erase("x-oss-meta-symlink-target");
+
+    //the target format is: type:size:urlencode(symlink)
+    if (!type.empty()) {
+        std::string value = type + ":" + str(symlink.length()) + ":" + urlEncode(symlink);
+        orgmeta["x-oss-meta-symlink-target"] = value;
+    }
+    return true;
+}
+
 bool FdEntity::SetAllStatus(bool is_loaded)
 {
     S3FS_PRN_INFO3("[path=%s][physical_fd=%d][%s]", path.c_str(), physical_fd, is_loaded ? "loaded" : "unloaded");

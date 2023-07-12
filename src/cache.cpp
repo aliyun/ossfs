@@ -157,6 +157,11 @@ bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, s
         pst->st_mode |= S_IFREG;
     }
 
+    //new symlink format
+    if (S_ISLNK(pst->st_mode) && pst->st_size == 0) {
+        pst->st_size = get_symlink_size(meta);
+    }
+
     // uid/gid
     pst->st_uid = get_uid(meta, noextendedmeta);
     pst->st_gid = get_gid(meta, noextendedmeta);

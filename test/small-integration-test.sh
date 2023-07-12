@@ -53,6 +53,7 @@ if [ -n "${ALL_TESTS}" ]; then
         "singlepart_copy_limit=10"  # limit size to exercise multipart code paths
         #use_sse  # TODO: S3Proxy does not support SSE
         noshallowcopyapi
+        symlink_in_meta
     )
 else
     FLAGS=(
