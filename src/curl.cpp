@@ -120,6 +120,9 @@ bool             S3fsCurl::is_ua               = true;           // default
 bool             S3fsCurl::listobjectsv2       = false;          // default
 bool             S3fsCurl::requester_pays      = false;          // default
 
+long             S3fsCurl::upload_traffic_limit      = 0;          // default
+long             S3fsCurl::download_traffic_limit    = 0;          // default
+
 //-------------------------------------------------------------------
 // Class methods for S3fsCurl
 //-------------------------------------------------------------------
@@ -3344,6 +3347,11 @@ int S3fsCurl::PutRequest(const char* tpath, headers_t& meta, int fd)
         // set additional header by ahbe conf
         requestHeaders = AdditionalHeader::get()->AddHeader(requestHeaders, tpath);
     }
+    if(S3fsCurl::upload_traffic_limit != 0) {
+        char buff[64];
+        sprintf(buff, "%ld", S3fsCurl::upload_traffic_limit);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-traffic-limit", buff);
+    }
 
     op = "PUT";
     type = REQTYPE_PUT;
@@ -3415,6 +3423,12 @@ int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, off_t 
     // SSE
     if(!AddSseRequestHead(ssetype, ssevalue, true, false)){
         S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+    }
+
+    if(S3fsCurl::download_traffic_limit != 0) {
+        char buff[64];
+        sprintf(buff, "%ld", S3fsCurl::download_traffic_limit);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-traffic-limit", buff);
     }
 
     op = "GET";
@@ -3929,6 +3943,12 @@ int S3fsCurl::UploadMultipartPostSetup(const char* tpath, int part_num, const st
         if(!AddSseRequestHead(S3fsCurl::GetSseType(), ssevalue, false, false)){
             S3FS_PRN_WARN("Failed to set SSE header, but continue...");
         }
+    }
+
+    if(S3fsCurl::upload_traffic_limit != 0) {
+        char buff[64];
+        sprintf(buff, "%ld", S3fsCurl::upload_traffic_limit);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-traffic-limit", buff);
     }
 
     requestHeaders = curl_slist_sort_insert(requestHeaders, "Accept", NULL);
