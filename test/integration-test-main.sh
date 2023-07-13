@@ -1439,7 +1439,7 @@ function test_truncate_cache() {
         for file in $(seq 75); do
             touch "${dir}/${file}"
         done
-        ls "${dir}"
+        ls "${dir}" > /dev/null
     done
 
     # shellcheck disable=SC2046
@@ -1944,6 +1944,250 @@ function test_symlink_in_meta {
     rm -f "${TMP_BODY_CONTENT_FILE}"
 }
 
+function test_default_permissions_readdir_optimize {
+    describe "Testing default permissions with readdir_optimize..."
+    # 640 regular file
+    # 750 dir
+    # 777 symlink
+
+    #1 get permissions by issuing head request
+    #1.1 with mode value
+    rm -rf "${TEST_DIR}"
+    local DIRECTORY_NAME; DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}"
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_DIR}/normal.txt"
+    local OBJECT_NAME_SYMLINK; OBJECT_NAME_SYMLINK=$(basename "${PWD}")/"${TEST_DIR}/symlink.txt"
+
+    local TMP_BODY_CONTENT_FILE="/tmp/${TEST_TEXT_FILE_BODY}.body"
+    echo "${TEST_DIR}/normal.txt" > ${TMP_BODY_CONTENT_FILE}
+
+    #0755   -> 493
+    #100644 ->33188
+    #120640 ->41376
+    aws_cli s3api put-object --content-type="application/x-directory" --metadata="mode=493" --bucket "${TEST_BUCKET_1}" --key "${DIRECTORY_NAME}/"
+    aws_cli s3api put-object --content-type="text/plain" --metadata="mode=33188" --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME}"
+    aws_cli s3api put-object --content-type="text/plain" --metadata="mode=41376" --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME_SYMLINK}"  --body "${TMP_BODY_CONTENT_FILE}"
+
+    local DIRECTORY_PERMISSIONS; DIRECTORY_PERMISSIONS=$(get_permissions "${TEST_DIR}")
+    local FILE_PERMISSIONS; FILE_PERMISSIONS=$(get_permissions "${TEST_DIR}/normal.txt")
+    local SYMLINK_PERMISSIONS; SYMLINK_PERMISSIONS=$(get_permissions "${TEST_DIR}/symlink.txt")
+
+    if [ "${DIRECTORY_PERMISSIONS}" != "750" ] ; then
+      echo "dir permission is not correct."
+      return 1
+    fi
+    if [ "${FILE_PERMISSIONS}" != "640" ] ; then
+      echo "file permission is not correct."
+      return 1
+    fi
+    if [ "${SYMLINK_PERMISSIONS}" != "777" ] ; then
+      echo "symlink permission is not correct."
+      return 1
+    fi
+
+    #1.2 without mode value
+    rm -rf "${TEST_DIR}"
+    DIRECTORY_PERMISSIONS=""
+    FILE_PERMISSIONS=""
+    DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}"
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_DIR}/normal-no-mode.txt"
+
+    aws_cli s3api put-object --content-type="application/x-directory" --bucket "${TEST_BUCKET_1}" --key "${DIRECTORY_NAME}/"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME}"
+
+    DIRECTORY_PERMISSIONS=$(get_permissions "${TEST_DIR}")
+    FILE_PERMISSIONS=$(get_permissions "${TEST_DIR}/normal-no-mode.txt")
+
+    if [ "${DIRECTORY_PERMISSIONS}" != "750" ] ; then
+      echo "dir permission is not correct."
+      return 1
+    fi
+    if [ "${FILE_PERMISSIONS}" != "640" ] ; then
+      echo "file permission is not correct."
+      return 1
+    fi
+
+    #1.3 new symlink format without mode
+    SYMLINK_PERMISSIONS=""
+    OBJECT_NAME_SYMLINK=$(basename "${PWD}")/"${TEST_DIR}/symlink-no-mode-new.txt"
+    aws_cli s3api put-object --content-type="text/plain" --metadata="symlink-target=header:12:old-text.txt" --bucket "${TEST_BUCKET_1}" --key "$OBJECT_NAME_SYMLINK"
+    SYMLINK_PERMISSIONS=$(get_permissions "${TEST_DIR}/symlink-no-mode-new.txt")
+    if [ "${SYMLINK_PERMISSIONS}" != "777" ] ; then
+      echo "symlink permission is not correct."
+      return 1
+    fi
+
+    rm -rf "${TEST_DIR}"
+
+    #get permissions by issuing list objects
+    rm -rf "${TEST_DIR}-list"
+    DIRECTORY_PERMISSIONS=""
+    FILE_PERMISSIONS=""
+    SYMLINK_PERMISSIONS=""
+    DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}-list"
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_DIR}-list/normal.txt"
+    local OBJECT_NAME1; OBJECT_NAME1=$(basename "${PWD}")/"${TEST_DIR}-list/sub-folder/normal.txt"
+    OBJECT_NAME_SYMLINK=$(basename "${PWD}")/"${TEST_DIR}-list/symlink.txt"
+
+    TMP_BODY_CONTENT_FILE="/tmp/${TEST_TEXT_FILE_BODY}.body"
+    echo "${TEST_DIR}/normal.txt" > ${TMP_BODY_CONTENT_FILE}
+    aws_cli s3api put-object --content-type="application/x-directory" --bucket "${TEST_BUCKET_1}" --key "${DIRECTORY_NAME}/"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME}" --body "${TMP_BODY_CONTENT_FILE}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME1}" --body "${TMP_BODY_CONTENT_FILE}"
+    aws_cli s3api put-object --content-type="text/plain" --metadata="symlink-target=header:12:old-text.txt" --bucket "${TEST_BUCKET_1}" --key "$OBJECT_NAME_SYMLINK"
+
+    ls "${TEST_DIR}-list" -al > /dev/null
+    DIRECTORY_PERMISSIONS=$(get_permissions "${TEST_DIR}-list/sub-folder")
+    FILE_PERMISSIONS=$(get_permissions "${TEST_DIR}-list/normal.txt")
+    SYMLINK_PERMISSIONS=$(get_permissions "${TEST_DIR}-list/symlink.txt")
+    if [ "${DIRECTORY_PERMISSIONS}" != "750" ] ; then
+      echo "dir permission is not correct."
+      return 1
+    fi
+    if [ "${FILE_PERMISSIONS}" != "640" ] ; then
+      echo "file permission is not correct."
+      return 1
+    fi
+    if [ "${SYMLINK_PERMISSIONS}" != "777" ] ; then
+      echo "symlink permission is not correct."
+      return 1
+    fi
+
+    rm -rf "${TEST_DIR}-list"
+    rm -rf "${TEST_DIR}"
+}
+
+function test_chmod_readdir_optimize {
+    describe "Testing chmod file function with readdir_optimize..."
+    # create the test file again
+    mk_test_file
+
+    local ORIGINAL_PERMISSIONS; ORIGINAL_PERMISSIONS=$(get_permissions "${TEST_TEXT_FILE}")
+
+    chmod 777 "${TEST_TEXT_FILE}";
+
+    # if they're not the same, we have a problem.
+    local CHANGED_PERMISSIONS; CHANGED_PERMISSIONS=$(get_permissions "${TEST_TEXT_FILE}")
+    if [ "${CHANGED_PERMISSIONS}" != "${ORIGINAL_PERMISSIONS}" ] ; then
+      echo "chmod should work nothing with readdir_optimize."
+      return 1
+    fi
+
+    # clean up
+    rm_test_file
+}
+
+function test_chown_readdir_optimize {
+    describe "Testing chown file function with readdir_optimize..."
+
+    # create the test file again
+    mk_test_file
+
+    local ORIGINAL_PERMISSIONS
+    if [ "$(uname)" = "Darwin" ]; then
+        ORIGINAL_PERMISSIONS=$(stat -f "%u:%g" "${TEST_TEXT_FILE}")
+    else
+        ORIGINAL_PERMISSIONS=$(stat --format=%u:%g "${TEST_TEXT_FILE}")
+    fi
+
+    # [NOTE]
+    # Prevents test interruptions due to permission errors, etc.
+    # If the chown command fails, an error will occur with the
+    # following judgment statement. So skip the chown command error.
+    # '|| true' was added due to a problem with Travis CI and MacOS
+    # and ensure_diskfree option.
+    #
+    chown 1000:1000 "${TEST_TEXT_FILE}" || true
+
+    # if they're the same, we have a problem.
+    local CHANGED_PERMISSIONS
+    if [ "$(uname)" = "Darwin" ]; then
+        CHANGED_PERMISSIONS=$(stat -f "%u:%g" "${TEST_TEXT_FILE}")
+    else
+        CHANGED_PERMISSIONS=$(stat --format=%u:%g "${TEST_TEXT_FILE}")
+    fi
+    if [ "${CHANGED_PERMISSIONS}" != "${ORIGINAL_PERMISSIONS}" ]; then
+      echo "chmod should work nothing with readdir_optimize."
+      return 1
+    fi
+
+    # clean up
+    rm_test_file
+}
+
+function test_time_readdir_optimize {
+    describe "Testing time function with readdir_optimize..."
+
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | aws_cli s3 cp --metadata="atime=1688201714,ctime=1689218776,mtime=1688201714" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
+
+    local INFO_STR; INFO_STR=$(aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME}" | grep "LastModified" | cut  -d'"' -f4 )
+    local base_time; base_time=$(date "+%s" --date "${INFO_STR}")
+
+    if [ "${base_time}" != "${base_atime}" ] || [ "${base_time}" != "${base_ctime}" ] || [ "${base_time}" != "${base_mtime}" ]; then
+       echo "time should be the same"
+       return 1
+    fi
+
+    sleep 2
+
+    #
+    # touch -> update ctime/atime/mtime
+    #
+    touch "${TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+
+    INFO_STR=$(aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME}" | grep "LastModified" | cut  -d'"' -f4 )
+    local touch_time; touch_time=$(date "+%s" --date "${INFO_STR}")
+
+    if [ "${touch_time}" != "${atime}" ] || [ "${touch_time}" != "${ctime}" ] || [ "${touch_time}" != "${mtime}" ]; then
+       echo "time should be the same"
+       return 1
+    fi
+
+    if [ "${base_time}" = "${touch_time}"]; then
+       echo "time is not the same"
+       return 1
+    fi
+
+    rm_test_file
+}
+function test_readdir_check_size_48 {
+    describe "Testing readdir_optimize with check size 48..."
+
+    rm -rf "${TEST_TEXT_FILE}"
+    rm -rf "${ALT_TEST_TEXT_FILE}"
+
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    local ALT_OBJECT_NAME; ALT_OBJECT_NAME=$(basename "${PWD}")/"${ALT_TEST_TEXT_FILE}"
+    local content_48; content_48="1234567890/1234567890/1234567890/1234567890/1234567890.txt"
+    echo "hello world" > text.txt
+    echo "hello" > long-file-text.txt
+    echo text.txt | aws_cli s3 cp --metadata="mode=41376" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
+    echo ${content_48} | aws_cli s3 cp --metadata="mode=41376" - "s3://${TEST_BUCKET_1}/${ALT_OBJECT_NAME}"
+
+    ls -al > /dev/null
+
+    local CONTENT; CONTENT=$(cat "${TEST_TEXT_FILE}")
+    if [ "${CONTENT}" != "hello world" ]; then
+       echo "CONTENT read is unexpected, got ${CONTENT}, expected world"
+       return 1
+    fi
+
+    local ALT_CONTENT; ALT_CONTENT=$(cat "${ALT_TEST_TEXT_FILE}")
+    if [ "${ALT_CONTENT}" != ${content_48} ]; then
+       echo "CONTENT read is unexpected, got ${ALT_CONTENT}, expected ${content_48}"
+       return 1
+    fi
+
+    rm -rf "${TEST_TEXT_FILE}"
+    rm -rf "${ALT_TEST_TEXT_FILE}"
+}
+
 function add_all_tests {
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
@@ -1966,8 +2210,6 @@ function add_all_tests {
     add_tests test_mv_nonempty_directory
     add_tests test_redirects
     add_tests test_mkdir_rmdir
-    add_tests test_chmod
-    add_tests test_chown
     add_tests test_list
     add_tests test_remove_nonempty_directory
     add_tests test_external_directory_creation
@@ -1985,28 +2227,6 @@ function add_all_tests {
     add_tests test_special_characters
     add_tests test_hardlink
     add_tests test_symlink
-    add_tests test_extended_attributes
-    add_tests test_mtime_file
-
-    add_tests test_update_time_chmod
-    add_tests test_update_time_chown
-    add_tests test_update_time_xattr
-    add_tests test_update_time_touch
-    if ! mount -t fuse.ossfs | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
-        add_tests test_update_time_touch_a
-    fi
-    add_tests test_update_time_append
-    add_tests test_update_time_cp_p
-    add_tests test_update_time_mv
-
-    add_tests test_update_directory_time_chmod
-    add_tests test_update_directory_time_chown
-    add_tests test_update_directory_time_set_xattr
-    add_tests test_update_directory_time_touch
-    if ! mount -t fuse.ossfs | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
-        add_tests test_update_directory_time_touch_a
-    fi
-    add_tests test_update_directory_time_subdir
     add_tests test_update_chmod_opened_file
 
     add_tests test_rm_rf_dir
@@ -2031,6 +2251,42 @@ function add_all_tests {
     add_tests test_write_data_with_skip
     if ps u -p "${OSSFS_PID}" | grep -q symlink_in_meta; then
         add_tests test_symlink_in_meta
+    fi
+
+    # when readdir_optimize enable, ignore mtime/atime/ctime, uid/gid, and permissions
+    if ps u -p "${OSSFS_PID}" | grep -q readdir_optimize; then
+        add_tests test_default_permissions_readdir_optimize
+        add_tests test_chmod_readdir_optimize
+        add_tests test_chown_readdir_optimize
+        add_tests test_time_readdir_optimize
+        if ps u -p "${OSSFS_PID}" | grep -q readdir_check_size; then
+            add_tests test_readdir_check_size_48
+        fi
+    else
+        add_tests test_chmod
+        add_tests test_chown
+        add_tests test_extended_attributes
+        add_tests test_mtime_file
+
+        add_tests test_update_time_chmod
+        add_tests test_update_time_chown
+        add_tests test_update_time_xattr
+        add_tests test_update_time_touch
+        if ! mount -t fuse.ossfs | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
+            add_tests test_update_time_touch_a
+        fi
+        add_tests test_update_time_append
+        add_tests test_update_time_cp_p
+        add_tests test_update_time_mv
+
+        add_tests test_update_directory_time_chmod
+        add_tests test_update_directory_time_chown
+        add_tests test_update_directory_time_set_xattr
+        add_tests test_update_directory_time_touch
+        if ! mount -t fuse.ossfs | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
+            add_tests test_update_directory_time_touch_a
+        fi
+        add_tests test_update_directory_time_subdir
     fi
 }
 

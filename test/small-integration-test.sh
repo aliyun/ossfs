@@ -52,8 +52,12 @@ if [ -n "${ALL_TESTS}" ]; then
         sigv1
         "singlepart_copy_limit=10"  # limit size to exercise multipart code paths
         #use_sse  # TODO: S3Proxy does not support SSE
+        listobjectsv2
         noshallowcopyapi
         symlink_in_meta
+        "use_xattr=0 -o readdir_optimize"
+        "use_xattr=0 -o readdir_optimize -o listobjectsv2"
+        "use_xattr=0 -o readdir_optimize -o readdir_check_size=48 -o symlink_in_meta"
     )
 else
     FLAGS=(
