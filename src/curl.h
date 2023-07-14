@@ -137,6 +137,7 @@ class S3fsCurl
         static sseckeylist_t    sseckeys;
         static std::string      ssekmsid;
         static sse_type_t       ssetype;
+        static bool             is_sse_cmk;
         static bool             is_content_md5;
         static bool             is_verbose;
         static bool             is_dump_body;
@@ -308,6 +309,8 @@ class S3fsCurl
         static bool GetSseKeyMd5(size_t pos, std::string& md5);
         static size_t GetSseKeyCount();
         static bool SetContentMd5(bool flag);
+        static bool SetSseCMK(bool flag);
+        static bool IsSetSseCMK() { return S3fsCurl::is_sse_cmk; }
         static bool SetVerbose(bool flag);
         static bool GetVerbose() { return S3fsCurl::is_verbose; }
         static bool SetDumpBody(bool flag);
