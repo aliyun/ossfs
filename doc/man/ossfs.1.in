@@ -87,10 +87,11 @@ Possible values: Standard, IA, Archive, ColdArchive, and DeepColdArchive.
 \fB\-o\fR use_sse (default is disable)
 Specify two type OSS's Server-Site Encryption: SSE-OSS or SSE-KMS. SSE-OSS uses Alibaba Cloud OSS-managed encryption keys and SSE-KMS uses the master key which you manage in Alibaba Cloud KMS.
 You can specify "use_sse" or "use_sse=1" enables SSE-OSS type (use_sse=1 is old type parameter).
-For setting SSE-KMS, specify "use_sse=kmsid" or "use_sse=kmsid:<kms id>".
+For setting SSE-KMS, specify "use_sse=kmsid", "use_sse=kmsid:<kms id>" or "use_sse=kms".
 You can use "k" for short "kmsid".
-If you san specify SSE-KMS type with your <kms id> in Alibaba Cloud KMS, you can set it after "kmsid:" (or "k:").
+If you specify SSE-KMS type with your <kms id> in Alibaba Cloud KMS, you can set it after "kmsid:" (or "k:").
 If you specify only "kmsid" ("k"), you need to set OSSSSEKMSID environment which value is <kms id>.
+If you specify only "kms", OSS uses the default customer master key(CMK) managed by KMS.
 You must be careful about that you can not use the KMS id which is not same EC2 region.
 .TP
 \fB\-o\fR passwd_file (default="")

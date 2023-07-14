@@ -4116,8 +4116,9 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         // use_sse=file                   Set Server Side Encrypting type to Custom key(SSE-C) and load custom keys
         // use_sse=custom(c):file
         // use_sse=custom(c)              Set Server Side Encrypting type to Custom key(SSE-C)
-        // use_sse=kmsid(k):kms-key-id    Set Server Side Encrypting type to AWS Key Management key id(SSE-KMS) and load KMS id
-        // use_sse=kmsid(k)               Set Server Side Encrypting type to AWS Key Management key id(SSE-KMS)
+        // use_sse=kmsid(k):kms-key-id    Set Server Side Encrypting type to Alibaba Cloud Key Management key id(SSE-KMS) and load KMS id
+        // use_sse=kmsid(k)               Set Server Side Encrypting type to Alibaba Cloud Key Management key id(SSE-KMS)
+        // use_sse=kms                    Set Server Side Encrypting type to default customer master key(CMK) managed by KMS (SSE-KMS
         //
         // load_sse_c=file                Load Server Side Encrypting custom keys
         //
@@ -4163,6 +4164,14 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
                 }
                 S3fsCurl::SetSseType(sse_type_t::SSE_KMS);
 
+            }else if(0 == strcmp(arg, "use_sse=kms")){
+                // sse type is SSE_KMS without kmsid, uses the default customer master key(CMK) managed by KMS.
+                if(!S3fsCurl::IsSseDisable() && !S3fsCurl::IsSseKmsType()){
+                    S3FS_PRN_EXIT("already set SSE another type, so conflict use_sse option or environment.");
+                    return -1;
+                }
+                S3fsCurl::SetSseType(sse_type_t::SSE_KMS);
+                S3fsCurl::SetSseCMK(true);
             }
             /*
             else if(0 == strcmp(arg, "use_sse=custom") || 0 == strcmp(arg, "use_sse=c")){

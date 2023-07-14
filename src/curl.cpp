@@ -94,6 +94,7 @@ std::string      S3fsCurl::storage_class       = "STANDARD";
 sseckeylist_t    S3fsCurl::sseckeys;
 std::string      S3fsCurl::ssekmsid;
 sse_type_t       S3fsCurl::ssetype             = sse_type_t::SSE_DISABLE;
+bool             S3fsCurl::is_sse_cmk          = false; // use the default customer master key (CMK) managed by KMS
 bool             S3fsCurl::is_content_md5      = false;
 bool             S3fsCurl::is_verbose          = false;
 bool             S3fsCurl::is_dump_body        = false;
@@ -883,6 +884,13 @@ bool S3fsCurl::SetSseKmsid(const char* kmsid)
     return true;
 }
 
+bool S3fsCurl::SetSseCMK(bool flag)
+{
+    bool old = S3fsCurl::is_sse_cmk;
+    S3fsCurl::is_sse_cmk = flag;
+    return old;
+}
+
 // [NOTE]
 // Because SSE is set by some options and environment, 
 // this function check the integrity of the SSE data finally.
@@ -903,6 +911,13 @@ bool S3fsCurl::FinalCheckSse()
             S3fsCurl::ssekmsid.erase();
             return true;
         case sse_type_t::SSE_KMS:
+            if (S3fsCurl::is_sse_cmk) {
+                if(!S3fsCurl::ssekmsid.empty()){
+                    S3FS_PRN_ERR("sse type is SSE-KMS, cannot set cmk and kms id at the same time.");
+                    return false;
+                }
+                return true;
+            }
             if(S3fsCurl::ssekmsid.empty()){
                 S3FS_PRN_ERR("sse type is SSE-KMS, but there is no specified kms id.");
                 return false;
@@ -3041,10 +3056,14 @@ bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, const std::string& input, b
         case sse_type_t::SSE_KMS:
             if(!is_only_c){
                 if(ssevalue.empty()){
-                    ssevalue = S3fsCurl::GetSseKmsId();
+                    if (!S3fsCurl::IsSetSseCMK()) {
+                        ssevalue = S3fsCurl::GetSseKmsId();
+                    }
                 }
                 requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption", "KMS");
-                requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-key-id", ssevalue.c_str());
+                if(!ssevalue.empty()) {
+                    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-server-side-encryption-key-id", ssevalue.c_str());
+                }
             }
             return true;
     }
