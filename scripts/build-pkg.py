@@ -33,13 +33,15 @@ docker_images = {
     'ubuntu18.04:test':'ossfs-ubuntu18.04:test',
     'ubuntu20.04:dev':'ossfs-ubuntu20.04:dev',
     'ubuntu20.04:test':'ossfs-ubuntu20.04:test',
+    'ubuntu22.04:dev':'ossfs-ubuntu22.04:dev',
+    'ubuntu22.04:test':'ossfs-ubuntu22.04:test',
     'anolisos7.0:dev':'ossfs-anolisos7.0:dev',
     'anolisos7.0:test':'ossfs-anolisos7.0:test',
     'anolisos8.0:dev':'ossfs-anolisos8.0:dev',
     'anolisos8.0:test':'ossfs-anolisos8.0:test',
 }
 
-os_list = ['centos7.0', 'centos8.0', 'ubuntu14.04', 'ubuntu16.04', 'ubuntu18.04', 'ubuntu20.04', 'anolisos7.0', 'anolisos8.0']
+os_list = ['centos7.0', 'centos8.0', 'ubuntu14.04', 'ubuntu16.04', 'ubuntu18.04', 'ubuntu20.04', 'ubuntu22.04', 'anolisos7.0', 'anolisos8.0']
 working_dir = '/tmp/ossfs'
 dest_dir = '/var/ossfs'
 ossfs_source_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -300,6 +302,11 @@ def build_docker_image():
     exec_cmd('docker pull ubuntu:20.04')
     exec_cmd('docker tag ubuntu:20.04 ossfs-ubuntu20.04:test')
     exec_cmd('docker build -t ossfs-ubuntu20.04:dev %s/scripts/docker-file/ubuntu/20.04'%ossfs_source_dir)
+
+    #ubuntu:22.04
+    exec_cmd('docker pull ubuntu:22.04')
+    exec_cmd('docker tag ubuntu:22.04 ossfs-ubuntu22.04:test')
+    exec_cmd('docker build -t ossfs-ubuntu22.04:dev %s/scripts/docker-file/ubuntu/22.04'%ossfs_source_dir)
 
     #centos:7.x
     exec_cmd('docker pull centos:centos7')
