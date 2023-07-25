@@ -1,3 +1,109 @@
+﻿ChangeLog for OSSFS
+------------------
+## v1.91.1 (25/07/2023)
+
+ - sse supports customer master key (CMK).
+ - Support symlink_in_meta option.
+ - Support readdir_optimize option.
+ - Enable shallow copy feature.
+ - Support traffic limit option.
+ - Fixed a bug could not change the mode while the file was opened.
+ - Fixed segmentation fault caused by file write failure.
+ - Avoid extended initializer lists in C++03.
+ - Compatible with OpenSSL 3.0.
+ - Fixed deadlock in S3fsCurl::DestroyCurlHandle.
+ - Fixed a bug when end of path for mount point is multi slash.
+ - Consume return code from get_object_attribute.
+ - Fixed a bug when the pool of curl handler exceeds the upper limit.
+ - Fix double-iteration in curl_slist_remove.
+ - Rebuild ossfs based s3fs 1.91.
+
+## v1.80.7 (13/12/2022)
+
+- Add listobjectV2 option.
+- Add notsup_compat_dir option.
+- Add requester_pays option.
+- Refactored the check_object_access function.
+- Fixed a bug about overwrite metadata at updating directory stats.
+- Flush file before renaming & Fixed a rename bug when enable_noobj_cache.
+- Always hold lock when accessing free_disk_space.
+- Remove cache file when object time differs.
+- Fix deadlock due to fdmanager_lock and fdent_data_lock.
+- Remove mirror path when deleting cache.
+- Load tail range during overwrite.
+- Fixed ref-count when error occurred.
+- Increase FdEntity reference count when returning.
+- Add disk space reservation.
+- Reduce lock contention on file open.
+- Fix condition for parallel download.
+- Improved use of temporary files.
+- Fix intermittent upload failures on macOS.
+- Add remove stat file cache dir api.
+- Some files partially contain NUL content after uploading.
+- Fixed writing sparsed file.
+- Cleanup cache directory when running out of disk space.
+- Add mirror file logic for removing cache file.
+
+## v1.80.6 (24/05/2019)
+
+- support ECSRole
+
+## v1.80.5 (25/05/2018)
+
+- Lock FdEntity when race condition
+
+## v1.80.4 (11/04/2018)
+
+- fix request hang when flush the writing file
+- update acl description of user in README
+- sleep for awhile when curl_multi_fdset failed
+
+## v1.80.3 (12/10/2017)
+
+- Fix a rename bug
+
+## v1.80.2 (06/01/2017)
+
+- Fix list error when path contains multi-slash
+- Print verbose message when failed to mount ossfs
+
+## v1.80.1 (05/16/2017)
+
+- Fix noobj cache bug
+- Fix null path in flush
+
+## v1.80.0 (12/14/2016)
+
+- Relax dir object content-type (#34)
+
+## v1.79.9 (6/17/2016)
+
+- Print to stderr when check OSS fails (#31)
+
+## v1.79.8 (4/22/2016)
+
+- Fix a bug when truncating an empty file (#27)
+
+## v1.79.7 (4/19/2016)
+
+- Change object default permission to 777
+- Add curl handler pool to reuse connections (#24)
+
+## v1.79.6 (3/29/2016)
+
+- Add the missing User-Agent in multi-head request
+
+## v1.79.5 (3/29/2016)
+
+- Setup travis CI
+- Fix a bug in fd cache lookup
+- Add script to build dist package
+
+## v1.79.4 (3/21/2016)
+
+- Add noxattr option to disable get/set xattr
+
+
 ChangeLog for S3FS
 ------------------
 
