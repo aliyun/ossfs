@@ -12,7 +12,7 @@ In the system, you can conveniently operate on objects in OSS while using the lo
 
 ## Features
 
-The ossfs is built based on ossfs and has all the features of s3fs. Main features:
+The ossfs is built based on s3fs and has all the features of s3fs. Main features:
 
 * large subset of POSIX including reading/writing files, directories, symlinks, mode, uid/gid, and extended attributes
 * allows random writes and appends
