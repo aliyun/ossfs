@@ -65,7 +65,7 @@ function cleanup {
 
     sleep 5
 
-    for f in $dir/bench.goofys $dir/bench.s3fs $dir/bench.ossfs $dir/bench.ossfs-ls $dir/bench.data $dir/bench.png; do
+    for f in $dir/bench.goofys $dir/bench.s3fs $dir/bench.ossfs $dir/bench.ossfs+readdir-optimize $dir/bench.data $dir/bench.png; do
 	if [ -e $f ]; then
 	    cp $f bench-mnt/
 	fi
@@ -78,7 +78,7 @@ function cleanup {
 }
 trap cleanup EXIT
 
-for fs in s3fs ossfs ossfs-ls goofys; do
+for fs in s3fs ossfs ossfs+readdir-optimize goofys; do
     if [ "$fs" == "-" ]; then
 	continue
     fi
@@ -101,7 +101,7 @@ for fs in s3fs ossfs ossfs-ls goofys; do
             FS=$OSSFS
             CREATE_FS=$FS
             ;;
-        ossfs-ls)
+        ossfs+readdir-optimize)
             FS="${OSSFS} -oreaddir_optimize"
             CREATE_FS=$FS
             ;;
@@ -141,7 +141,7 @@ for fs in s3fs ossfs ossfs-ls goofys; do
     fi
 done
 
-$dir/bench_format.py <(paste $dir/bench.ossfs $dir/bench.s3fs) > $dir/bench.data
-gnuplot -c $dir/bench_graph.gnuplot $dir/bench.data $dir/bench.png ossfs s3fs && convert -rotate 90 $dir/bench.png $dir/bench.png
-
+$dir/bench_format.py <(paste $dir/bench.ossfs $dir/bench.s3fs $dir/bench.goofys $dir/bench.ossfs+readdir-optimize) > $dir/bench.data
+gnuplot -c $dir/bench_graph_all.gnuplot $dir/bench.data $dir/bench.png ossfs s3fs goofys ossfs+readdir-optimize
+convert -rotate 90 $dir/bench.png $dir/bench.png
 

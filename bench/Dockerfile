@@ -23,7 +23,7 @@ RUN git clone --depth 1 https://github.com/s3fs-fuse/s3fs-fuse.git && \
     cd .. && rm -Rf s3fs-fuse
 
 # get prebuild bin
-RUN curl -SL https://github.com/kahing/goofys/releases/latest/download/goofys -o /usr/local/bin && \
+RUN curl -SL https://github.com/kahing/goofys/releases/latest/download/goofys -o /usr/local/bin/goofys && \
     chmod +x /usr/local/bin/goofys
 
 #get ossfs

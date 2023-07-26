@@ -219,8 +219,8 @@ function create_tree_parallel {
             mkdir $i/$j
 
             for k in $(seq 1 9); do
-                 touch $i/$j/$k & true
-             done
+                (echo $k > $i/$j/$k) & true
+            done
          done
     done
     wait)
