@@ -1,6 +1,6 @@
 ﻿ChangeLog for OSSFS
 ------------------
-## v1.91.1 (25/07/2023)
+## v1.91.1 (27/07/2023)
 
  - sse supports customer master key (CMK).
  - Support symlink_in_meta option.
