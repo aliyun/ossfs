@@ -3749,7 +3749,7 @@ static int s3fs_check_service()
 
     S3fsCurl s3fscurl;
     int      res;
-    if(0 > (res = s3fscurl.CheckBucket())){
+    if(0 > (res = s3fscurl.CheckBucket("/"))){
         // get response code
         long responseCode = s3fscurl.GetLastResponseCode();
 
@@ -3810,9 +3810,16 @@ static int s3fs_check_service()
                 }
                 // retry to check with new host
                 s3fscurl.DestroyCurlHandle();
-                res          = s3fscurl.CheckBucket();
+                res          = s3fscurl.CheckBucket("/");
                 responseCode = s3fscurl.GetLastResponseCode();
             }
+        }
+
+        // retry to check with mount prefix
+        if(300 <= responseCode && responseCode < 500 && !mount_prefix.empty()){
+            s3fscurl.DestroyCurlHandle();
+            res          = s3fscurl.CheckBucket(get_realpath("/").c_str());
+            responseCode = s3fscurl.GetLastResponseCode();
         }
 
         // try signature v2
