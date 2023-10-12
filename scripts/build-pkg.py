@@ -132,7 +132,7 @@ def command_build_package(f, install_dir):
     f.write('cd %s/package\n' % dest_dir)
 
 def command_test_package(f):
-    f.write('version=$(ossfs --version | grep -E -o "V[0-9.]+" | cut -d"V" -f2)\n')
+    f.write('version=$(ossfs --version | grep -E -o "V[0-9.]+[^ ]+" | cut -d"V" -f2)\n')
     f.write('test "$version" = "%s"\n' % ossfs_version)
 
 def command_build_package_centos65():
