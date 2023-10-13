@@ -4522,6 +4522,63 @@ int S3fsCurl::GetObjectRequestStream(const char* tpath, char *buff, off_t start,
     return result;
 }
 
+int S3fsCurl::ParallelGetObjectRequestStream(const char* tpath, char *buff, off_t start, off_t size)
+{
+    S3FS_PRN_INFO3("[tpath=%s][buff=%p]", SAFESTRPTR(tpath), buff);
+
+    sse_type_t ssetype = sse_type_t::SSE_DISABLE;
+    std::string ssevalue;
+    if(!get_object_sse_type(tpath, ssetype, ssevalue)){
+        S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
+    }
+    int        result = 0;
+    off_t      remaining_bytes;
+
+    // cycle through open fd, pulling off 10MB chunks at a time
+    for(remaining_bytes = size; 0 < remaining_bytes; ){
+        S3fsMultiCurl curlmulti(GetMaxParallelCount());
+        int           para_cnt;
+        off_t         chunk;
+
+        // Initialize S3fsMultiCurl
+        curlmulti.SetSuccessCallback(NULL);   // not need to set success callback
+        //TODO
+        //curlmulti.SetRetryCallback(S3fsCurl::ParallelGetObjectRetryCallback);
+
+        // Loop for setup parallel upload(multipart) request.
+        for(para_cnt = 0; para_cnt < S3fsCurl::max_parallel_cnt && 0 < remaining_bytes; para_cnt++, remaining_bytes -= chunk){
+            // chunk size
+            chunk = remaining_bytes > S3fsCurl::multipart_size ? S3fsCurl::multipart_size : remaining_bytes;
+
+            // s3fscurl sub object
+            S3fsCurl* s3fscurl_para = new S3fsCurl();
+            if(0 != (result = s3fscurl_para->PreGetObjectRequestStream(tpath, buff + (size - remaining_bytes), (start + size - remaining_bytes), chunk, ssetype, ssevalue))){
+                S3FS_PRN_ERR("failed downloading part setup(%d)", result);
+                delete s3fscurl_para;
+                return result;
+            }
+
+            // set into parallel object
+            if(!curlmulti.SetS3fsCurlObject(s3fscurl_para)){
+                S3FS_PRN_ERR("Could not make curl object into multi curl(%s).", tpath);
+                delete s3fscurl_para;
+                return -EIO;
+            }
+        }
+
+        // Multi request
+        if(0 != (result = curlmulti.Request())){
+            S3FS_PRN_ERR("error occurred in multi request(errno=%d).", result);
+            break;
+        }
+
+        // reinit for loop.
+        curlmulti.Clear();
+    }
+    return result;
+}
+
+
 /*
 * Local variables:
 * tab-width: 4

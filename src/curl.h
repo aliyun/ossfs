@@ -279,6 +279,7 @@ class S3fsCurl
         static int ParallelMultipartUploadRequest(const char* tpath, headers_t& meta, int fd);
         static int ParallelMixMultipartUploadRequest(const char* tpath, headers_t& meta, int fd, const fdpage_list_t& mixuppages);
         static int ParallelGetObjectRequest(const char* tpath, int fd, off_t start, off_t size);
+        static int ParallelGetObjectRequestStream(const char* tpath, char *buff, off_t start, off_t size);
 
         // class methods(variables)
         static std::string LookupMimeType(const std::string& name);
