@@ -124,6 +124,12 @@ FdEntity::FdEntity(const char* tpath, const char* cpath) :
         abort();
     }
     is_lock_init = true;
+
+    prefetch_buffer = NULL;
+    prefetch_offset = 0;
+    prefetch_bytes = 0;
+    prefetch_capacity = 0;
+    prefetch_lazy_init = false;
 }
 
 FdEntity::~FdEntity()
@@ -187,6 +193,12 @@ void FdEntity::Clear()
     pagelist.Init(0, false, false);
     path      = "";
     cachepath = "";
+
+    if (prefetch_buffer != NULL) {
+        S3FS_PRN_DBG("free prefetch_buffer %p.", prefetch_buffer);
+        free(prefetch_buffer);
+        prefetch_buffer = NULL;
+    }
 }
 
 // [NOTE]
@@ -2323,16 +2335,60 @@ ssize_t FdEntity::ReadFromStream(const char* tpath, char *buff, off_t start, off
     S3fsCurl s3fscurl;
     int result;
     ssize_t rsize;
-
+    S3FS_PRN_DBG("[path=%s][offset=%lld][size=%zu]", path.c_str(), static_cast<long long int>(start), size);
     //TODO
     //load into prefetch buffer 
     //read from prefetch buffer
     //sequential-read check, swith between sequential read and random read
-    result = s3fscurl.GetObjectRequestStream(path.c_str(), buff, start, size, rsize);
-    if(0 != result){
-        S3FS_PRN_ERR("could not download. start(%lld), size(%zu), errno(%d)", static_cast<long long int>(start), size, result);
-        return -errno;
+    if (!prefetch_lazy_init) {
+        off_t total_size = pagelist.Size();
+        ssize_t prefetch_max_size = std::min(total_size, S3fsCurl::GetMultipartSize());
+        if (prefetch_max_size > 512*1024) {
+            prefetch_max_size = (prefetch_max_size + 256*1024 -1)/(256*1024) * (256*1024);
+            char *pbuff = (char *)malloc(prefetch_max_size);
+            if (pbuff != NULL) {
+                prefetch_buffer = pbuff;
+                prefetch_capacity = prefetch_max_size;
+            }
+        }
+        prefetch_offset = 0;
+        prefetch_bytes = 0; 
+        prefetch_lazy_init = true;
+        S3FS_PRN_DBG("prefetch init [path=%s][prefetch_capacity=%lld][prefetch_buffer=%p]", path.c_str(), static_cast<long long int>(prefetch_capacity), prefetch_buffer);
     }
+
+    if (!prefetch_buffer){
+        result = s3fscurl.GetObjectRequestStream(path.c_str(), buff, start, size, rsize);
+        if(0 != result){
+            S3FS_PRN_ERR("could not download. start(%lld), size(%zu), errno(%d)", static_cast<long long int>(start), size, result);
+            return -errno;
+        }
+        return rsize;
+    }
+
+    off_t bstart = prefetch_offset;
+    off_t bend = prefetch_offset + prefetch_bytes;
+    off_t end = start + size;
+    //load into prefetch_buffer
+    S3FS_PRN_DBG("prefetch load start [path=%s][bstart=%lld][bstart=%lld][end=%lld]", path.c_str(), (long long int)bstart, (long long int)bend,(long long int)end);
+    if (!(bstart <= start && end <= bend)) {
+        prefetch_offset = start/(256*1024) * 256*1024;
+        S3FS_PRN_DBG("prefetch [path=%s][offset=%lld][size=%lld]", path.c_str(), static_cast<long long int>(prefetch_offset), static_cast<long long int>(prefetch_capacity));
+        result = s3fscurl.GetObjectRequestStream(path.c_str(), prefetch_buffer, prefetch_offset, prefetch_capacity, rsize);
+        if(0 != result){
+            S3FS_PRN_ERR("could not download. start(%lld), size(%zu), errno(%d)", static_cast<long long int>(start), size, result);
+            return -errno;
+        }
+        prefetch_bytes = rsize;
+    }
+
+    //read from prefetch_buffer 
+    bend = prefetch_offset + prefetch_bytes;
+    end = start + size;
+    end = std::min(bend, end);
+    rsize = end - start;
+    //S3FS_PRN_DBG("prefetch load mid [path=%s][bstart=%lld][bstart=%lld][end=%lld]", path.c_str(), (long long int)bstart, (long long int)bend,(long long int)end);
+    memcpy(buff, prefetch_buffer + (start - prefetch_offset), rsize);
     return rsize;
 }
 /*

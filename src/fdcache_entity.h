@@ -54,6 +54,12 @@ class FdEntity
         struct timespec holding_mtime;  // if mtime is updated while the file is open, it is set time_t value
         bool            is_direct_read;
 
+        char*           prefetch_buffer;
+        off_t           prefetch_offset;
+        off_t           prefetch_bytes;
+        int64_t         prefetch_capacity;
+        bool            prefetch_lazy_init;
+
     private:
         static int FillFile(int fd, unsigned char byte, off_t size, off_t start);
         static ino_t GetInode(int fd);
@@ -80,7 +86,7 @@ class FdEntity
         int OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, int flags);
         ssize_t ReadDirectInner(int fd, char* bytes, off_t start, size_t size, bool force_load = false);
         ssize_t ReadFromStream(const char* tpath, char *buff, off_t start, off_t size);
-        
+
     public:
         static bool GetNoMixMultipart() { return mixmultipart; }
         static bool SetNoMixMultipart();
