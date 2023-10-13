@@ -4542,6 +4542,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         if(0 == strcmp(arg, "symlink_in_meta")){
             is_new_symlink_format = true;
             return 0;
+        }
+        if(0 == strcmp(arg, "enable_direct_read")){
+            FdEntity::SetDirectRead(true);
+            return 0;
         }        
         //
         // log file option

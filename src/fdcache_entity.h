@@ -33,6 +33,7 @@ class FdEntity
 {
     private:
         static bool     mixmultipart;   // whether multipart uploading can use copy api.
+        static bool     direct_read;   // read directly from server for read only file 
 
         pthread_mutex_t fdent_lock;
         bool            is_lock_init;
@@ -51,6 +52,7 @@ class FdEntity
         std::string     mirrorpath;     // mirror file path to local cache file path
         bool            is_meta_pending;
         struct timespec holding_mtime;  // if mtime is updated while the file is open, it is set time_t value
+        bool            is_direct_read;
 
     private:
         static int FillFile(int fd, unsigned char byte, off_t size, off_t start);
@@ -75,9 +77,16 @@ class FdEntity
         ssize_t WriteMixMultipart(PseudoFdInfo* pseudo_obj, const char* bytes, off_t start, size_t size);
         int UploadPendingMeta();
 
+        int OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, int flags);
+        ssize_t ReadDirectInner(int fd, char* bytes, off_t start, size_t size, bool force_load = false);
+        ssize_t ReadFromStream(const char* tpath, char *buff, off_t start, off_t size);
+        
     public:
         static bool GetNoMixMultipart() { return mixmultipart; }
         static bool SetNoMixMultipart();
+        static bool GetDirectRead() { return direct_read; }
+        static bool SetDirectRead(bool flag);
+
 
         explicit FdEntity(const char* tpath = NULL, const char* cpath = NULL);
         ~FdEntity();

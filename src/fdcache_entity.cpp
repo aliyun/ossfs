@@ -43,6 +43,7 @@ static const int MAX_MULTIPART_CNT         = 10 * 1000; // OSS multipart max cou
 // FdEntity class variables
 //------------------------------------------------
 bool FdEntity::mixmultipart = true;
+bool FdEntity::direct_read = false;
 
 //------------------------------------------------
 // FdEntity class methods
@@ -51,6 +52,13 @@ bool FdEntity::SetNoMixMultipart()
 {
     bool old = mixmultipart;
     mixmultipart = false;
+    return old;
+}
+
+bool FdEntity::SetDirectRead(bool flag)
+{
+    bool old = direct_read;
+    direct_read = flag;
     return old;
 }
 
@@ -96,7 +104,8 @@ ino_t FdEntity::GetInode(int fd)
 FdEntity::FdEntity(const char* tpath, const char* cpath) :
     is_lock_init(false), path(SAFESTRPTR(tpath)),
     physical_fd(-1), pfile(NULL), inode(0), size_orgmeta(0),
-    cachepath(SAFESTRPTR(cpath)), is_meta_pending(false)
+    cachepath(SAFESTRPTR(cpath)), is_meta_pending(false),
+    is_direct_read(false)
 {
     holding_mtime.tv_sec = -1;
     holding_mtime.tv_nsec = 0;
@@ -418,6 +427,11 @@ int FdEntity::Open(const headers_t* pmeta, off_t size, time_t time, int flags, A
 
     AutoLock auto_data_lock(&fdent_data_lock);
 
+    if (direct_read && ((flags & O_ACCMODE) == O_RDONLY)) {
+        is_direct_read = true;
+        return OpenDirectInner(pmeta, size, time, flags);
+    }
+
     if(-1 != physical_fd){
         //
         // already open file
@@ -730,7 +744,7 @@ bool FdEntity::IsModified() const
 bool FdEntity::GetStats(struct stat& st, bool lock_already_held)
 {
     AutoLock auto_lock(&fdent_lock, lock_already_held ? AutoLock::ALREADY_LOCKED : AutoLock::NONE);
-    if(-1 == physical_fd){
+    if(-1 == physical_fd || is_direct_read){
         return false;
     }
 
@@ -1757,6 +1771,10 @@ ssize_t FdEntity::Read(int fd, char* bytes, off_t start, size_t size, bool force
     AutoLock auto_lock(&fdent_lock);
     AutoLock auto_lock2(&fdent_data_lock);
 
+    if (is_direct_read) {
+        return ReadDirectInner(fd, bytes, start, size, force_load);
+    }
+
     if(force_load){
         pagelist.SetPageLoadedStatus(start, size, PageList::PAGE_NOT_LOAD_MODIFIED);
     }
@@ -2231,6 +2249,92 @@ void FdEntity::MarkDirtyNewFile()
     is_meta_pending = true;
 }
 
+int FdEntity::OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, int flags)
+{
+    S3FS_PRN_DBG("[path=%s][physical_fd=%d][size=%lld][time=%lld][flags=0x%x]", path.c_str(), physical_fd, static_cast<long long>(size), static_cast<long long>(time), flags);
+
+    if(-1 != physical_fd){
+        //
+        // already open file
+        //
+        // set original headers and set size.
+        off_t new_size = (0 <= size ? size : size_orgmeta);
+        if(pmeta){
+            orgmeta  = *pmeta;
+            size_orgmeta = get_size(orgmeta);
+        }
+        if(new_size < size_orgmeta){
+            size_orgmeta = new_size;
+        }
+
+        S3FS_PRN_DBG("[size=%lld], [size_orgmeta=%lld]", static_cast<long long>(size), static_cast<long long>(size_orgmeta));
+
+    } else {
+        // open temporary file
+        if(NULL == (pfile = FdManager::MakeTempFile()) || -1 ==(physical_fd = fileno(pfile))){
+            S3FS_PRN_ERR("failed to open temporary file by errno(%d)", errno);
+            if(pfile){
+                fclose(pfile);
+                pfile = NULL;
+            }
+            return (0 == errno ? -EIO : -errno);
+        }
+        if(-1 == size){
+            size = 0;
+            pagelist.Init(0, false, false);
+        }else{
+            // [NOTE]
+            // The modify flag must not be set when opening a file,
+            // if the time parameter(mtime) is specified(not -1) and
+            // the cache file does not exist.
+            // If mtime is specified for the file and the cache file
+            // mtime is older than it, the cache file is removed and
+            // the processing comes here.
+            //
+            pagelist.Resize(size, false, (0 <= time ? false : true));
+        }
+    }
+
+    // set original headers and size in it.
+    if(pmeta){
+        orgmeta      = *pmeta;
+        size_orgmeta = get_size(orgmeta);
+    }else{
+        orgmeta.clear();
+        size_orgmeta = 0;
+    }
+
+    // create new pseudo fd, and set it to map
+    PseudoFdInfo*   ppseudoinfo = new PseudoFdInfo(physical_fd, flags);
+    int             pseudo_fd   = ppseudoinfo->GetPseudoFd();
+    pseudo_fd_map[pseudo_fd]    = ppseudoinfo;
+
+    return pseudo_fd;
+}
+
+ssize_t FdEntity::ReadDirectInner(int fd, char* bytes, off_t start, size_t size, bool force_load)
+{
+    S3FS_PRN_INFO("[path=%s][pseudo_fd=%d][offset=%lld][size=%zu]", path.c_str(), fd, static_cast<long long int>(start), size);
+    return ReadFromStream(path.c_str(), bytes, start, size);
+}
+
+ssize_t FdEntity::ReadFromStream(const char* tpath, char *buff, off_t start, off_t size)
+{
+    S3fsCurl s3fscurl;
+    int result;
+    ssize_t rsize;
+
+    //TODO
+    //load into prefetch buffer 
+    //read from prefetch buffer
+    //sequential-read check, swith between sequential read and random read
+    result = s3fscurl.GetObjectRequestStream(path.c_str(), buff, start, size, rsize);
+    if(0 != result){
+        S3FS_PRN_ERR("could not download. start(%lld), size(%zu), errno(%d)", static_cast<long long int>(start), size, result);
+        return -errno;
+    }
+    return rsize;
+}
 /*
 * Local variables:
 * tab-width: 4

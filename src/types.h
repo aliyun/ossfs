@@ -210,8 +210,12 @@ struct filepart
     off_t        size;        // uploading size
     bool         is_copy;     // whether is copy multipart
     etagpair*    petag;       // use only parallel upload
+    char*        buff;        // base buffer prt 
+    off_t        buffpos;
 
-    filepart(bool is_uploaded = false, int _fd = -1, off_t part_start = 0, off_t part_size = -1, bool is_copy_part = false, etagpair* petagpair = NULL) : uploaded(false), fd(_fd), startpos(part_start), size(part_size), is_copy(is_copy_part), petag(petagpair) {}
+    filepart(bool is_uploaded = false, int _fd = -1, off_t part_start = 0, off_t part_size = -1, bool is_copy_part = false, etagpair* petagpair = NULL) : 
+        uploaded(false), fd(_fd), startpos(part_start), size(part_size), is_copy(is_copy_part), petag(petagpair),
+        buff(NULL),buffpos(0) {}
 
     ~filepart()
     {
@@ -227,6 +231,8 @@ struct filepart
         size     = -1;
         is_copy  = false;
         petag    = NULL;
+        buff     = NULL;
+        buffpos  = 0;
     }
 
     void add_etag_list(etaglist_t& list, int partnum = -1)
