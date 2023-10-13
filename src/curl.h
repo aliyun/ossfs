@@ -232,6 +232,7 @@ class S3fsCurl
         static S3fsCurl* CopyMultipartPostRetryCallback(S3fsCurl* s3fscurl);
         static S3fsCurl* MixMultipartPostRetryCallback(S3fsCurl* s3fscurl);
         static S3fsCurl* ParallelGetObjectRetryCallback(S3fsCurl* s3fscurl);
+        static S3fsCurl* ParallelGetObjectStreamRetryCallback(S3fsCurl* s3fscurl);
 
         // lazy functions for set curl options
         static bool UploadMultipartPostSetCurlOpts(S3fsCurl* s3fscurl);

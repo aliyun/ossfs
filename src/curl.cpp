@@ -4522,6 +4522,31 @@ int S3fsCurl::GetObjectRequestStream(const char* tpath, char *buff, off_t start,
     return result;
 }
 
+S3fsCurl* S3fsCurl::ParallelGetObjectStreamRetryCallback(S3fsCurl* s3fscurl)
+{
+    int result;
+
+    if(!s3fscurl){
+        return NULL;
+    }
+    if(s3fscurl->retry_count >= S3fsCurl::retries){
+        S3FS_PRN_ERR("Over retry count(%d) limit(%s).", s3fscurl->retry_count, s3fscurl->path.c_str());
+        return NULL;
+    }
+
+    // duplicate request(setup new curl object)
+    S3fsCurl* newcurl = new S3fsCurl(s3fscurl->IsUseAhbe());
+    
+    if(0 != (result = newcurl->PreGetObjectRequestStream(s3fscurl->path.c_str(), s3fscurl->partdata.buff, s3fscurl->partdata.startpos, s3fscurl->partdata.size, s3fscurl->b_ssetype, s3fscurl->b_ssevalue))){
+        S3FS_PRN_ERR("failed downloading part setup(%d)", result);
+        delete newcurl;
+        return NULL;;
+    }
+    newcurl->retry_count = s3fscurl->retry_count + 1;
+
+    return newcurl;
+}
+
 int S3fsCurl::ParallelGetObjectRequestStream(const char* tpath, char *buff, off_t start, off_t size)
 {
     S3FS_PRN_INFO3("[tpath=%s][buff=%p]", SAFESTRPTR(tpath), buff);
@@ -4541,9 +4566,8 @@ int S3fsCurl::ParallelGetObjectRequestStream(const char* tpath, char *buff, off_
         off_t         chunk;
 
         // Initialize S3fsMultiCurl
-        curlmulti.SetSuccessCallback(NULL);   // not need to set success callback
-        //TODO
-        //curlmulti.SetRetryCallback(S3fsCurl::ParallelGetObjectRetryCallback);
+        //curlmulti.SetSuccessCallback(NULL);   // not need to set success callback
+        curlmulti.SetRetryCallback(S3fsCurl::ParallelGetObjectStreamRetryCallback);
 
         // Loop for setup parallel upload(multipart) request.
         for(para_cnt = 0; para_cnt < S3fsCurl::max_parallel_cnt && 0 < remaining_bytes; para_cnt++, remaining_bytes -= chunk){
