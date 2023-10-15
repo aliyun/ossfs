@@ -67,6 +67,8 @@ endif
 if USE_SSL_NSS
     ossfs_SOURCES += nss_auth.cpp
 endif
+    ossfs_SOURCES += threadpoolman.cpp
+    ossfs_SOURCES += streamreader.cpp
 
 ossfs_LDADD = $(DEPS_LIBS)
 

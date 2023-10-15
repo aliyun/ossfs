@@ -125,6 +125,7 @@ FdEntity::FdEntity(const char* tpath, const char* cpath) :
     }
     is_lock_init = true;
 
+    buffreader = NULL;
     prefetch_buffer = NULL;
     prefetch_offset = 0;
     prefetch_bytes = 0;
@@ -198,6 +199,10 @@ void FdEntity::Clear()
         S3FS_PRN_DBG("free prefetch_buffer %p.", prefetch_buffer);
         free(prefetch_buffer);
         prefetch_buffer = NULL;
+    }
+
+    if (buffreader) {
+        delete buffreader;
     }
 }
 
@@ -2304,6 +2309,8 @@ int FdEntity::OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, i
             // the processing comes here.
             //
             pagelist.Resize(size, false, (0 <= time ? false : true));
+
+            buffreader = new BufferReader(path.c_str(), size, 1*1024*1024);
         }
     }
 
@@ -2327,7 +2334,11 @@ int FdEntity::OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, i
 ssize_t FdEntity::ReadDirectInner(int fd, char* bytes, off_t start, size_t size, bool force_load)
 {
     S3FS_PRN_INFO("[path=%s][pseudo_fd=%d][offset=%lld][size=%zu]", path.c_str(), fd, static_cast<long long int>(start), size);
-    return ReadFromStream(path.c_str(), bytes, start, size);
+    if (buffreader) {
+        return buffreader->Read(bytes, start, size);
+    }
+    return -1;
+    //return ReadFromStream(path.c_str(), bytes, start, size);
 }
 
 ssize_t FdEntity::ReadFromStream(const char* tpath, char *buff, off_t start, off_t size)

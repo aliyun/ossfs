@@ -25,6 +25,7 @@
 #include "fdcache_page.h"
 #include "fdcache_fdinfo.h"
 #include "metaheader.h"
+#include "streamreader.h"
 
 //------------------------------------------------
 // class FdEntity
@@ -52,8 +53,9 @@ class FdEntity
         std::string     mirrorpath;     // mirror file path to local cache file path
         bool            is_meta_pending;
         struct timespec holding_mtime;  // if mtime is updated while the file is open, it is set time_t value
+        
         bool            is_direct_read;
-
+        BufferReader    *buffreader;
         char*           prefetch_buffer;
         off_t           prefetch_offset;
         off_t           prefetch_bytes;

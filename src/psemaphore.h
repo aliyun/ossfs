@@ -1,5 +1,5 @@
 /*
- * ossfs -  FUSE-based file system backed by Alibaba Cloud OSS
+ * s3fs - FUSE-based file system backed by Amazon S3
  *
  * Copyright(C) 2007 Randy Rizun <rrizun@gmail.com>
  *
@@ -42,6 +42,14 @@ class Semaphore
             dispatch_release(sem);
         }
         void wait() { dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER); }
+        bool try_wait()
+        {
+            if(0 == dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW)){
+                return true;
+            }else{
+                return false;
+            }
+        }
         void post() { dispatch_semaphore_signal(sem); }
         int get_value() const { return value; }
 
@@ -66,6 +74,15 @@ class Semaphore
             do {
                 r = sem_wait(&mutex);
             } while (r == -1 && errno == EINTR);
+        }
+        bool try_wait()
+        {
+            int result;
+            do{
+                result = sem_trywait(&mutex);
+            }while(result == -1 && errno == EINTR);
+
+            return (0 == result);
         }
         void post() { sem_post(&mutex); }
         int get_value() const { return value; }
