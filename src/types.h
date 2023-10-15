@@ -198,6 +198,8 @@ struct etagpair
 
 typedef std::list<etagpair> etaglist_t;
 
+typedef void* (*filepart_write_cb)(void*, off_t pos, off_t size);
+
 //
 // Each part information for Multipart upload
 //
@@ -212,10 +214,12 @@ struct filepart
     etagpair*    petag;       // use only parallel upload
     char*        buff;        // base buffer prt 
     off_t        buffpos;
+    filepart_write_cb cbfn;
+    void*        cbarg;
 
     filepart(bool is_uploaded = false, int _fd = -1, off_t part_start = 0, off_t part_size = -1, bool is_copy_part = false, etagpair* petagpair = NULL) : 
         uploaded(false), fd(_fd), startpos(part_start), size(part_size), is_copy(is_copy_part), petag(petagpair),
-        buff(NULL),buffpos(0) {}
+        buff(NULL),buffpos(0),cbfn(NULL),cbarg(NULL)  {}
 
     ~filepart()
     {
@@ -233,6 +237,8 @@ struct filepart
         petag    = NULL;
         buff     = NULL;
         buffpos  = 0;
+        cbfn     = NULL;
+        cbarg    = NULL;
     }
 
     void add_etag_list(etaglist_t& list, int partnum = -1)

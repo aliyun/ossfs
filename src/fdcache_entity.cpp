@@ -2311,6 +2311,10 @@ int FdEntity::OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, i
             pagelist.Resize(size, false, (0 <= time ? false : true));
 
             buffreader = new BufferReader(path.c_str(), size, 1*1024*1024);
+
+            prefetchreader = new AsyncPrefechBufferV2();
+            prefetchreader->Init(path.c_str(), size, 0, 30*1024*1024);
+            prefetchreader->Prefech();
         }
     }
 
@@ -2334,9 +2338,16 @@ int FdEntity::OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, i
 ssize_t FdEntity::ReadDirectInner(int fd, char* bytes, off_t start, size_t size, bool force_load)
 {
     S3FS_PRN_INFO("[path=%s][pseudo_fd=%d][offset=%lld][size=%zu]", path.c_str(), fd, static_cast<long long int>(start), size);
-    if (buffreader) {
-        return buffreader->Read(bytes, start, size);
+    #if 1
+    if (prefetchreader)
+    {
+        return prefetchreader->ReadN(bytes, start, size);
     }
+    #else 
+    if (buffreader) {
+        return buffreader->ReadN(bytes, start, size);
+    }
+    #endif
     return -1;
     //return ReadFromStream(path.c_str(), bytes, start, size);
 }

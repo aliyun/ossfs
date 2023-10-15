@@ -726,10 +726,12 @@ size_t S3fsCurl::StreamDownloadWriteCallback(void* ptr, size_t size, size_t nmem
     // write
     memcpy(&((char*)pCurl->partdata.buff)[pCurl->partdata.buffpos], ptr, copysize);
 
+    if (pCurl->partdata.cbfn != NULL) {
+        pCurl->partdata.cbfn(pCurl->partdata.cbarg, pCurl->partdata.startpos, copysize);
+    }
     pCurl->partdata.startpos += copysize;
     pCurl->partdata.size     -= copysize;
     pCurl->partdata.buffpos  += copysize;
-
     return copysize;
 }
 
@@ -4432,7 +4434,7 @@ void S3fsCurl::insertOSSV1Headers(const std::string& access_key_id, const std::s
     }
 }
 
-int S3fsCurl::PreGetObjectRequestStream(const char* tpath, char *buff, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue)
+int S3fsCurl::PreGetObjectRequestStream(const char* tpath, char *buff, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue, filepart_write_cb fn, void* cbarg)
 {
     S3FS_PRN_INFO3("[tpath=%s][start=%lld][size=%lld]", SAFESTRPTR(tpath), static_cast<long long>(start), static_cast<long long>(size));
 
@@ -4487,10 +4489,13 @@ int S3fsCurl::PreGetObjectRequestStream(const char* tpath, char *buff, off_t sta
     b_ssevalue          = ssevalue;
     b_ssekey_pos        = -1;         // not use this value for get object.
 
+    partdata.cbfn       = fn;
+    partdata.cbarg      = cbarg;
+
     return 0;
 }
 
-int S3fsCurl::GetObjectRequestStream(const char* tpath, char *buff, off_t start, off_t size, ssize_t& rsize)
+int S3fsCurl::GetObjectRequestStream(const char* tpath, char *buff, off_t start, off_t size, ssize_t& rsize, filepart_write_cb fn, void* cbarg)
 {
     int result;
 
@@ -4505,7 +4510,7 @@ int S3fsCurl::GetObjectRequestStream(const char* tpath, char *buff, off_t start,
         S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
     }
 
-    if(0 != (result = PreGetObjectRequestStream(tpath, buff, start, size, ssetype, ssevalue))){
+    if(0 != (result = PreGetObjectRequestStream(tpath, buff, start, size, ssetype, ssevalue, fn, cbarg))){
         return result;
     }
     if(!fpLazySetup || !fpLazySetup(this)){

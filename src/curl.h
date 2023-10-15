@@ -376,8 +376,8 @@ class S3fsCurl
         int MultipartHeadRequest(const char* tpath, off_t size, headers_t& meta, bool is_copy);
         int MultipartUploadRequest(const std::string& upload_id, const char* tpath, int fd, off_t offset, off_t size, etagpair* petagpair);
         int MultipartRenameRequest(const char* from, const char* to, headers_t& meta, off_t size);
-        int PreGetObjectRequestStream(const char* tpath, char* buff, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue);
-        int GetObjectRequestStream(const char* tpath, char* buff, off_t start, off_t size, ssize_t &rsize);
+        int PreGetObjectRequestStream(const char* tpath, char* buff, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue, filepart_write_cb cbfn = NULL, void* cbarg = NULL);
+        int GetObjectRequestStream(const char* tpath, char* buff, off_t start, off_t size, ssize_t &rsize, filepart_write_cb cbfn = NULL, void* cbarg = NULL);
 
         // methods(variables)
         CURL* GetCurlHandle() const { return hCurl; }
