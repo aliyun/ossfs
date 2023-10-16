@@ -62,7 +62,8 @@ class FdEntity
         int64_t         prefetch_capacity;
         bool            prefetch_lazy_init;
 
-        AsyncPrefechBufferV2 *prefetchreader;
+        //AsyncPrefechBufferV2 *prefetchreader;
+        PrefechReader        *prefechReader;
 
     private:
         static int FillFile(int fd, unsigned char byte, off_t size, off_t start);

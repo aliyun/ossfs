@@ -57,6 +57,8 @@ class BufferReader
         off_t        buff_bytes;
         off_t        buff_capacity;
 
+        off_t        next_rd_offset;
+
     private:
         ssize_t ReadFromStream(char *buff, off_t start, off_t size);
 
@@ -119,6 +121,7 @@ class AsyncPrefechBufferV2
         int            fetchresult;
         off_t          endoffset;
 
+        off_t          next_rd_offset;
         off_t          rdoff;
         off_t          wdoff;
 
@@ -139,8 +142,30 @@ class AsyncPrefechBufferV2
         bool Prefech();
         off_t UpdateWritePtr(off_t wp);
         ssize_t Read(char *b, off_t start, off_t size);
+        ssize_t ReadNInner(char *b, off_t start, off_t size);
         ssize_t ReadN(char *b, off_t start, off_t size);
 
+        off_t Next() {return offset + fetchsize;}
+
+};
+
+class PrefechReader
+{
+    private:
+        std::string  path;
+        off_t        file_size;
+        off_t        remains;
+
+        off_t        next_rd_offset;
+
+        std::list< AsyncPrefechBufferV2 *> buffers;
+        pthread_mutex_t mLock;
+
+    public:
+        explicit PrefechReader(const char* path, off_t fsize);
+        ~PrefechReader();
+        ssize_t ReadNInner(char *b, off_t start, off_t size);
+        ssize_t ReadN(char *b, off_t start, off_t size);
 };
 
 #endif // OSSFS_STREAMREADER_H_

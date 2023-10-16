@@ -2312,9 +2312,10 @@ int FdEntity::OpenDirectInner(const headers_t* pmeta, off_t size, time_t time, i
 
             buffreader = new BufferReader(path.c_str(), size, 1*1024*1024);
 
-            prefetchreader = new AsyncPrefechBufferV2();
-            prefetchreader->Init(path.c_str(), size, 0, 30*1024*1024);
-            prefetchreader->Prefech();
+            //prefetchreader = new AsyncPrefechBufferV2();
+            //prefetchreader->Init(path.c_str(), size, 0, 30*1024*1024);
+            //prefetchreader->Prefech();
+            prefechReader = new PrefechReader(path.c_str(), size);
         }
     }
 
@@ -2339,9 +2340,9 @@ ssize_t FdEntity::ReadDirectInner(int fd, char* bytes, off_t start, size_t size,
 {
     S3FS_PRN_INFO("[path=%s][pseudo_fd=%d][offset=%lld][size=%zu]", path.c_str(), fd, static_cast<long long int>(start), size);
     #if 1
-    if (prefetchreader)
+    if (prefechReader)
     {
-        return prefetchreader->ReadN(bytes, start, size);
+        return prefechReader->ReadN(bytes, start, size);
     }
     #else 
     if (buffreader) {

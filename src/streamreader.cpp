@@ -36,11 +36,14 @@ static const off_t MIN_BUFFER_SIZE         = 128*1024;
 #define ROUND_DOWN(v, a) ((v)/(a)*(a))
 
 static const off_t MEM_PAGE_SIZE         = 2*1024*1024;
+static const off_t PREFETCH_SIZE         = 10*1024*1024;
+static const off_t PREFETCH_COUNT        = 1;
 
 
 BufferReader::BufferReader(const char* tpath, off_t fsize, off_t buffsize)
     :path(tpath), file_size(fsize), buff(NULL), buff_offset(0), buff_bytes(0)
 {
+    next_rd_offset = 0;
     if (file_size > MIN_BUFFER_SIZE) {
         off_t s = ROUND_UP(file_size, 128*1024);
         s = std::min(s, buffsize);
@@ -106,10 +109,19 @@ ssize_t BufferReader::Read(char *b, off_t start, off_t size)
 
 ssize_t BufferReader::ReadN(char *b, off_t start, off_t size)
 {
-    S3FS_PRN_DBG("begin [path=%s][b=%p][start=%lld][size=%lld]", path.c_str(), b, static_cast<long long>(start), static_cast<long long>(size));
+    if (next_rd_offset != start) {
+        S3FS_PRN_DBG("BufferReader::ReadN offset not equal [path=%s][b=%p][start=%lld][next_rd_offset=%lld]", path.c_str(), b, 
+            static_cast<long long>(start), static_cast<long long>(next_rd_offset));
+    }
+
+    S3FS_PRN_DBG("begin [path=%s][b=%p][start=%lld][size=%lld][next_rd_offset=%lld]", path.c_str(), b, 
+        static_cast<long long>(start), static_cast<long long>(size), static_cast<long long>(next_rd_offset));
     ssize_t ret = Read(b, start, size);
     S3FS_PRN_DBG("end [path=%s][b=%p][start=%lld][ret=%lld]", path.c_str(), b, static_cast<long long>(start), static_cast<long long>(ret));
-    return ret;
+    if (ret > 0) {
+        next_rd_offset = start + size;
+    }
+     return ret;
 }
 
 ssize_t BufferReader::ReadFromStream(char *b, off_t start, off_t size)
@@ -320,6 +332,7 @@ void AsyncPrefechBufferV2::reset()
     fetchst = 0;
     fetchresult = 0;
     endoffset = -1;
+    next_rd_offset = -1;
 }
 
 
@@ -329,8 +342,9 @@ off_t AsyncPrefechBufferV2::Init(const char* tpath, off_t fsize, off_t start, of
     path = tpath;
     file_size = fsize;
     offset = start;
-
-    S3FS_PRN_DBG("begin [path=%s][prefetchsize=%lld]", path.c_str(), static_cast<long long>(prefetchsize));
+    next_rd_offset = start;
+    S3FS_PRN_DBG("begin [path=%s][start=%lld][prefetchsize=%lld]", path.c_str(), 
+        static_cast<long long>(start), static_cast<long long>(prefetchsize));
     off_t remians = std::min(file_size - offset, prefetchsize);
     off_t prefetch_size = ROUND_UP(remians, MEM_PAGE_SIZE);
 
@@ -418,23 +432,43 @@ off_t AsyncPrefechBufferV2::UpdateWritePtr(off_t wp)
 ssize_t AsyncPrefechBufferV2::Read(char *b, off_t start, off_t size)
 {
     AutoLock lock(&mLock);
-    S3FS_PRN_DBG("[path=%s][b=%p][start=%lld][size=%lld]", path.c_str(), b, static_cast<long long>(start), static_cast<long long>(size));
+    S3FS_PRN_DBG("AsyncPrefechBufferV2::Read begin [path=%s][b=%p][start=%lld][size=%lld][rdoff=%lld]", path.c_str(), b, 
+        static_cast<long long>(start), static_cast<long long>(size), static_cast<long long>(rdoff));
     if (wdoff == -1 || start > wdoff ) {
         pthread_cond_wait(&mCond, &mLock);  
     }
+
+    
 
     //read from prefetch_buffer 
     off_t bend = wdoff;
     off_t end = start + size;
     end = std::min(bend, end);
     size_t rsize = (size_t)(end - start);
-    S3FS_PRN_DBG("[path=%s][rsize=%lld]", path.c_str(), static_cast<long long>(rsize));
     memcpy(b, data + (start - offset), rsize);
     rdoff = start + rsize;
+    S3FS_PRN_DBG("AsyncPrefechBufferV2::Read end [path=%s][rsize=%lld][rdoff=%lld]", path.c_str(), 
+        static_cast<long long>(rsize), static_cast<long long>(rdoff));
     return (ssize_t)rsize;
 }
 
 ssize_t AsyncPrefechBufferV2::ReadN(char *b, off_t start, off_t size)
+{
+    if (next_rd_offset != start) {
+        S3FS_PRN_DBG("AsyncPrefechBufferV2::ReadN offset not equal [path=%s][b=%p][start=%lld][next_rd_offset=%lld]", path.c_str(), b, 
+            static_cast<long long>(start), static_cast<long long>(next_rd_offset));
+    }
+    S3FS_PRN_DBG("begin [path=%s][b=%p][start=%lld][size=%lld][next_rd_offset=%lld]", path.c_str(), b, 
+        static_cast<long long>(start), static_cast<long long>(size), static_cast<long long>(next_rd_offset));
+    ssize_t ret = ReadNInner(b, start, size);
+    S3FS_PRN_DBG("end [path=%s][b=%p][start=%lld][ret=%lld]", path.c_str(), b, static_cast<long long>(start), static_cast<long long>(ret));
+    if (ret > 0) {
+        next_rd_offset = start + size;
+    }
+    return ret;
+}
+
+ssize_t AsyncPrefechBufferV2::ReadNInner(char *b, off_t start, off_t size)
 {
     //not in the buffer
     if (!(offset <= start && (start < (offset + fetchsize)))) {
@@ -466,6 +500,91 @@ ssize_t AsyncPrefechBufferV2::ReadN(char *b, off_t start, off_t size)
     return (ssize_t)off;
 }
 
+PrefechReader::PrefechReader(const char* tpath, off_t fsize)
+    :path(tpath), file_size(fsize)
+{
+    next_rd_offset = 0;
+    remains = fsize;
+    for(int i = 0; i < PREFETCH_COUNT && remains > 0; i++) {
+        AsyncPrefechBufferV2 * buff = new AsyncPrefechBufferV2();
+        buff->Init(path.c_str(), fsize, i * PREFETCH_SIZE, PREFETCH_SIZE);
+        buffers.push_back(buff);
+        buff->Prefech();
+        if (remains < PREFETCH_SIZE) {
+            remains = 0;
+        } else {
+            remains -= PREFETCH_SIZE;
+        }
+    }
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    if (0 != pthread_mutex_init(&mLock, &attr)) {
+        S3FS_PRN_ERR("init lock failed");
+    }
+}
+
+PrefechReader::~PrefechReader()
+{
+
+}
+
+ssize_t PrefechReader::ReadN(char *b, off_t start, off_t size)
+{
+    if (next_rd_offset != start) {
+        S3FS_PRN_DBG("PrefechReader::ReadN offset not equal [path=%s][b=%p][start=%lld][next_rd_offset=%lld]", path.c_str(), b, 
+            static_cast<long long>(start), static_cast<long long>(next_rd_offset));
+    }
+    S3FS_PRN_DBG("begin [path=%s][b=%p][start=%lld][size=%lld][next_rd_offset=%lld]", path.c_str(), b, 
+        static_cast<long long>(start), static_cast<long long>(size), static_cast<long long>(next_rd_offset));
+    ssize_t ret = ReadNInner(b, start, size);
+    S3FS_PRN_DBG("end [path=%s][b=%p][start=%lld][ret=%lld]", path.c_str(), b, static_cast<long long>(start), static_cast<long long>(ret));
+    if (ret > 0) {
+        next_rd_offset = start + size;
+    }
+    return ret;
+}
+
+ssize_t PrefechReader::ReadNInner(char *b, off_t start, off_t size)
+{
+    AutoLock lock(&mLock);
+    off_t gots = std::min(file_size - start, size);
+    off_t off = 0;
+    S3FS_PRN_DBG("begin[path=%s][b=%p][start=%lld][size=%lld][gots=%lld]", path.c_str(), b, 
+        static_cast<long long>(start), static_cast<long long>(size), static_cast<long long>(gots));    
+    while (gots > 0) {
+        ssize_t cnt = buffers.front()->ReadN(b + off, start + off, gots);
+        if (cnt < 0) {
+            return cnt;
+        }
+
+        gots -= (off_t)cnt;
+        off += (off_t)cnt;
+
+        if (gots > 0) {
+            S3FS_PRN_DBG("mid[path=%s][b=%p][start=%lld][size=%lld][gots=%lld][remains=%lld]", path.c_str(), b, 
+                static_cast<long long>(start), static_cast<long long>(size), 
+                static_cast<long long>(gots), static_cast<long long>(remains));              
+            AsyncPrefechBufferV2 * buff = buffers.front();
+            buffers.pop_front();
+            S3FS_PRN_DBG("mid -1");
+            if (remains > 0) {
+                off_t next = file_size - remains;
+                S3FS_PRN_DBG("mid next:%lld", static_cast<long long>(next));
+                buff->Init(path.c_str(), file_size, next, PREFETCH_SIZE);
+                S3FS_PRN_DBG("mid - 2");
+                if (remains <= PREFETCH_SIZE) {
+                    remains = 0;
+                }
+                buff->Prefech();
+                buffers.push_back(buff);
+            }
+        }
+    }
+    S3FS_PRN_DBG("end[path=%s][b=%p][start=%lld][size=%lld][off=%lld]", path.c_str(), b, 
+        static_cast<long long>(start), static_cast<long long>(size), static_cast<long long>(off));  
+
+    return off;
+}
 
 /*
 * Local variables:
