@@ -4461,11 +4461,13 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
                 found  = s3host.find_last_of('/');
                 length = s3host.length();
             }
+            /*
             // Check url for http / https protocol std::string
             if(!is_prefix(s3host.c_str(), "https://") && !is_prefix(s3host.c_str(), "http://")){
                 S3FS_PRN_EXIT("option url has invalid format, missing http / https protocol");
                 return -1;
             }
+            */
             return 0;
         }
         if(0 == strcmp(arg, "sigv1")){
