@@ -36,8 +36,8 @@ static const off_t MIN_BUFFER_SIZE         = 128*1024;
 #define ROUND_DOWN(v, a) ((v)/(a)*(a))
 
 static const off_t MEM_PAGE_SIZE         = 2*1024*1024;
-static const off_t PREFETCH_SIZE         = 10*1024*1024;
-static const off_t PREFETCH_COUNT        = 1;
+static const off_t PREFETCH_SIZE         = 4*1024*1024;
+static const off_t PREFETCH_COUNT        = 4;
 
 
 BufferReader::BufferReader(const char* tpath, off_t fsize, off_t buffsize)
@@ -563,7 +563,7 @@ ssize_t PrefechReader::ReadNInner(char *b, off_t start, off_t size)
         if (gots > 0) {
             S3FS_PRN_DBG("mid[path=%s][b=%p][start=%lld][size=%lld][gots=%lld][remains=%lld]", path.c_str(), b, 
                 static_cast<long long>(start), static_cast<long long>(size), 
-                static_cast<long long>(gots), static_cast<long long>(remains));              
+                static_cast<long long>(gots), static_cast<long long>(remains));          
             AsyncPrefechBufferV2 * buff = buffers.front();
             buffers.pop_front();
             S3FS_PRN_DBG("mid -1");
@@ -574,6 +574,8 @@ ssize_t PrefechReader::ReadNInner(char *b, off_t start, off_t size)
                 S3FS_PRN_DBG("mid - 2");
                 if (remains <= PREFETCH_SIZE) {
                     remains = 0;
+                } else {
+                    remains -= PREFETCH_SIZE;
                 }
                 buff->Prefech();
                 buffers.push_back(buff);
