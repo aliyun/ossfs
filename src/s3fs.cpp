@@ -47,6 +47,7 @@
 #include "s3fs_help.h"
 #include "s3fs_util.h"
 #include "mpu_util.h"
+#include "threadpoolman.h"
 
 //-------------------------------------------------------------------
 // Symbols
@@ -100,7 +101,7 @@ static bool is_readdir_optimize   = false;
 static bool is_refresh_fakemeta   = false;
 static off_t readdir_check_size   = 0;
 static bool is_new_symlink_format = false;
-
+static int max_thread_count       = 5;  // default is 5
 //-------------------------------------------------------------------
 // Global functions : prototype
 //-------------------------------------------------------------------
@@ -3641,6 +3642,11 @@ static void* s3fs_init(struct fuse_conn_info* conn)
          conn->want |= FUSE_CAP_BIG_WRITES;
     }
 
+    if(!ThreadPoolMan::Initialize(max_thread_count)){
+        S3FS_PRN_CRIT("Could not create thread pool(%d)", max_thread_count);
+        s3fs_exit_fuseloop(EXIT_FAILURE);
+    }
+
     // Signal object
     if(!S3fsSignals::Initialize()){
         S3FS_PRN_ERR("Failed to initialize signal object, but continue...");
@@ -3657,6 +3663,8 @@ static void s3fs_destroy(void*)
     if(!S3fsSignals::Destroy()){
         S3FS_PRN_WARN("Failed to clean up signal object.");
     }
+
+    ThreadPoolMan::Destroy();
 
     // cache(remove at last)
     if(is_remove_cache && (!CacheFileStat::DeleteCacheFileStatDirectory() || !FdManager::DeleteCacheDirectory())){
@@ -4545,6 +4553,16 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             is_new_symlink_format = true;
             return 0;
         }        
+        if(is_prefix(arg, "max_thread_count=")){
+            int max_thcount = static_cast<int>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            if(0 >= max_thcount){
+                S3FS_PRN_EXIT("argument should be over 1: max_thread_count");
+                return -1;
+            }
+            max_thread_count = max_thcount;
+            S3FS_PRN_WARN("The max_thread_count option is not a formal option. Please note that it will change in the future.");
+            return 0;
+        }
         //
         // log file option
         //
