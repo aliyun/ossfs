@@ -161,6 +161,11 @@ bool S3fsCurl::InitS3fsCurl()
     if(sCurlPoolSize < std::max(GetMaxParallelCount(), GetMaxMultiRequest())){
         sCurlPoolSize = std::max(GetMaxParallelCount(), GetMaxMultiRequest());
     }
+
+    if(direct_read && sCurlPoolSize < direct_read_max_prefetch_thread_count) {
+        sCurlPoolSize = direct_read_max_prefetch_thread_count;
+    }
+
     sCurlPool = new CurlHandlerPool(sCurlPoolSize);
     if (!sCurlPool->Init()) {
         return false;
@@ -702,6 +707,35 @@ size_t S3fsCurl::DownloadWriteCallback(void* ptr, size_t size, size_t nmemb, voi
     pCurl->partdata.size     -= totalwrite;
 
     return totalwrite;
+}
+
+size_t S3fsCurl::DownloadWriteStreamCallback(void* ptr, size_t size, size_t nmemb, void* userp)
+{
+    S3fsCurl* pCurl = static_cast<S3fsCurl*>(userp);
+
+    if(1 > (size * nmemb)){
+        return 0;
+    }
+    if(!pCurl-> partdata.streambuffer || 0 >= pCurl->partdata.size){
+        return 0;
+    }
+
+    // Buffer initial bytes in case it is an XML error response.
+    if(pCurl->bodydata.size() < GET_OBJECT_RESPONSE_LIMIT){
+        pCurl->bodydata.Append(ptr, std::min(size * nmemb, GET_OBJECT_RESPONSE_LIMIT - pCurl->bodydata.size()));
+    }
+
+    // write size
+    ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
+
+    // write
+    memcpy(&((char*)pCurl->partdata.streambuffer)[pCurl->partdata.streampos], ptr, copysize);
+
+    pCurl->partdata.startpos  += copysize;
+    pCurl->partdata.size      -= copysize;
+    pCurl->partdata.streampos += copysize;
+
+    return copysize;
 }
 
 bool S3fsCurl::SetCheckCertificate(bool isCertCheck)
@@ -1628,6 +1662,31 @@ bool S3fsCurl::PreGetObjectRequestSetCurlOpts(S3fsCurl* s3fscurl)
     return true;
 }
 
+bool S3fsCurl::PreGetObjectStreamRequestSetCurlOpts(S3fsCurl* s3fscurl) 
+{
+    if(!s3fscurl) {
+        return false;
+    }
+    if(!s3fscurl->CreateCurlHandle()){
+        return false;
+    }
+
+    if (CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_URL, s3fscurl->url.c_str())){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEFUNCTION, DownloadWriteStreamCallback)){
+        return false;
+    }
+    if(CURLE_OK != curl_easy_setopt(s3fscurl->hCurl, CURLOPT_WRITEDATA, (void*)s3fscurl)){
+        return false;
+    }
+    if(!S3fsCurl::AddUserAgent(s3fscurl->hCurl)){                            // put User-Agent
+        return false;
+    }
+
+    return true;
+}
+
 bool S3fsCurl::PreHeadRequestSetCurlOpts(S3fsCurl* s3fscurl)
 {
     if(!s3fscurl){
@@ -1761,6 +1820,7 @@ S3fsCurl::S3fsCurl(bool ahbe) :
     hCurl(NULL), type(REQTYPE_UNSET), requestHeaders(NULL),
     LastResponseCode(S3FSCURL_RESPONSECODE_NOTSET), postdata(NULL), postdata_remaining(0), is_use_ahbe(ahbe),
     retry_count(0), b_infile(NULL), b_postdata(NULL), b_postdata_remaining(0), b_partdata_startpos(0), b_partdata_size(0),
+    b_partdata_streambuff(NULL), b_partdata_streampos(0),
     b_ssekey_pos(-1), b_ssetype(sse_type_t::SSE_DISABLE),
     sem(NULL), completed_tids_lock(NULL), completed_tids(NULL), fpLazySetup(NULL), curlCode(CURLE_OK)
 {
@@ -2015,7 +2075,8 @@ bool S3fsCurl::RemakeHandle()
     postdata_remaining = b_postdata_remaining;
     partdata.startpos  = b_partdata_startpos;
     partdata.size      = b_partdata_size;
-
+    partdata.streambuffer = b_partdata_streambuff;
+    partdata.streampos    = b_partdata_streampos;
     // reset handle
     ResetHandle();
 
@@ -2281,6 +2342,18 @@ bool S3fsCurl::RemakeHandle()
                 return false;
             }
             if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            break;
+
+        case REQTYPE_GET_STREAM:
+            if (CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+                return false;
+            }
+            if (CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, S3fsCurl::DownloadWriteStreamCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)this)){
                 return false;
             }
             break;
@@ -3497,6 +3570,94 @@ int S3fsCurl::GetObjectRequest(const char* tpath, int fd, off_t start, off_t siz
     S3FS_PRN_INFO3("downloading... [path=%s][fd=%d]", tpath, fd);
 
     result = RequestPerform();
+    partdata.clear();
+
+    return result;
+}
+
+int S3fsCurl::PreGetObjectStreamRequest(const char* tpath, char* buf, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue) 
+{
+    S3FS_PRN_INFO3("[tpath=%s][start=%lld][size=%lld]", SAFESTRPTR(tpath), static_cast<long long>(start), static_cast<long long>(size));
+
+    if (!tpath || !buf || 0 > start || 0 > size){
+        return -EINVAL;
+    }
+
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+    url             = prepare_url(turl.c_str());
+    path            = get_realpath(tpath);
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+
+    if(0 < size) {
+        std::string range = "bytes=";
+        range       += str(start);
+        range       += "-";
+        range       += str(start + size - 1);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Range", range.c_str());
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-range-behavior", "standard");
+    }
+
+    // SSE
+    if(!AddSseRequestHead(ssetype, ssevalue, true, false)){
+        S3FS_PRN_WARN("Failed to set SSE header, but continue...");
+    }
+
+    if(S3fsCurl::download_traffic_limit != 0){
+        char buff[64];
+        sprintf(buff, "%ld", S3fsCurl::download_traffic_limit);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-traffic-limit", buff);
+    }
+
+    op = "GET";
+    type = REQTYPE_GET_STREAM;
+
+    // set lazy function
+    fpLazySetup = PreGetObjectStreamRequestSetCurlOpts;
+    
+    // set info for callback func.
+    partdata.clear();
+    partdata.startpos       = start;
+    partdata.size           = size;
+    partdata.streambuffer   = buf;
+    partdata.streampos      = 0;
+    b_partdata_startpos     = start;
+    b_partdata_size         = size;
+    b_partdata_streambuff   = buf;
+    b_partdata_streampos    = 0;
+    b_ssetype               = ssetype;
+    b_ssevalue              = ssevalue;
+    b_ssekey_pos            = -1;
+
+    return 0;
+}
+
+int S3fsCurl::GetObjectStreamRequest(const char* tpath, char* buf, off_t start, off_t size, ssize_t& rsize) 
+{
+    int result;
+    S3FS_PRN_INFO3("[tpath=%s][start=%lld][size=%lld]", SAFESTRPTR(tpath), static_cast<long long>(start), static_cast<long long>(size));
+
+    if(!tpath) {
+        return -EINVAL;
+    }
+    sse_type_t ssetype = sse_type_t::SSE_DISABLE;
+    std::string ssevalue;
+    if(!get_object_sse_type(tpath, ssetype, ssevalue)){
+        S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
+    }
+
+    if(0 != (result = PreGetObjectStreamRequest(tpath, buf, start, size, ssetype, ssevalue))){
+        return result;
+    }
+    if(!fpLazySetup ||!fpLazySetup(this)){
+        S3FS_PRN_INFO3("Failed to lazy setup in single get object request.");
+        return -EIO;
+    }
+
+    result = RequestPerform();
+    rsize = (ssize_t)partdata.streampos;
     partdata.clear();
 
     return result;

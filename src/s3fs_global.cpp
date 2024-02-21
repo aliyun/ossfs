@@ -29,6 +29,10 @@ bool nomultipart                  = false;
 bool pathrequeststyle             = false;
 bool complement_stat              = false;
 bool noxmlns                      = true;
+bool direct_read                  = false;
+
+int direct_read_max_prefetch_thread_count = 64;
+
 std::string program_name;
 std::string service_path          = "/";
 std::string s3host                = "https://oss-cn-hangzhou.aliyuncs.com";

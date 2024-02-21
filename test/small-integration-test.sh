@@ -59,6 +59,7 @@ if [ -n "${ALL_TESTS}" ]; then
         "use_xattr=0 -o readdir_optimize"
         "use_xattr=0 -o readdir_optimize -o listobjectsv2 -ouse_sse=kms"
         "use_xattr=0 -o readdir_optimize -o readdir_check_size=48 -o symlink_in_meta"
+        "use_cache=${CACHE_DIR} -o direct_read"
     )
 else
     FLAGS=(

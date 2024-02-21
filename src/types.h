@@ -203,15 +203,23 @@ typedef std::list<etagpair> etaglist_t;
 //
 struct filepart
 {
-    bool         uploaded;    // does finish uploading
-    std::string  etag;        // expected etag value
-    int          fd;          // base file(temporary full file) descriptor
-    off_t        startpos;    // seek fd point for uploading
-    off_t        size;        // uploading size
-    bool         is_copy;     // whether is copy multipart
-    etagpair*    petag;       // use only parallel upload
+    bool         uploaded;      // does finish uploading
+    std::string  etag;          // expected etag value
+    int          fd;            // base file(temporary full file) descriptor
+    off_t        startpos;      // seek fd point for uploading
+    off_t        size;          // uploading size
+    bool         is_copy;       // whether is copy multipart
+    etagpair*    petag;         // use only parallel upload
+    char*        streambuffer;  // use only direct read 
+    off_t        streampos;     // use only direct read 
 
-    filepart(bool is_uploaded = false, int _fd = -1, off_t part_start = 0, off_t part_size = -1, bool is_copy_part = false, etagpair* petagpair = NULL) : uploaded(false), fd(_fd), startpos(part_start), size(part_size), is_copy(is_copy_part), petag(petagpair) {}
+    filepart(bool is_uploaded = false, 
+            int _fd = -1,
+            off_t part_start = 0, 
+            off_t part_size = -1, 
+            bool is_copy_part = false, 
+            etagpair* petagpair = NULL) 
+        : uploaded(false), fd(_fd), startpos(part_start), size(part_size), is_copy(is_copy_part), petag(petagpair), streambuffer(NULL), streampos(0) {}
 
     ~filepart()
     {
@@ -220,13 +228,15 @@ struct filepart
 
     void clear()
     {
-        uploaded = false;
-        etag     = "";
-        fd       = -1;
-        startpos = 0;
-        size     = -1;
-        is_copy  = false;
-        petag    = NULL;
+        uploaded      = false;
+        etag          = "";
+        fd            = -1;
+        startpos      = 0;
+        size          = -1;
+        is_copy       = false;
+        petag         = NULL;
+        streambuffer  = NULL;
+        streampos     = 0;
     }
 
     void add_etag_list(etaglist_t& list, int partnum = -1)

@@ -110,7 +110,8 @@ class S3fsCurl
             REQTYPE_MULTILIST,
             REQTYPE_IAMCRED,
             REQTYPE_ABORTMULTIUPLOAD,
-            REQTYPE_IAMROLE
+            REQTYPE_IAMROLE,
+            REQTYPE_GET_STREAM
         };
 
         // class variables
@@ -182,6 +183,8 @@ class S3fsCurl
         off_t                b_postdata_remaining; // backup for retrying
         off_t                b_partdata_startpos;  // backup for retrying
         off_t                b_partdata_size;      // backup for retrying
+        char*                b_partdata_streambuff;// backup for retrying
+        off_t                b_partdata_streampos; // backup for retrying
         size_t               b_ssekey_pos;         // backup for retrying
         std::string          b_ssevalue;           // backup for retrying
         sse_type_t           b_ssetype;            // backup for retrying
@@ -223,6 +226,7 @@ class S3fsCurl
         static size_t ReadCallback(void *ptr, size_t size, size_t nmemb, void *userp);
         static size_t UploadReadCallback(void *ptr, size_t size, size_t nmemb, void *userp);
         static size_t DownloadWriteCallback(void* ptr, size_t size, size_t nmemb, void* userp);
+        static size_t DownloadWriteStreamCallback(void* ptr, size_t size, size_t nmenb, void* userp);
 
         static bool UploadMultipartPostCallback(S3fsCurl* s3fscurl);
         static bool CopyMultipartPostCallback(S3fsCurl* s3fscurl);
@@ -237,6 +241,7 @@ class S3fsCurl
         static bool CopyMultipartPostSetCurlOpts(S3fsCurl* s3fscurl);
         static bool PreGetObjectRequestSetCurlOpts(S3fsCurl* s3fscurl);
         static bool PreHeadRequestSetCurlOpts(S3fsCurl* s3fscurl);
+        static bool PreGetObjectStreamRequestSetCurlOpts(S3fsCurl* s3fscurl);
 
         static bool LoadEnvSseCKeys();
         static bool LoadEnvSseKmsid();
@@ -372,6 +377,8 @@ class S3fsCurl
         int MultipartHeadRequest(const char* tpath, off_t size, headers_t& meta, bool is_copy);
         int MultipartUploadRequest(const std::string& upload_id, const char* tpath, int fd, off_t offset, off_t size, etagpair* petagpair);
         int MultipartRenameRequest(const char* from, const char* to, headers_t& meta, off_t size);
+        int PreGetObjectStreamRequest(const char* tpath, char* buf, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue);
+        int GetObjectStreamRequest(const char* tpath, char* buf, off_t start, off_t size, ssize_t& rsize);
 
         // methods(variables)
         CURL* GetCurlHandle() const { return hCurl; }
