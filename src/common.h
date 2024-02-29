@@ -39,6 +39,10 @@ extern bool           nomultipart;
 extern bool           pathrequeststyle;
 extern bool           complement_stat;
 extern bool           noxmlns;
+extern bool           direct_read;
+
+extern int            direct_read_max_prefetch_thread_count;
+
 extern std::string    program_name;
 extern std::string    service_path;
 extern std::string    s3host;

@@ -22,6 +22,7 @@
 #define S3FS_FDCACHE_FDINFO_H_
 
 #include "fdcache_untreated.h"
+#include "direct_reader.h"
 
 //------------------------------------------------
 // Class PseudoFdInfo
@@ -40,11 +41,19 @@ class PseudoFdInfo
         bool            is_lock_init;
         pthread_mutex_t upload_list_lock;   // protects upload_id and upload_list
 
+        pthread_mutex_t direct_read_lock;
+        bool            is_direct_read;
+        off_t           last_read_tail;
+        int             prefetch_cnt;
+        DirectReader*   direct_reader_mgr;
+
     private:
         bool Clear();
 
+        void GeneratePrefetchTask(uint32_t start_prefetch_chunk, uint32_t prefetch_cnt);
+        uint32_t GetPrefetchCount(off_t offset, size_t size);
     public:
-        PseudoFdInfo(int fd = -1, int open_flags = 0);
+        PseudoFdInfo(int fd = -1, int open_flags = 0, bool is_direct_read = false, std::string path = "", off_t size = 0);
         ~PseudoFdInfo();
 
         int GetPhysicalFd() const { return physical_fd; }
@@ -68,6 +77,9 @@ class PseudoFdInfo
         bool GetUntreated(off_t& start, off_t& size, off_t max_size, off_t min_size = MIN_MULTIPART_SIZE);
         bool GetLastUntreated(off_t& start, off_t& size, off_t max_size, off_t min_size = MIN_MULTIPART_SIZE);
         bool AddUntreated(off_t start, off_t size);
+
+        ssize_t DirectReadAndPrefetch(char* bytes, off_t start, size_t size);
+        void ExitDirectRead();
 };
 
 typedef std::map<int, class PseudoFdInfo*> fdinfo_map_t;

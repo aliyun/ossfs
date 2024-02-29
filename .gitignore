@@ -85,7 +85,7 @@ test/chaos-http-proxy-*
 test/junk_data
 test/s3proxy-*
 test/write_multiblock
-
+test/direct_read_test
 #
 # Windows ports
 #

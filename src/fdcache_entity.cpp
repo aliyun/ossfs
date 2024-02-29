@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <sys/time.h>
+#include <algorithm>
 
 #include "common.h"
 #include "s3fs.h"
@@ -96,7 +97,8 @@ ino_t FdEntity::GetInode(int fd)
 FdEntity::FdEntity(const char* tpath, const char* cpath) :
     is_lock_init(false), path(SAFESTRPTR(tpath)),
     physical_fd(-1), pfile(NULL), inode(0), size_orgmeta(0),
-    cachepath(SAFESTRPTR(cpath)), is_meta_pending(false)
+    cachepath(SAFESTRPTR(cpath)), is_meta_pending(false),
+    is_direct_read(direct_read)
 {
     holding_mtime.tv_sec = -1;
     holding_mtime.tv_nsec = 0;
@@ -629,7 +631,7 @@ int FdEntity::Open(const headers_t* pmeta, off_t size, time_t time, int flags, A
     }
 
     // create new pseudo fd, and set it to map
-    PseudoFdInfo*   ppseudoinfo = new PseudoFdInfo(physical_fd, flags);
+    PseudoFdInfo*   ppseudoinfo = new PseudoFdInfo(physical_fd, flags, is_direct_read, path, size_orgmeta);
     int             pseudo_fd   = ppseudoinfo->GetPseudoFd();
     pseudo_fd_map[pseudo_fd]    = ppseudoinfo;
 
@@ -1749,13 +1751,18 @@ ssize_t FdEntity::Read(int fd, char* bytes, off_t start, size_t size, bool force
 {
     S3FS_PRN_DBG("[path=%s][pseudo_fd=%d][physical_fd=%d][offset=%lld][size=%zu]", path.c_str(), fd, physical_fd, static_cast<long long int>(start), size);
 
-    if(-1 == physical_fd || NULL == CheckPseudoFdFlags(fd, false)){
+    PseudoFdInfo* pseudo_obj = NULL;
+    if(-1 == physical_fd || NULL == (pseudo_obj = CheckPseudoFdFlags(fd, false))){
         S3FS_PRN_DBG("pseudo_fd(%d) to physical_fd(%d) for path(%s) is not opened or not readable", fd, physical_fd, path.c_str());
         return -EBADF;
     }
 
     AutoLock auto_lock(&fdent_lock);
     AutoLock auto_lock2(&fdent_data_lock);
+
+    if(is_direct_read){
+        return pseudo_obj->DirectReadAndPrefetch(bytes, start, size);
+    }
 
     if(force_load){
         pagelist.SetPageLoadedStatus(start, size, PageList::PAGE_NOT_LOAD_MODIFIED);
@@ -2229,6 +2236,21 @@ void FdEntity::MarkDirtyNewFile()
 {
     pagelist.Init(0, false, true);
     is_meta_pending = true;
+}
+
+void FdEntity::CheckAndExitDirectReadIfNeeded()
+{
+    AutoLock auto_lock(&fdent_lock);
+    if(!is_direct_read){
+        return;
+    }
+
+    is_direct_read = false;
+    for(fdinfo_map_t::iterator iter = pseudo_fd_map.begin(); iter != pseudo_fd_map.end(); ++iter){
+        PseudoFdInfo* ppseudofdinfo = iter->second;
+        ppseudofdinfo->ExitDirectRead();
+    }
+    return;
 }
 
 /*

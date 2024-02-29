@@ -2188,6 +2188,253 @@ function test_readdir_check_size_48 {
     rm -rf "${ALT_TEST_TEXT_FILE}"
 }
 
+function test_direct_read {
+    describe "Testing direct read ..."
+ 
+    local TEST_FILE="direct-read-test-file"
+    local RANDOM_STRING; RANDOM_STRING=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w $((RANDOM % 1024 + 1)) | head -n 1)
+ 
+    local BYTE_CNT; BYTE_CNT=$((RANDOM % 100 + 1))
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1 count=${BYTE_CNT}
+    # avoid taking up local disk space bacase of cache file.
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+    # compare file 
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}"; then
+        return 1
+    fi
+    # cache file's size should be 0 because of direct read.
+    if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
+        return 1
+    fi
+ 
+    local KBYTE_CNT; KBYTE_CNT=$((RANDOM % 100 + 1))
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1K count=${KBYTE_CNT}
+    echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}"; then
+        return 1
+    fi
+    if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
+        return 1
+    fi
+ 
+    local MBYTE_CNT; MBYTE_CNT=$((RANDOM % 3 + 1)) #less than a chunk
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=${MBYTE_CNT}
+    echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}"; then
+        return 1
+    fi
+    if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
+        return 1
+    fi
+ 
+    MBYTE_CNT=$((RANDOM % 100 + 1))
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=${MBYTE_CNT}
+    echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}"; then
+        return 1
+    fi
+    if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
+        return 1
+    fi
+ 
+    MBYTE_CNT=$((RANDOM % 100 + 128))
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=${MBYTE_CNT}
+    echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}"; then
+        return 1
+    fi
+    if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
+        return 1
+    fi
+ 
+    # test reading file from the middle
+    SKIP_CNT=$((RANDOM % 100))
+    dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}-read-from-middle" bs=1M skip=${SKIP_CNT}
+    dd if="${TEMP_DIR}/${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}-read-from-middle.cmp" bs=1M skip=${SKIP_CNT}
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}-read-from-middle" "${TEMP_DIR}/${TEST_FILE}-read-from-middle.cmp"; then
+        return 1
+    fi
+    if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
+        return 1
+    fi
+ 
+    # test writing
+    local SEEK_COUNT=$((RANDOM % 100 + 1))
+    dd if=/dev/zero of="${TEMP_DIR}/${TEST_FILE}" bs=1M seek=${SEEK_COUNT} count=1 conv=notrunc
+    dd if=/dev/zero of="${TEST_FILE}" bs=1M seek=${SEEK_COUNT} count=1 conv=notrunc
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}"; then
+        return 1
+    fi
+ 
+    rm -f "${TEMP_DIR}/${TEST_FILE}"
+    rm_test_file "${TEST_FILE}"
+}
+
+function test_direct_read_with_out_of_order {
+    describe "Testing direct read with out of order ..."
+ 
+    local TEST_FILE="direct-read-test-file-with-out-of-order"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=256
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+    
+    # skip size less than a chunk will be considered as sequential reading.
+    ../../direct_read_test -r "${TEST_FILE}" -o 100 -s 3 -w "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize"
+    CACHE_SIZE=`du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'`
+    if [ $CACHE_SIZE -ne 0 ]; then
+        return 1
+    fi
+ 
+    ../../direct_read_test -r "${TEMP_DIR}/${TEST_FILE}" -o 100 -s 3 -w "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize.new"
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize.new" "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize"; then
+        return 1
+    fi
+    rm -f "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize.new"
+    rm -f "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize"
+    
+    ../../direct_read_test -r "${TEST_FILE}" -o 100 -s 20 -w "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize"
+    CACHE_SIZE=`du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'`
+    if [ $CACHE_SIZE -ne 0 ]; then
+        return 1
+    fi
+ 
+    ../../direct_read_test -r "${TEMP_DIR}/${TEST_FILE}" -o 100 -s 20 -w "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize.new"
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize.new" "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize"; then
+        return 1
+    fi
+    rm -f "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize.new"
+    rm -f "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize"
+ 
+    rm -f ${TEMP_DIR}/${TEST_FILE}
+    rm_test_file "${TEST_FILE}"
+}
+ 
+function test_direct_read_with_write {
+    describe "Testing direct read with another process write ..."
+ 
+    local TEST_FILE="direct-read-test-file-with-write"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+ 
+    dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}.new" bs=1M &
+    echo "" >> "${TEST_FILE}"
+    wait
+    
+    local CACHE_FILE_SIZE=`du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'`
+    if [ ${CACHE_FILE_SIZE} -eq 0 ]; then 
+        return 1
+    fi
+    
+    rm -f "${TEMP_DIR}/${TEST_FILE}"
+    rm -f "${TEMP_DIR}/${TEST_FILE}.new"
+    rm_test_file "${TEST_FILE}"
+}
+
+function test_direct_read_with_rename {
+    describe "Testing direct read with another process rename ..."
+ 
+    local TEST_FILE="direct-read-test-file-with-rename"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+ 
+    local CACHE_DIR_SIZE=`du -s ${CACHE_DIR} | awk '{print $1}'`
+ 
+    dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}.new" bs=1M &
+    mv "${TEST_FILE}" "${TEST_FILE}.cp"
+    wait
+    
+    local CACHE_DIR_SIZE_NEW=`du -s ${CACHE_DIR} | awk '{print $1}'`
+ 
+    if [ ${CACHE_DIR_SIZE} == ${CACHE_DIR_SIZE_NEW} ]; then
+       return 1
+    fi
+ 
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}.cp"; then
+       return 1
+    fi 
+ 
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEMP_DIR}/${TEST_FILE}.new"; then
+       return 1
+    fi 
+ 
+    rm -f "${TEMP_DIR}/${TEST_FILE}"
+    rm -f "${TEMP_DIR}/${TEST_FILE}.new"
+    rm_test_file "${TEST_FILE}.cp"
+}
+
+function test_direct_read_with_unlink {
+    describe "Testing direct read with another process unlink ..."
+ 
+    local TEST_FILE="direct-read-test-file-with-unlink"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+ 
+    dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}.new" bs=1M &
+    rm -f ${TEST_FILE}
+    wait
+    
+    if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEMP_DIR}/${TEST_FILE}.new"; then
+       return 1
+    fi 
+ 
+    rm -f "${TEMP_DIR}/${TEST_FILE}"
+    rm -f "${TEMP_DIR}/${TEST_FILE}.new"
+}
+
+function test_direct_read_with_truncate {
+    describe "Testing direct read with anothre process truncate ..."
+    
+    local TEST_FILE="direct-read-test-file-with-truncate"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
+ 
+    dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}" bs=1M &
+    truncate -s 1024M "${TEST_FILE}"
+    wait
+ 
+    local CACHE_FILE_SIZE=`du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'`
+    if [ ${CACHE_FILE_SIZE} -eq 0 ]; then 
+        return 1
+    fi
+    
+    rm -f ${TEMP_DIR}/${TEST_FILE}
+    rm_test_file "${TEST_FILE}"
+}
+
+function test_concurrent_direct_read {
+    describe "Testing concurrent direct read ..."
+ 
+    local TEST_FILE="concurrent_direct_read_test_file"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=254
+    for i in $(seq 5); do
+        aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}_${i}" --body "${TEMP_DIR}/${TEST_FILE}" &
+    done
+    wait
+ 
+    #1. read different file
+    for i in $(seq 5); do
+        dd if="${TEST_FILE}_${i}" of="${TEMP_DIR}/${TEST_FILE}_${i}" bs=1M &
+    done
+    wait
+ 
+    for i in $(seq 5); do
+        if ! cmp "${TEMP_DIR}/${TEST_FILE}_${i}" "${TEMP_DIR}/${TEST_FILE}"; then
+            return 1
+        fi
+ 
+        if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}_${i}" | awk '{print $1}'` -ne 0 ]; then
+            return 1
+        fi
+    done
+ 
+    #2. read same file 
+    rm -f ${TEMP_DIR}/${TEST_FILE}
+    rm_test_file
+}
+
 function add_all_tests {
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
@@ -2288,6 +2535,17 @@ function add_all_tests {
         fi
         add_tests test_update_directory_time_subdir
     fi
+
+    if ps u -p "${OSSFS_PID}" | grep -q direct_read; then
+        add_tests test_direct_read
+        add_tests test_direct_read_with_out_of_order
+        add_tests test_direct_read_with_write
+        add_tests test_direct_read_with_rename
+        add_tests test_direct_read_with_unlink
+        add_tests test_direct_read_with_truncate
+        add_tests test_concurrent_direct_read
+    fi
+
 }
 
 init_suite

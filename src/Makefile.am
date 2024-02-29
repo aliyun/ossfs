@@ -57,7 +57,9 @@ ossfs_SOURCES = \
     addhead.cpp \
     sighandlers.cpp \
     autolock.cpp \
-    common_auth.cpp
+    common_auth.cpp \
+    threadpoolman.cpp \
+    direct_reader.cpp
 if USE_SSL_OPENSSL
     ossfs_SOURCES += openssl_auth.cpp
 endif

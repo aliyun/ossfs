@@ -47,6 +47,7 @@
 #include "s3fs_help.h"
 #include "s3fs_util.h"
 #include "mpu_util.h"
+#include "threadpoolman.h"
 
 //-------------------------------------------------------------------
 // Symbols
@@ -1288,6 +1289,7 @@ static int rename_object(const char* from, const char* to, bool update_ctime)
                 ent->SetAtime(atime);
             }
         }
+        if(ent) ent->CheckAndExitDirectReadIfNeeded();
 
         // copy
         if(0 != (result = put_headers(to, meta, true, /* use_st_size= */ false))){
@@ -1344,6 +1346,8 @@ static int rename_object_nocopy(const char* from, const char* to, bool update_ct
             struct timespec ts = {time(NULL), 0};
             ent->SetCtime(ts);
         }
+
+        ent->CheckAndExitDirectReadIfNeeded();
 
         // upload
         if(0 != (result = ent->RowFlush(autoent.GetPseudoFd(), to, true))){
@@ -2281,6 +2285,8 @@ static int s3fs_truncate(const char* _path, off_t size)
             S3FS_PRN_ERR("could not open file(%s): errno=%d", path, errno);
             return -EIO;
         }
+
+        ent->CheckAndExitDirectReadIfNeeded();
         ent->UpdateCtime();
 
 #if defined(__APPLE__)
@@ -2444,6 +2450,8 @@ static int s3fs_write(const char* _path, const char* buf, size_t size, off_t off
         S3FS_PRN_ERR("could not find opened pseudo_fd(%llu) for path(%s)", (unsigned long long)(fi->fh), path);
         return -EIO;
     }
+
+    ent->CheckAndExitDirectReadIfNeeded();
 
     if(0 > (res = ent->Write(static_cast<int>(fi->fh), buf, offset, size))){
         S3FS_PRN_WARN("failed to write file(%s). result=%zd", path, res);
@@ -3641,6 +3649,11 @@ static void* s3fs_init(struct fuse_conn_info* conn)
          conn->want |= FUSE_CAP_BIG_WRITES;
     }
 
+    if(direct_read && !ThreadPoolMan::Initialize(direct_read_max_prefetch_thread_count)){
+        S3FS_PRN_CRIT("Could not create thread pool(%d)", direct_read_max_prefetch_thread_count);
+        s3fs_exit_fuseloop(EXIT_FAILURE);
+    }
+
     // Signal object
     if(!S3fsSignals::Initialize()){
         S3FS_PRN_ERR("Failed to initialize signal object, but continue...");
@@ -3657,6 +3670,8 @@ static void s3fs_destroy(void*)
     if(!S3fsSignals::Destroy()){
         S3FS_PRN_WARN("Failed to clean up signal object.");
     }
+
+    ThreadPoolMan::Destroy();
 
     // cache(remove at last)
     if(is_remove_cache && (!CacheFileStat::DeleteCacheFileStatDirectory() || !FdManager::DeleteCacheDirectory())){
@@ -4545,6 +4560,42 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             is_new_symlink_format = true;
             return 0;
         }        
+        if(0 == strcmp(arg, "direct_read")){
+            direct_read = true;
+            return 0;
+        }
+        if(is_prefix(arg, "direct_read_prefetch_thread=")){
+            int max_thcount = static_cast<int>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            if(0 >= max_thcount){
+                S3FS_PRN_EXIT("direct_read_max_prefetch_thread_count should be over 1");
+                return -1;
+            }
+            direct_read_max_prefetch_thread_count = max_thcount;
+            return 0;
+        }
+        if(is_prefix(arg, "direct_read_chunk_size=")){
+            off_t size = static_cast<off_t>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            if(!DirectReader::SetChunkSize(size)) {
+                S3FS_PRN_EXIT("direct_read_prefetch_chunk_size option must between 1 and 32.");
+                return -1;
+            }
+            return 0;
+        }
+        if(is_prefix(arg, "direct_read_prefetch_chunks=")) {
+            int count = static_cast<int>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/10));
+            if(!DirectReader::SetPrefetchChunkCount(count)) {
+                return -1;
+            }
+            return 0;
+        }
+        if(is_prefix(arg, "direct_read_prefetch_limit=")) {
+            long limit = static_cast<long>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            if(!DirectReader::SetPrefetchCacheLimits(limit)) {
+                S3FS_PRN_EXIT("prefetch_cache_limits option should be greater than 128.");
+                return -1;
+            }
+            return 0;
+        }
         //
         // log file option
         //

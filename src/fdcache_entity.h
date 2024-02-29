@@ -25,6 +25,7 @@
 #include "fdcache_page.h"
 #include "fdcache_fdinfo.h"
 #include "metaheader.h"
+#include "direct_reader.h"
 
 //------------------------------------------------
 // class FdEntity
@@ -51,6 +52,8 @@ class FdEntity
         std::string     mirrorpath;     // mirror file path to local cache file path
         bool            is_meta_pending;
         struct timespec holding_mtime;  // if mtime is updated while the file is open, it is set time_t value
+
+        bool            is_direct_read;
 
     private:
         static int FillFile(int fd, unsigned char byte, off_t size, off_t start);
@@ -129,6 +132,8 @@ class FdEntity
         bool PunchHole(off_t start = 0, size_t size = 0);
 
         void MarkDirtyNewFile();
+
+        void CheckAndExitDirectReadIfNeeded();
 };
 
 typedef std::map<std::string, class FdEntity*> fdent_map_t;   // key=path, value=FdEntity*
