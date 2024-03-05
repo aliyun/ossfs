@@ -1,5 +1,9 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.2 (06/03/2024)
+
+ - Support direct read without using local disk.
+
 ## v1.91.1 (27/07/2023)
 
  - sse supports customer master key (CMK).
