@@ -7,4 +7,5 @@ RUN yum update upgrade -y \
     && cd /opt/ && tar zxvf ruby-2.6.5.tar.gz && cd ruby-2.6.5 \
     && ./configure && make -j10 && make install \
     && gem sources -a http://mirrors.aliyun.com/rubygems/ -r https://rubygems.org/ \
+    && gem install dotenv -v 2.8.1 \
     && gem install fpm
