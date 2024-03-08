@@ -354,11 +354,16 @@ ssize_t PseudoFdInfo::DirectReadAndPrefetch(char* bytes, off_t start, size_t siz
         for (auto iter = direct_reader_mgr->chunks.begin(); iter!= direct_reader_mgr->chunks.end(); ) {
             // keep the one before the current chunk without releasing it. Because we assume that when 
             // the read offset is in the previous chunk, it is still read sequentially.
-            if ((iter->first >= id && iter->first-id <= 2 * max_prefetch_chunks)|| (id-iter->first) <= 1) break;
-            
-            delete iter->second;
-            iter->second = NULL;
-            iter = direct_reader_mgr->chunks.erase(iter);
+            // keep chunks in [id-1, id+max_prefetch_chunks]
+            uint32_t chunkid = iter->first;
+            if(chunkid + 1 >= id && chunkid <= id + max_prefetch_chunks){
+                iter++;
+            } else {
+                S3FS_PRN_DBG("release chunk[chunkid=%d]", chunkid);
+                delete iter->second;
+                iter->second = NULL;
+                iter = direct_reader_mgr->chunks.erase(iter);
+            }
         }
 
         if (direct_reader_mgr->chunks.count(id)) {
