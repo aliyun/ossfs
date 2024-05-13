@@ -1,8 +1,8 @@
 ﻿ChangeLog for OSSFS
 ------------------
 ## v1.91.2 (06/03/2024)
-
- - Support direct read without using local disk.
+ - Support direct reading file from OSS without using local disk. 
+   When direct reading mode is enabled, OSSFS uses asynchronous memory prefetch to improve sequential read performance dramatically. 
 
 ## v1.91.1 (27/07/2023)
 
