@@ -151,6 +151,7 @@ static const char help_string[] =
     "      - specify expire time (seconds) for entries in the stat cache.\n"
     "        This expire time indicates the time since stat cached. and this\n"
     "        is also set to the expire time of the symbolic link cache.\n"
+    "        -1 value means disable.\n"
     "\n"
     "   stat_cache_interval_expire (default is 900)\n"
     "      - specify expire time (seconds) for entries in the stat cache(and\n"

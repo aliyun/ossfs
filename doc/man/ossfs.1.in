@@ -136,7 +136,7 @@ maximum number of entries in the stat cache and symbolic link cache.
 specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time indicates the time since cached.
 .TP
 \fB\-o\fR stat_cache_interval_expire (default is 900)
-specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time is based on the time from the last access time of those cache.
+specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time is based on the time from the last access time of those cache. -1 value means disable.
 This option is exclusive with stat_cache_expire, and is left for compatibility with older versions.
 .TP
 \fB\-o\fR enable_noobj_cache (default is disable)
