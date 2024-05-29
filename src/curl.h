@@ -30,7 +30,6 @@
 
 #include "common.h"
 #include "curl_handlerpool.h"
-#include "bodydata.h"
 #include "psemaphore.h"
 #include "metaheader.h"
 #include "fdcache_page.h"
@@ -170,8 +169,8 @@ class S3fsCurl
         std::string          url;                  // target object path(url)
         struct curl_slist*   requestHeaders;
         headers_t            responseHeaders;      // header data by HeaderCallback
-        BodyData             bodydata;             // body data by WriteMemoryCallback
-        BodyData             headdata;             // header data by WriteMemoryCallback
+        std::string          bodydata;             // body data by WriteMemoryCallback
+        std::string          headdata;             // header data by WriteMemoryCallback
         long                 LastResponseCode;
         const unsigned char* postdata;             // use by post method and read callback function.
         off_t                postdata_remaining;   // use by post method and read callback function.
@@ -388,8 +387,8 @@ class S3fsCurl
         std::string GetUrl() const { return url; }
         std::string GetOp() const { return op; }
         headers_t* GetResponseHeaders() { return &responseHeaders; }
-        BodyData* GetBodyData() { return &bodydata; }
-        BodyData* GetHeadData() { return &headdata; }
+        const std::string* GetBodyData() { return &bodydata; }
+        const std::string* GetHeadData() { return &headdata; }
         CURLcode GetCurlCode() const { return curlCode; }
         long GetLastResponseCode() const { return LastResponseCode; }
         bool SetUseAhbe(bool ahbe);
