@@ -319,6 +319,17 @@ function common_exit_handler {
 }
 trap common_exit_handler EXIT
 
+function install_ossutil {
+    if ! [ -x "$(command -v ossutil)" ]; then
+        curl https://gosspublic.alicdn.com/ossutil/install.sh > install_ossutil.sh
+        bash install_ossutil.sh
+        if ! [ -x "$(command -v ossutil)" ]; then
+            echo "Failed to install ossutil"
+            exit 1
+        fi
+    fi
+}
+
 #
 # Local variables:
 # tab-width: 4

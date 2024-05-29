@@ -89,7 +89,7 @@ long             S3fsCurl::connect_timeout     = 300;  // default
 time_t           S3fsCurl::readwrite_timeout   = 120;  // default
 int              S3fsCurl::retries             = 5;    // default
 bool             S3fsCurl::is_public_bucket    = false;
-acl_t            S3fsCurl::default_acl         = acl_t::PRIVATE;
+acl_t            S3fsCurl::default_acl         = acl_t::DEFAULT;
 std::string      S3fsCurl::storage_class       = "STANDARD";
 sseckeylist_t    S3fsCurl::sseckeys;
 std::string      S3fsCurl::ssekmsid;
@@ -3268,7 +3268,7 @@ int S3fsCurl::PutHeadRequest(const char* tpath, headers_t& meta, bool is_copy)
     for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
         std::string key   = lower(iter->first);
         std::string value = iter->second;
-        if(is_prefix(key.c_str(), "x-oss-acl")){
+        if(is_prefix(key.c_str(), "x-oss-object-acl")){
             // not set value, but after set it.
         }else if(is_prefix(key.c_str(), "x-oss-meta")){
             requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
@@ -3294,9 +3294,9 @@ int S3fsCurl::PutHeadRequest(const char* tpath, headers_t& meta, bool is_copy)
         }
     }
 
-    // "x-oss-acl", storage class, sse
-    if(S3fsCurl::default_acl != acl_t::PRIVATE){
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.str());
+    // "x-oss-object-acl", storage class, sse
+    if(S3fsCurl::default_acl != acl_t::DEFAULT){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-object-acl", S3fsCurl::default_acl.str());
     }
     if(strcasecmp(GetStorageClass().c_str(), "STANDARD") != 0){
         requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", GetStorageClass().c_str());
@@ -3408,7 +3408,7 @@ int S3fsCurl::PutRequest(const char* tpath, headers_t& meta, int fd)
     for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
         std::string key   = lower(iter->first);
         std::string value = iter->second;
-        if(is_prefix(key.c_str(), "x-oss-acl")){
+        if(is_prefix(key.c_str(), "x-oss-object-acl")){
             // not set value, but after set it.
         }else if(is_prefix(key.c_str(), "x-oss-meta")){
             requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
@@ -3420,9 +3420,9 @@ int S3fsCurl::PutRequest(const char* tpath, headers_t& meta, int fd)
             // skip this header, because this header is specified after logic.
         }
     }
-    // "x-oss-acl", storage class, sse
-    if(S3fsCurl::default_acl != acl_t::PRIVATE){
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.str());
+    // "x-oss-object-acl", storage class, sse
+    if(S3fsCurl::default_acl != acl_t::DEFAULT){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-object-acl", S3fsCurl::default_acl.str());
     }
     if(strcasecmp(GetStorageClass().c_str(), "STANDARD") != 0){
         requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", GetStorageClass().c_str());
@@ -3802,7 +3802,7 @@ int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, std::s
     for(headers_t::iterator iter = meta.begin(); iter != meta.end(); ++iter){
         std::string key   = lower(iter->first);
         std::string value = iter->second;
-        if(is_prefix(key.c_str(), "x-oss-acl")){
+        if(is_prefix(key.c_str(), "x-oss-object-acl")){
             // not set value, but after set it.
         }else if(is_prefix(key.c_str(), "x-oss-meta")){
             requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
@@ -3825,9 +3825,9 @@ int S3fsCurl::PreMultipartPostRequest(const char* tpath, headers_t& meta, std::s
             }
         }
     }
-    // "x-oss-acl", storage class, sse
-    if(S3fsCurl::default_acl != acl_t::PRIVATE){
-        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-acl", S3fsCurl::default_acl.str());
+    // "x-oss-object-acl", storage class, sse
+    if(S3fsCurl::default_acl != acl_t::DEFAULT){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-object-acl", S3fsCurl::default_acl.str());
     }
     if(strcasecmp(GetStorageClass().c_str(), "STANDARD") != 0){
         requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-storage-class", GetStorageClass().c_str());
@@ -4207,7 +4207,7 @@ int S3fsCurl::CopyMultipartPostSetup(const char* from, const char* to, int part_
         }else if(key == "x-oss-copy-source-range"){
             requestHeaders = curl_slist_sort_insert(requestHeaders, iter->first.c_str(), value.c_str());
         }
-        // NOTICE: x-oss-acl, x-oss-server-side-encryption is not set!
+        // NOTICE: x-oss-object-acl, x-oss-server-side-encryption is not set!
     }
 
     op = "PUT";

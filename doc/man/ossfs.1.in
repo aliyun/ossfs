@@ -61,8 +61,8 @@ All ossfs options must given in the form where "opt" is:
 \fB\-o\fR bucket
 if it is not specified bucket name (and path) in command line, must specify this option after \-o option for bucket name.
 .TP
-\fB\-o\fR default_acl (default="private")
-the default canned acl to apply to all written oss objects, e.g., "private", "public-read".
+\fB\-o\fR default_acl (default="default")
+the default canned acl to apply to all written oss objects, e.g., "private", "public-read", "public-read-write".
 .TP
 \fB\-o\fR retries (default="5")
 number of times to retry a failed OSS transaction.
