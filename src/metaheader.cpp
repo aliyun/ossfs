@@ -210,9 +210,11 @@ mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir
                                     if(strConType == "text/plain" && (0 == size || 1 == size)){
                                         mode |= S_IFDIR;
                                     }else{
+                                        S3FS_PRN_DBG("Type Conflict[path=%s][content-type=%s][size=%ld]", strpath.c_str(), strConType.c_str(), size);
                                         mode |= S_IFREG;
                                     }
                                 }else{
+                                    S3FS_PRN_DBG("Type Conflict[path=%s][content-type=%s]", strpath.c_str(), strConType.c_str());
                                     mode |= S_IFREG;
                                 }
                             }
