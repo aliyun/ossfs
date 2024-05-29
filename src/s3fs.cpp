@@ -4324,7 +4324,13 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             return 0;
         }
         if(is_prefix(arg, "stat_cache_expire=")){
-            time_t expr_time = static_cast<time_t>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), 10));
+            auto value = cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10);
+            if(value == -1){
+                S3FS_PRN_WARN("stat_cache_expire is set to -1, unset expiretime.");
+                StatCache::getStatCacheData()->UnsetExpireTime();
+                return 0;
+            }
+            time_t expr_time = static_cast<time_t>(value);
             StatCache::getStatCacheData()->SetExpireTime(expr_time);
             return 0;
         }

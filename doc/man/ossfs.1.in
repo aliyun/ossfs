@@ -133,7 +133,7 @@ specify the maximum number of keys returned by OSS list object API. The default 
 maximum number of entries in the stat cache and symbolic link cache.
 .TP
 \fB\-o\fR stat_cache_expire (default is 900)
-specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time indicates the time since cached.
+specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time indicates the time since cached. -1 value means disable.
 .TP
 \fB\-o\fR stat_cache_interval_expire (default is 900)
 specify expire time (seconds) for entries in the stat cache and symbolic link cache. This expire time is based on the time from the last access time of those cache.
