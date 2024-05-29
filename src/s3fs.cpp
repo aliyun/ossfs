@@ -3752,6 +3752,18 @@ static bool check_endpoint_error(const char* pbody, size_t len, std::string& exp
     return true;
 }
 
+static bool check_error_message(const char* pbody, size_t len, std::string& message)
+{
+    message.clear();
+    if(!pbody){
+        return false;
+    }
+    if(!simple_parse_xml(pbody, len, "Message", message)){
+        return false;
+    }
+    return true;
+}
+
 static int s3fs_check_service()
 {
     S3FS_PRN_INFO("check services.");
@@ -3852,18 +3864,19 @@ static int s3fs_check_service()
         */
         // check errors(after retrying)
         if(0 > res && responseCode != 200 && responseCode != 301){
+            // parse error message if existed
+            std::string errMessage;
+            const std::string* body = s3fscurl.GetBodyData();
+            check_error_message(body->c_str(), body->size(), errMessage);
+            
             if(responseCode == 400){
-                S3FS_PRN_CRIT("Bad Request(host=%s) - result of checking service.", s3host.c_str());
-
+                S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Bad Request(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }else if(responseCode == 403){
-                S3FS_PRN_CRIT("invalid credentials(host=%s) - result of checking service.", s3host.c_str());
-
+                 S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Invalid Credentials(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }else if(responseCode == 404){
-                S3FS_PRN_CRIT("bucket or key not found(host=%s) - result of checking service.", s3host.c_str());
-
+                S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Bucket or directory not found(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }else{
-                // another error
-                S3FS_PRN_CRIT("unable to connect(host=%s) - result of checking service.", s3host.c_str());
+                S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Unable to connect(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }
             return EXIT_FAILURE;
         }
