@@ -68,6 +68,7 @@ bool S3ObjList::insert(const char* name, const char* etag, bool is_dir, const ch
         std::string chkname = newname.substr(0, newname.length() - 1);
         if(objects.end() != (iter = objects.find(chkname))){
             // found "dir" object --> remove it.
+            S3FS_PRN_DBG("Type Conflict[%s and %s may exist on the cloud at the same time.]", chkname.c_str(), newname.c_str());
             objects.erase(iter);
         }
     }else{
