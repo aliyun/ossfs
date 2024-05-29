@@ -2435,6 +2435,34 @@ function test_concurrent_direct_read {
     rm_test_file
 }
 
+function test_free_cache_ahead {
+    describe "Testing free cache ahead ..."
+ 
+    # fake_diskfree = 200MB
+    local TEST_FILE="test_reclaim_cache_ahead"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=100
+ 
+    for i in $(seq 4); do
+        aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}_${i}" --body "${TEMP_DIR}/${TEST_FILE}" &
+    done
+    wait
+ 
+    for i in $(seq 4); do
+        dd if="${TEST_FILE}_${i}" of="${TEMP_DIR}/${TEST_FILE}_${i}" bs=1M &
+    done
+    wait
+ 
+    for i in $(seq 4); do
+        if ! cmp "${TEMP_DIR}/${TEST_FILE}_${i}" "${TEMP_DIR}/${TEST_FILE}"; then
+            rm -f ${TEMP_DIR}/${TEST_FILE}_${i}
+            return 1
+        fi
+        rm -f ${TEMP_DIR}/${TEST_FILE}_${i}
+    done
+ 
+    rm_test_file "${TEST_FILE}"
+}
+
 function add_all_tests {
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
@@ -2546,6 +2574,9 @@ function add_all_tests {
         add_tests test_concurrent_direct_read
     fi
 
+    if ps u -p "${OSSFS_PID}" | grep -q parallel_count && ps u -p "${OSSFS_PID}" | grep -q fake_diskfree; then
+        add_tests test_free_cache_ahead
+    fi
 }
 
 init_suite

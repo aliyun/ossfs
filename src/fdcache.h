@@ -48,6 +48,7 @@ class FdManager
   private:
       static off_t GetFreeDiskSpace(const char* path);
       static bool IsDir(const std::string* dir);
+      static int GetVfsStat(const char* path, struct statvfs* vfsbuf);
 
       int GetPseudoFdCount(const char* path);
       void CleanupCacheDirInternal(const std::string &path = "");
@@ -60,6 +61,7 @@ class FdManager
       // Reference singleton
       static FdManager* get() { return &singleton; }
 
+      static off_t GetTotalDiskSpace(const char* path);
       static bool DeleteCacheDirectory();
       static int DeleteCacheFile(const char* path);
       static bool SetCacheDir(const char* dir);
