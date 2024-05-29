@@ -2463,6 +2463,26 @@ function test_free_cache_ahead {
     rm_test_file "${TEST_FILE}"
 }
 
+function test_default_acl {
+    describe "Testing defacult acl..."
+    
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
+    touch "test.txt"
+ 
+    local CONTENT_TYPE; CONTENT_TYPE=$(ossutil_cmd stat "oss://${TEST_BUCKET_1}/${DIR_NAME}/test.txt" | grep ACL)
+    if ps u -p "${OSSFS_PID}" | grep -q default_acl; then
+        if ! echo "${CONTENT_TYPE}" | grep -q "private"; then 
+            return 1
+        fi
+    else    
+        if ! echo "${CONTENT_TYPE}" | grep -q "default"; then 
+            return 1
+        fi
+    fi
+ 
+    rm -rf "test.txt"
+}
+
 function add_all_tests {
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
@@ -2576,6 +2596,10 @@ function add_all_tests {
 
     if ps u -p "${OSSFS_PID}" | grep -q parallel_count && ps u -p "${OSSFS_PID}" | grep -q fake_diskfree; then
         add_tests test_free_cache_ahead
+    fi
+
+    if ! uname | grep -q Darwin; then 
+        add_tests test_default_acl
     fi
 }
 

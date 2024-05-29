@@ -86,6 +86,7 @@ test/junk_data
 test/s3proxy-*
 test/write_multiblock
 test/direct_read_test
+test/install_ossutil.sh
 #
 # Windows ports
 #

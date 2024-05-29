@@ -61,6 +61,7 @@ if [ -n "${ALL_TESTS}" ]; then
         "use_xattr=0 -o readdir_optimize -o readdir_check_size=48 -o symlink_in_meta"
         "use_cache=${CACHE_DIR} -o direct_read"
         "fake_diskfree=${FAKE_FREE_DISK_SIZE} -oparallel_count=10 -omultipart_size=10"
+        "default_acl=private"
     )
 else
     FLAGS=(
@@ -69,6 +70,7 @@ else
 fi
 
 start_s3proxy
+install_ossutil
 
 if ! aws_cli s3api head-bucket --bucket "${TEST_BUCKET_1}" --region "${OSS_REGION}"; then
     aws_cli s3 mb "s3://${TEST_BUCKET_1}" --region "${OSS_REGION}"

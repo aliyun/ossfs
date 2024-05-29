@@ -340,6 +340,14 @@ function aws_cli() {
     aws $@ --endpoint-url "${OSS_URL}" --ca-bundle /tmp/keystore.pem ${FLAGS}
 }
 
+function ossutil_cmd() {
+    OSS_ACCESS_KEY_ID=$(cut -d: -f1 "${OSSFS_CREDENTIALS_FILE}")
+    OSS_SECRET_ACCESS_KEY=$(cut -d: -f2 "${OSSFS_CREDENTIALS_FILE}")
+ 
+    ossutil64 -i "${OSS_ACCESS_KEY_ID}" -k "${OSS_SECRET_ACCESS_KEY}" -e "${OSS_URL}" $@
+ 
+}
+
 function wait_for_port() {
     local PORT="$1"
     for _ in $(seq 30); do

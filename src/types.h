@@ -70,6 +70,10 @@ typedef std::map<std::string, PXATTRVAL> xattrs_t;
 
 //-------------------------------------------------------------------
 // acl_t
+// Note: Header "x-oss-object-acl" is for acl. OSS's acl is not compatible with S3. 
+// OSS object's acl is "private", "public-read", "public-read-write", "default"
+// ref: https://help.aliyun.com/zh/oss/developer-reference/putobjectacl?spm=a2c4g.11186623.0.i26
+//      https://docs.aws.amazon.com/AmazonS3/latest/userguide/acl-overview.html#canned-acl
 //-------------------------------------------------------------------
 class acl_t{
     public:
@@ -77,11 +81,7 @@ class acl_t{
             PRIVATE,
             PUBLIC_READ,
             PUBLIC_READ_WRITE,
-            AWS_EXEC_READ,
-            AUTHENTICATED_READ,
-            BUCKET_OWNER_READ,
-            BUCKET_OWNER_FULL_CONTROL,
-            LOG_DELIVERY_WRITE,
+            DEFAULT,
             UNKNOWN
         };
 
@@ -99,16 +99,8 @@ class acl_t{
                     return "public-read";
                 case PUBLIC_READ_WRITE:
                     return "public-read-write";
-                case AWS_EXEC_READ:
-                    return "aws-exec-read";
-                case AUTHENTICATED_READ:
-                    return "authenticated-read";
-                case BUCKET_OWNER_READ:
-                    return "bucket-owner-read";
-                case BUCKET_OWNER_FULL_CONTROL:
-                    return "bucket-owner-full-control";
-                case LOG_DELIVERY_WRITE:
-                    return "log-delivery-write";
+                case DEFAULT:
+                    return "default";
                 case UNKNOWN:
                     return NULL;
             }
@@ -123,16 +115,8 @@ class acl_t{
                 return PUBLIC_READ;
             }else if(0 == strcmp(acl, "public-read-write")){
                 return PUBLIC_READ_WRITE;
-            }else if(0 == strcmp(acl, "aws-exec-read")){
-                return AWS_EXEC_READ;
-            }else if(0 == strcmp(acl, "authenticated-read")){
-                return AUTHENTICATED_READ;
-            }else if(0 == strcmp(acl, "bucket-owner-read")){
-                return BUCKET_OWNER_READ;
-            }else if(0 == strcmp(acl, "bucket-owner-full-control")){
-                return BUCKET_OWNER_FULL_CONTROL;
-            }else if(0 == strcmp(acl, "log-delivery-write")){
-                return LOG_DELIVERY_WRITE;
+            }else if(0 == strcmp(acl, "default")){
+                return DEFAULT;
             }else{
                 return UNKNOWN;
             }
