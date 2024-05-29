@@ -1764,12 +1764,15 @@ ssize_t FdEntity::Read(int fd, char* bytes, off_t start, size_t size, bool force
         return pseudo_obj->DirectReadAndPrefetch(bytes, start, size);
     }
 
+    CheckAndFreeDiskCacheIfNeeded();
+
     if(force_load){
         pagelist.SetPageLoadedStatus(start, size, PageList::PAGE_NOT_LOAD_MODIFIED);
     }
 
     ssize_t rsize;
-
+    int result = 0;
+    bool read_from_oss_directly = false;
     // check disk space
     if(0 < pagelist.GetTotalUnloadedPageSize(start, size)){
         // load size(for prefetch)
@@ -1788,23 +1791,36 @@ ssize_t FdEntity::Read(int fd, char* bytes, off_t start, size_t size, bool force
             S3FS_PRN_WARN("could not reserve disk space for pre-fetch download");
             load_size = size;
             if(!ReserveDiskSpace(load_size)){
-                S3FS_PRN_ERR("could not reserve disk space for pre-fetch download");
-                return -ENOSPC;
+                S3FS_PRN_WARN("could not reserve disk space for pre-fetch download");
+                read_from_oss_directly = true;
             }
         }
 
-        // Loading
-        int result = 0;
-        if(0 < size){
-            result = Load(start, load_size, AutoLock::ALREADY_LOCKED);
+        if(!read_from_oss_directly) {
+            if(0 < size){
+                // Loading
+                result = Load(start, load_size, AutoLock::ALREADY_LOCKED);
+            }
+
+            FdManager::FreeReservedDiskSpace(load_size);
+
+            if(0 != result){
+                S3FS_PRN_WARN("could not download. start(%lld), size(%zu), errno(%d)", static_cast<long long int>(start), size, result);
+                read_from_oss_directly = true;
+            }
         }
+    }
 
-        FdManager::FreeReservedDiskSpace(load_size);
-
+    if(read_from_oss_directly){
+        // direct read from oss, but no prefetch
+        S3FS_PRN_WARN("could not reserve disk space for download, direct read from cloud.");
+        S3fsCurl s3fscurl;
+        result = s3fscurl.GetObjectStreamRequest(path.c_str(), bytes, start, size, rsize);
         if(0 != result){
             S3FS_PRN_ERR("could not download. start(%lld), size(%zu), errno(%d)", static_cast<long long int>(start), size, result);
             return result;
         }
+        return rsize;
     }
 
     // Reading
@@ -2250,6 +2266,26 @@ void FdEntity::CheckAndExitDirectReadIfNeeded()
         PseudoFdInfo* ppseudofdinfo = iter->second;
         ppseudofdinfo->ExitDirectRead();
     }
+    return;
+}
+
+// fdent_data_lock should be locked before calling
+// if free disk is less than multipart_size, try to clear all cache for this fd.
+void FdEntity::CheckAndFreeDiskCacheIfNeeded()
+{
+    if(FdManager::IsSafeDiskSpace(NULL, S3fsCurl::GetMultipartSize())){
+        return;
+    }
+
+    if(!pagelist.IsModified()){
+        // try to clear all cache for this fd.
+        S3FS_PRN_DBG("try to clear cache for file(%s).", path.c_str());
+        pagelist.Init(pagelist.Size(), false, false);
+        if(-1 == ftruncate(physical_fd, 0) || -1 == ftruncate(physical_fd, pagelist.Size())){
+            S3FS_PRN_WARN("failed to truncate temporary file(physical_fd=%d).", physical_fd);
+        }
+    }
+    
     return;
 }
 

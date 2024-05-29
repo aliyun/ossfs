@@ -134,6 +134,8 @@ class FdEntity
         void MarkDirtyNewFile();
 
         void CheckAndExitDirectReadIfNeeded();
+
+        void CheckAndFreeDiskCacheIfNeeded();
 };
 
 typedef std::map<std::string, class FdEntity*> fdent_map_t;   // key=path, value=FdEntity*

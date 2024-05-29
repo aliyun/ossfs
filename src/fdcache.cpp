@@ -271,9 +271,33 @@ bool FdManager::InitFakeUsedDiskSize(off_t fake_freesize)
     return true;
 }
 
+off_t FdManager::GetTotalDiskSpace(const char* path)
+{
+    struct statvfs vfsbuf;
+    int result = FdManager::GetVfsStat(path, &vfsbuf);
+    if(result == -1){
+        return 0;
+    }
+
+    off_t actual_totalsize = vfsbuf.f_blocks * vfsbuf.f_frsize;
+    
+    return actual_totalsize;
+}
+
 off_t FdManager::GetFreeDiskSpace(const char* path)
 {
     struct statvfs vfsbuf;
+    int result = FdManager::GetVfsStat(path, &vfsbuf);
+    if(result == -1){
+        return 0;
+    }
+
+    off_t actual_freesize = vfsbuf.f_bavail * vfsbuf.f_frsize;
+    
+    return (FdManager::fake_used_disk_space < actual_freesize ? (actual_freesize - FdManager::fake_used_disk_space) : 0);
+}
+
+int FdManager::GetVfsStat(const char* path, struct statvfs* vfsbuf){
     std::string ctoppath;
     if(!FdManager::cache_dir.empty()){
         ctoppath = FdManager::cache_dir + "/";
@@ -289,14 +313,12 @@ off_t FdManager::GetFreeDiskSpace(const char* path)
     }else{
         ctoppath += ".";
     }
-    if(-1 == statvfs(ctoppath.c_str(), &vfsbuf)){
+    if(-1 == statvfs(ctoppath.c_str(), vfsbuf)){
         S3FS_PRN_ERR("could not get vfs stat by errno(%d)", errno);
-        return 0;
+        return -1;
     }
 
-    off_t actual_freesize = vfsbuf.f_bavail * vfsbuf.f_frsize;
-
-    return (FdManager::fake_used_disk_space < actual_freesize ? (actual_freesize - FdManager::fake_used_disk_space) : 0);
+    return 0;
 }
 
 bool FdManager::IsSafeDiskSpace(const char* path, off_t size)
