@@ -40,7 +40,6 @@ ossfs_SOURCES = \
     curl_handlerpool.cpp \
     curl_multi.cpp \
     curl_util.cpp \
-    bodydata.cpp \
     s3objlist.cpp \
     cache.cpp \
     string_util.cpp \

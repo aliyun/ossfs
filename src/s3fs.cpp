@@ -2977,10 +2977,10 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
             S3FS_PRN_ERR("ListBucketRequest returns with error.");
             return result;
         }
-        BodyData* body = s3fscurl.GetBodyData();
+        const std::string* body = s3fscurl.GetBodyData();
 
         // xmlDocPtr
-        if(NULL == (doc = xmlReadMemory(body->str(), static_cast<int>(body->size()), "", NULL, 0))){
+        if(NULL == (doc = xmlReadMemory(body->c_str(), static_cast<int>(body->size()), "", NULL, 0))){
             S3FS_PRN_ERR("xmlReadMemory returns with error.");
             return -EIO;
         }
@@ -3772,11 +3772,11 @@ static int s3fs_check_service()
         if(300 <= responseCode && responseCode < 500){
 
             // check region error(for putting message or retrying)
-            BodyData* body = s3fscurl.GetBodyData();
+            const std::string* body = s3fscurl.GetBodyData();
             /*
             std::string expectregion;
             std::string expectendpoint;
-            if(check_region_error(body->str(), body->size(), expectregion)){
+            if(check_region_error(body->c_str(), body->size(), expectregion)){
                 // [NOTE]
                 // If endpoint is not specified(using us-east-1 region) and
                 // an error is encountered accessing a different region, we
@@ -3808,7 +3808,7 @@ static int s3fs_check_service()
             }else 
             */
             std::string expecthost;
-            if(check_endpoint_error(body->str(), body->size(), expecthost)){
+            if(check_endpoint_error(body->c_str(), body->size(), expecthost)){
                 S3FS_PRN_CRIT("Failed to connect host '%s'(default), so retry to connect host '%s'.", s3host.c_str(), expecthost.c_str());
                 if(!strncasecmp(s3host.c_str(), "https://", 8)){
                     s3host = "https://" + expecthost;
