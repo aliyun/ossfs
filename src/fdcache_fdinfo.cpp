@@ -271,12 +271,12 @@ bool PseudoFdInfo::AddUntreated(off_t start, off_t size)
 void PseudoFdInfo::ExitDirectRead()
 {
     AutoLock auto_lock(&direct_read_lock);
-
+    
     // Once is_direct_read is set to false, it will not be reset again until the file is reopend.
     is_direct_read = false;
     last_read_tail = 0;
     prefetch_cnt = 0;
-
+    
     // clean up chunks
     if(direct_reader_mgr != NULL){
         direct_reader_mgr->CleanUpChunks();
@@ -288,9 +288,9 @@ void PseudoFdInfo::ExitDirectRead()
 uint32_t PseudoFdInfo::GetPrefetchCount(off_t offset, size_t size)
 {
     S3FS_PRN_DBG("GetPrefetchCount[offset=%ld][size=%ld][last_read_tail=%ld]", offset, size, last_read_tail);
-
+    
     AutoLock auto_lock(&direct_read_lock);
-
+    
     if(!is_direct_read){
         return 0;
     }
@@ -324,14 +324,14 @@ ssize_t PseudoFdInfo::DirectReadAndPrefetch(char* bytes, off_t start, size_t siz
     ssize_t rsize = 0;
     off_t offset = start;
     size_t readsize = size;
-
+    
     const off_t chunk_size = DirectReader::GetChunkSize();
     const uint32_t max_prefetch_chunks = DirectReader::GetPrefetchChunkCount();
     off_t file_size = direct_reader_mgr->GetFileSize();
     if(size == 0 || start >= file_size){
         return 0;
     }
-
+    
     uint32_t chunkid_start = offset / chunk_size;
     uint32_t chunkid_end = (offset + readsize - 1) / chunk_size;
     for (uint32_t id = chunkid_start; id <= chunkid_end; id++) {
@@ -349,23 +349,23 @@ ssize_t PseudoFdInfo::DirectReadAndPrefetch(char* bytes, off_t start, size_t siz
         }
 
         AutoLock auto_lock(&direct_reader_mgr->direct_read_lock);
-
+        
         // Release chunks to reduce memory usage
         for (auto iter = direct_reader_mgr->chunks.begin(); iter!= direct_reader_mgr->chunks.end(); ) {
             // keep the one before the current chunk without releasing it. Because we assume that when 
             // the read offset is in the previous chunk, it is still read sequentially.
-            // keep chunks in [id-1, id+max_prefetch_chunks]
+            // keep chunks in [id-backward_chunks, id+max_prefetch_chunks]
             uint32_t chunkid = iter->first;
-            if(chunkid + 1 >= id && chunkid <= id + max_prefetch_chunks){
+            if(chunkid + DirectReader::GetBackwardChunks() >= id && chunkid <= id + max_prefetch_chunks){
                 iter++;
             } else {
-                S3FS_PRN_DBG("release chunk[chunkid=%d]", chunkid);
+                S3FS_PRN_DBG("release chunk[pseudo_fd=%d][chunkid=%d]", pseudo_fd, chunkid);
                 delete iter->second;
                 iter->second = NULL;
                 iter = direct_reader_mgr->chunks.erase(iter);
             }
         }
-
+        
         if (direct_reader_mgr->chunks.count(id)) {
             S3FS_PRN_DBG("reading from buffer[chunkid=%d][offset=%ld][chunk_off=%ld][real_read_size=%ld]", id, offset, chunk_off, real_read_size);
             assert(chunk_off + static_cast<off_t>(real_read_size) <= direct_reader_mgr->chunks[id]->size);
@@ -393,7 +393,7 @@ ssize_t PseudoFdInfo::DirectReadAndPrefetch(char* bytes, off_t start, size_t siz
             // finish reading the file.
             return rsize + real_read_size;   
         }
-
+        
         offset += chunk_len;
         readsize -= chunk_len;
         bytes += chunk_len;
@@ -414,9 +414,9 @@ void PseudoFdInfo::GeneratePrefetchTask(uint32_t start_prefetch_chunk, uint32_t 
     const off_t file_size = direct_reader_mgr->GetFileSize();
     uint32_t max_prefetch_chunk = (file_size - 1) / chunk_size; 
     uint32_t last_prefetch_chunk = std::min(max_prefetch_chunk, start_prefetch_chunk + prefetch_cnt);
-
+    
     AutoLock auto_lock(&direct_reader_mgr->direct_read_lock);
-
+    
     // if ongoing_prefetch is not 0, it means thera are some prefetch tasks generated last time running. 
     // skip generate new tasks here inorder to avoid prefetch a chunk twice.
     if (direct_reader_mgr->ongoing_prefetch == 0) {

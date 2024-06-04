@@ -119,8 +119,14 @@ class FdEntity
         bool GetSymlinkAttr(std::string& type, std::string& symlink);
         bool SetSymlinkAttr(const std::string& type, const std::string& symlink);
 
-        int Load(off_t start, off_t size, AutoLock::Type type, bool is_modified_flag = false);  // size=0 means loading to end
+        // size=0 means loading to end
+        int LoadWithSizeInfo(off_t start, off_t size, AutoLock::Type type, uint64_t &loaded_size, bool is_modified_flag = false); 
+        int Load(off_t start, off_t size, AutoLock::Type type, bool is_modified_flag = false) {
+            uint64_t loaded_size = 0;
+            return LoadWithSizeInfo(start, size, type, loaded_size, is_modified_flag);
+        };
 
+        
         off_t BytesModified();
         int RowFlush(int fd, const char* tpath, bool force_sync = false);
         int Flush(int fd, bool force_sync = false) { return RowFlush(fd, NULL, force_sync); }
@@ -134,7 +140,7 @@ class FdEntity
         void MarkDirtyNewFile();
 
         void CheckAndExitDirectReadIfNeeded();
-
+        
         void CheckAndFreeDiskCacheIfNeeded();
 };
 

@@ -46,10 +46,10 @@ class PseudoFdInfo
         off_t           last_read_tail;
         int             prefetch_cnt;
         DirectReader*   direct_reader_mgr;
+        uint64_t        loaded_size = 0;
 
     private:
         bool Clear();
-
         void GeneratePrefetchTask(uint32_t start_prefetch_chunk, uint32_t prefetch_cnt);
         uint32_t GetPrefetchCount(off_t offset, size_t size);
     public:
@@ -80,6 +80,8 @@ class PseudoFdInfo
 
         ssize_t DirectReadAndPrefetch(char* bytes, off_t start, size_t size);
         void ExitDirectRead();
+        void AddLoadedSize(off_t size) { loaded_size += size; }
+        uint64_t GetLoadedSize() { return loaded_size; }
 };
 
 typedef std::map<int, class PseudoFdInfo*> fdinfo_map_t;

@@ -44,6 +44,8 @@ bool Chunk::cache_usage_check()
 off_t     DirectReader::chunk_size                    = 4 * 1024 * 1024;       // default
 int       DirectReader::prefetch_chunk_count          = 32;                    // default 
 uint64_t  DirectReader::prefetch_cache_limits         = 1024 * 1024 * 1024;    // default
+int       DirectReader::backward_chunks               = 1;
+uint64_t  DirectReader::direct_read_local_file_cache_size = 0;   // by default data will not be written to the disk
 
 bool DirectReader::SetChunkSize(off_t size)
 {
@@ -71,6 +73,19 @@ bool DirectReader::SetPrefetchCacheLimits(uint64_t limit)
     }
 
     DirectReader::prefetch_cache_limits = limit;
+    return true;
+}
+bool DirectReader::SetDirectReadLocalFileCacheSizeMB(uint64_t limit) {
+    limit = limit * 1024 * 1024;
+    DirectReader::direct_read_local_file_cache_size = limit;
+    return true;
+}
+
+bool DirectReader::SetBackwardChunks(int chunk_num) {
+    if (chunk_num < 0) {
+        return false;
+    }
+    DirectReader::backward_chunks = chunk_num;
     return true;
 }
 
@@ -115,7 +130,7 @@ bool DirectReader::Prefetch(off_t start, off_t len)
     if (start >= filesize || len == 0) {
         return false;
     }
-
+    
     DirectReadParam* direct_read_param  = new DirectReadParam;
     direct_read_param->direct_reader    = this;
     direct_read_param->start            = start;
@@ -133,7 +148,7 @@ bool DirectReader::Prefetch(off_t start, off_t len)
         delete poolparam;
         return false;
     }
-
+    
     ++instruct_count; // already lock outside
 
     return true;
@@ -196,7 +211,7 @@ bool DirectReader::CompleteInstruction(AutoLock::Type type)
 
     --instruct_count;
     ++completed_count;
-
+    
     S3FS_PRN_DBG("CompleteInstruction[instruct_count=%d][completed_count=%d]", instruct_count, completed_count);
 
     return true;
@@ -229,15 +244,16 @@ void* direct_read_worker(void* arg)
             delete direct_read_param;
         }
         return reinterpret_cast<void*>(-EIO);
-    }
-
+    }   
+    
     DirectReader* direct_reader = direct_read_param->direct_reader;
     off_t start = direct_read_param->start;
     off_t len   = direct_read_param->len;
     bool  is_sync_download = direct_read_param->is_sync_download;
-
+    
+    
     S3FS_PRN_DBG("prefetch worker[pid=%lu][path=%s][start=%ld][len=%ld]", pthread_self(), direct_reader->filepath.c_str(), start, len);
-
+    
     S3fsCurl s3fscurl;
     ssize_t rsize;
 
@@ -280,12 +296,3 @@ void* direct_read_worker(void* arg)
     delete direct_read_param;
     return NULL;
 }
-
-/*
-* Local variables:
-* tab-width: 4
-* c-basic-offset: 4
-* End:
-* vim600: expandtab sw=4 ts=4 fdm=marker
-* vim<600: expandtab sw=4 ts=4
-*/

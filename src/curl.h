@@ -378,7 +378,7 @@ class S3fsCurl
         int MultipartRenameRequest(const char* from, const char* to, headers_t& meta, off_t size);
         int PreGetObjectStreamRequest(const char* tpath, char* buf, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue);
         int GetObjectStreamRequest(const char* tpath, char* buf, off_t start, off_t size, ssize_t& rsize);
-
+        
         // methods(variables)
         CURL* GetCurlHandle() const { return hCurl; }
         std::string GetPath() const { return path; }
