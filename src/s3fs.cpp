@@ -3648,7 +3648,7 @@ static void* s3fs_init(struct fuse_conn_info* conn)
     if((unsigned int)conn->capable & FUSE_CAP_BIG_WRITES){
          conn->want |= FUSE_CAP_BIG_WRITES;
     }
-
+    
     if(direct_read && !ThreadPoolMan::Initialize(direct_read_max_prefetch_thread_count)){
         S3FS_PRN_CRIT("Could not create thread pool(%d)", direct_read_max_prefetch_thread_count);
         s3fs_exit_fuseloop(EXIT_FAILURE);
@@ -3868,7 +3868,7 @@ static int s3fs_check_service()
             std::string errMessage;
             const std::string* body = s3fscurl.GetBodyData();
             check_error_message(body->c_str(), body->size(), errMessage);
-            
+
             if(responseCode == 400){
                 S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Bad Request(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }else if(responseCode == 403){
@@ -4578,7 +4578,7 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         if(0 == strcmp(arg, "symlink_in_meta")){
             is_new_symlink_format = true;
             return 0;
-        }        
+        }       
         if(0 == strcmp(arg, "direct_read")){
             direct_read = true;
             return 0;
@@ -4611,6 +4611,22 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             long limit = static_cast<long>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
             if(!DirectReader::SetPrefetchCacheLimits(limit)) {
                 S3FS_PRN_EXIT("prefetch_cache_limits option should be greater than 128.");
+                return -1;
+            }
+            return 0;
+        }
+        if(is_prefix(arg, "direct_read_backward_chunks=")) {
+            int count = static_cast<int>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/10));
+            if(!DirectReader::SetBackwardChunks(count)) {
+                return -1;
+            }
+            return 0;
+        }
+        // takes effect only when direct_read == true
+        if(is_prefix(arg, "direct_read_local_file_cache_size_mb=")) {
+            long limit = static_cast<long>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            if(!DirectReader::SetDirectReadLocalFileCacheSizeMB(limit)) {
+                S3FS_PRN_EXIT("Invalid direct_read_local_file_cache_size_mb.");
                 return -1;
             }
             return 0;

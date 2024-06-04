@@ -72,6 +72,8 @@ class DirectReader
         static off_t                chunk_size;
         static int                  prefetch_chunk_count;
         static uint64_t             prefetch_cache_limits;
+        static int                  backward_chunks;
+        static uint64_t             direct_read_local_file_cache_size;
 
         const std::string           filepath;    // used to request data from oss, and If the file is renamed or deleted during reading, 
                                                  // ossfs will exit direct read mode and no loner direct reading data from oss again.
@@ -84,14 +86,21 @@ class DirectReader
         int                         completed_count;
         
         bool                        is_direct_read_lock_init;
-
+   
     public:
         static bool SetChunkSize(off_t size);
         static bool SetPrefetchChunkCount(int count);
         static bool SetPrefetchCacheLimits(uint64_t limit);
+        
         static off_t GetChunkSize() { return DirectReader::chunk_size; }
         static int GetPrefetchChunkCount() { return DirectReader::prefetch_chunk_count; }
         static uint64_t GetPrefetchCacheLimits() { return DirectReader::prefetch_cache_limits; }
+
+        static bool SetDirectReadLocalFileCacheSizeMB(uint64_t limit);
+        static uint64_t GetDirectReadLocalFileCacheSize() { return DirectReader::direct_read_local_file_cache_size; }
+
+        static bool SetBackwardChunks(int chunk_num);
+        static int GetBackwardChunks() { return DirectReader::backward_chunks; }
 
         explicit DirectReader(const std::string& path, off_t size);
         ~DirectReader();
@@ -116,12 +125,3 @@ struct DirectReadParam {
 
 
 #endif // S3FS_PREFETCH_READER_H_
-
-/*
-* Local variables:
-* tab-width: 4
-* c-basic-offset: 4
-* End:
-* vim600: expandtab sw=4 ts=4 fdm=marker
-* vim<600: expandtab sw=4 ts=4
-*/

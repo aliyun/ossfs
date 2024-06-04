@@ -37,9 +37,12 @@ source test-utils.sh
 #reserve 200MB for data cache
 FAKE_FREE_DISK_SIZE=200
 ENSURE_DISKFREE_SIZE=10
+BACKWARD_CHUNKS=1
+DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB=2048
 
 export CACHE_DIR
 export ENSURE_DISKFREE_SIZE 
+export DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB
 if [ -n "${ALL_TESTS}" ]; then
     FLAGS=(
         "use_cache=${CACHE_DIR} -o ensure_diskfree=${ENSURE_DISKFREE_SIZE} -o fake_diskfree=${FAKE_FREE_DISK_SIZE}"
@@ -59,9 +62,10 @@ if [ -n "${ALL_TESTS}" ]; then
         "use_xattr=0 -o readdir_optimize"
         "use_xattr=0 -o readdir_optimize -o listobjectsv2 -ouse_sse=kms"
         "use_xattr=0 -o readdir_optimize -o readdir_check_size=48 -o symlink_in_meta"
-        "use_cache=${CACHE_DIR} -o direct_read"
+        "use_cache=${CACHE_DIR} -o direct_read -o direct_read_backward_chunks=${BACKWARD_CHUNKS}"
         "fake_diskfree=${FAKE_FREE_DISK_SIZE} -oparallel_count=10 -omultipart_size=10"
         "default_acl=private"
+        "direct_read -o direct_read_local_file_cache_size_mb=${DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB}"
     )
 else
     FLAGS=(

@@ -280,7 +280,7 @@ off_t FdManager::GetTotalDiskSpace(const char* path)
     }
 
     off_t actual_totalsize = vfsbuf.f_blocks * vfsbuf.f_frsize;
-    
+
     return actual_totalsize;
 }
 

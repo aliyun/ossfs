@@ -87,6 +87,7 @@ test/s3proxy-*
 test/write_multiblock
 test/direct_read_test
 test/install_ossutil.sh
+test/mix_direct_read_test
 #
 # Windows ports
 #
@@ -95,6 +96,8 @@ test/install_ossutil.sh
 fuse.pc
 WinFsp/
 bin/
+
+.vscode/
 
 #
 # Local variables:

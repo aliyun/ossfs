@@ -27,6 +27,7 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 
 /*
     This program is used to test the direct reading when 
@@ -42,7 +43,7 @@ int main(int argc, char **argv)
     const char* opts = "r:s:o:w:";
     char* read_path;
     char* write_path;
-    int skip_size = 0;
+    size_t skip_size = 0;
     off_t start_skip_offset = 0;
     while ((o = getopt(argc, argv, opts)) != -1) {
         switch (o) {
@@ -83,7 +84,7 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    int wfd = open(write_path, O_CREAT|O_RDWR, 0644);
+    int wfd = open(write_path, O_CREAT|O_RDWR|O_TRUNC, 0644);
     if (wfd < 0) {
         std::cout << "open write file failed" << std::endl;
         exit(1);
@@ -93,7 +94,16 @@ int main(int argc, char **argv)
     ssize_t bytesread = 0;
     off_t offset_read = 0;
     off_t offset_write = 0;
-    while((bytesread = pread(fd, buf, sizeof(buf), offset_read))) {
+    while(start_skip_offset - offset_read) {
+        size_t nbytes = std::min(off_t(MB), start_skip_offset - offset_read);
+        bytesread = pread(fd, buf, nbytes, offset_read);
+        if (bytesread < 0) {
+            std::cout << "failed to read file" << std::endl;
+            exit(1);
+        } else if (bytesread == 0) {
+            break;
+        }
+
         pwrite(wfd, buf, bytesread, offset_write);
         offset_read += bytesread;
         offset_write += bytesread;
@@ -103,7 +113,16 @@ int main(int argc, char **argv)
     }
 
     offset_read += skip_size;
-    while((bytesread = pread(fd, buf, sizeof(buf), offset_read))) {
+    while(offset_read < stbuf.st_size) {
+        size_t nbytes = std::min(off_t(MB), stbuf.st_size - offset_read);
+        bytesread = pread(fd, buf, nbytes, offset_read);
+        if (bytesread < 0) {
+            std::cout << "failed to read file" << std::endl;
+            exit(1);
+        } else if (bytesread == 0) {
+            break;
+        }
+
         pwrite(wfd, buf, bytesread, offset_write);
         offset_read += bytesread;
         offset_write += bytesread;
@@ -114,12 +133,3 @@ int main(int argc, char **argv)
 
     return 0;
 }
-
-/*
-* Local variables:
-* tab-width: 4
-* c-basic-offset: 4
-* End:
-* vim600: expandtab sw=4 ts=4 fdm=marker
-* vim<600: expandtab sw=4 ts=4
-*/

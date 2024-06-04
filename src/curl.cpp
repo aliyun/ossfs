@@ -707,7 +707,7 @@ size_t S3fsCurl::DownloadWriteCallback(void* ptr, size_t size, size_t nmemb, voi
 size_t S3fsCurl::DownloadWriteStreamCallback(void* ptr, size_t size, size_t nmemb, void* userp)
 {
     S3fsCurl* pCurl = static_cast<S3fsCurl*>(userp);
-
+    
     if(1 > (size * nmemb)){
         return 0;
     }
@@ -722,7 +722,7 @@ size_t S3fsCurl::DownloadWriteStreamCallback(void* ptr, size_t size, size_t nmem
 
     // write size
     ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
-
+    
     // write
     memcpy(&((char*)pCurl->partdata.streambuffer)[pCurl->partdata.streampos], ptr, copysize);
 
@@ -2340,7 +2340,7 @@ bool S3fsCurl::RemakeHandle()
                 return false;
             }
             break;
-
+        
         case REQTYPE_GET_STREAM:
             if (CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
                 return false;
@@ -2352,7 +2352,7 @@ bool S3fsCurl::RemakeHandle()
                 return false;
             }
             break;
-
+        
         default:
             S3FS_PRN_ERR("request type is unknown(%d)", type);
             return false;
@@ -3624,7 +3624,7 @@ int S3fsCurl::PreGetObjectStreamRequest(const char* tpath, char* buf, off_t star
     b_partdata_streampos    = 0;
     b_ssetype               = ssetype;
     b_ssevalue              = ssevalue;
-    b_ssekey_pos            = -1;
+    b_ssekey_pos            = -1; 
 
     return 0;
 }

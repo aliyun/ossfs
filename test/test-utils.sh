@@ -150,6 +150,9 @@ function mk_test_file {
         local TRY_COUNT=$((TRY_COUNT - 1))
         if [ "${TRY_COUNT}" -le 0 ]; then
             echo "Could not create file ${TEST_TEXT_FILE}, that file size is something wrong"
+            echo "Base text length: ${BASE_TEXT_LENGTH}"
+            echo "Mk text length: ${MK_TEXT_LENGTH}"
+            exit 1
         fi
         sleep 1
     done
@@ -343,9 +346,9 @@ function aws_cli() {
 function ossutil_cmd() {
     OSS_ACCESS_KEY_ID=$(cut -d: -f1 "${OSSFS_CREDENTIALS_FILE}")
     OSS_SECRET_ACCESS_KEY=$(cut -d: -f2 "${OSSFS_CREDENTIALS_FILE}")
- 
+
     ossutil64 -i "${OSS_ACCESS_KEY_ID}" -k "${OSS_SECRET_ACCESS_KEY}" -e "${OSS_URL}" $@
- 
+
 }
 
 function wait_for_port() {

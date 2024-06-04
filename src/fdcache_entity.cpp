@@ -1044,8 +1044,9 @@ bool FdEntity::SetAllStatus(bool is_loaded)
     return true;
 }
 
-int FdEntity::Load(off_t start, off_t size, AutoLock::Type type, bool is_modified_flag)
+int FdEntity::LoadWithSizeInfo(off_t start, off_t size, AutoLock::Type type, uint64_t &loaded_size, bool is_modified_flag)
 {
+    loaded_size = 0;
     AutoLock auto_lock(&fdent_lock, type);
 
     S3FS_PRN_DBG("[path=%s][physical_fd=%d][offset=%lld][size=%lld]", path.c_str(), physical_fd, static_cast<long long int>(start), static_cast<long long int>(size));
@@ -1088,6 +1089,7 @@ int FdEntity::Load(off_t start, off_t size, AutoLock::Type type, bool is_modifie
           if(0 != result){
               break;
           }
+          loaded_size += need_load_size;
           // Set loaded flag
           pagelist.SetPageLoadedStatus(iter->offset, iter->bytes, (is_modified_flag ? PageList::PAGE_LOAD_MODIFIED : PageList::PAGE_LOADED));
         }
@@ -1760,8 +1762,29 @@ ssize_t FdEntity::Read(int fd, char* bytes, off_t start, size_t size, bool force
     AutoLock auto_lock(&fdent_lock);
     AutoLock auto_lock2(&fdent_data_lock);
 
+    ssize_t rsize = 0;
+
     if(is_direct_read){
-        return pseudo_obj->DirectReadAndPrefetch(bytes, start, size);
+        if (DirectReader::GetDirectReadLocalFileCacheSize() == 0) {
+            return pseudo_obj->DirectReadAndPrefetch(bytes, start, size);
+        }
+
+        // mix-direct-read mode
+        // enter direct-read-and-prefetch when the total_downloaded_size >= the threshold
+        if (pseudo_obj->GetLoadedSize() >= DirectReader::GetDirectReadLocalFileCacheSize()) {
+            if (pagelist.IsPageLoaded(start, size)) {
+                // Reading
+                if(-1 == (rsize = pread(physical_fd, bytes, size, start))){
+                    S3FS_PRN_ERR("pread failed. errno(%d)", errno);
+                    return -errno;
+                }
+                
+                return rsize;
+            }
+
+            S3FS_PRN_DBG("start direct read. total_loaded_size = %lld, offset = %lld", pseudo_obj->GetLoadedSize(), start);
+            return pseudo_obj->DirectReadAndPrefetch(bytes, start, size);
+        }
     }
 
     CheckAndFreeDiskCacheIfNeeded();
@@ -1770,8 +1793,8 @@ ssize_t FdEntity::Read(int fd, char* bytes, off_t start, size_t size, bool force
         pagelist.SetPageLoadedStatus(start, size, PageList::PAGE_NOT_LOAD_MODIFIED);
     }
 
-    ssize_t rsize;
     int result = 0;
+    uint64_t downloaded_size = 0;
     bool read_from_oss_directly = false;
     // check disk space
     if(0 < pagelist.GetTotalUnloadedPageSize(start, size)){
@@ -1799,14 +1822,15 @@ ssize_t FdEntity::Read(int fd, char* bytes, off_t start, size_t size, bool force
         if(!read_from_oss_directly) {
             if(0 < size){
                 // Loading
-                result = Load(start, load_size, AutoLock::ALREADY_LOCKED);
+                result = LoadWithSizeInfo(start, load_size, AutoLock::ALREADY_LOCKED, downloaded_size);
             }
 
             FdManager::FreeReservedDiskSpace(load_size);
-
             if(0 != result){
                 S3FS_PRN_WARN("could not download. start(%lld), size(%zu), errno(%d)", static_cast<long long int>(start), size, result);
                 read_from_oss_directly = true;
+            } else {
+                pseudo_obj->AddLoadedSize(downloaded_size);
             }
         }
     }
@@ -2260,7 +2284,7 @@ void FdEntity::CheckAndExitDirectReadIfNeeded()
     if(!is_direct_read){
         return;
     }
-
+    
     is_direct_read = false;
     for(fdinfo_map_t::iterator iter = pseudo_fd_map.begin(); iter != pseudo_fd_map.end(); ++iter){
         PseudoFdInfo* ppseudofdinfo = iter->second;
@@ -2285,7 +2309,7 @@ void FdEntity::CheckAndFreeDiskCacheIfNeeded()
             S3FS_PRN_WARN("failed to truncate temporary file(physical_fd=%d).", physical_fd);
         }
     }
-    
+
     return;
 }
 

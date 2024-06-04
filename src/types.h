@@ -198,7 +198,7 @@ struct filepart
     off_t        streampos;     // use only direct read 
 
     filepart(bool is_uploaded = false, 
-            int _fd = -1,
+            int _fd = -1, 
             off_t part_start = 0, 
             off_t part_size = -1, 
             bool is_copy_part = false, 

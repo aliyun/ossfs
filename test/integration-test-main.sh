@@ -344,6 +344,7 @@ function test_list {
     local file_cnt=${#file_list[@]}
     if [ "${file_cnt}" -ne 2 ]; then
         echo "Expected 2 file but got ${file_cnt}"
+        echo "list results: " ${file_list[@]}
         return 1
     fi
 
@@ -2190,10 +2191,10 @@ function test_readdir_check_size_48 {
 
 function test_direct_read {
     describe "Testing direct read ..."
- 
+
     local TEST_FILE="direct-read-test-file"
     local RANDOM_STRING; RANDOM_STRING=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w $((RANDOM % 1024 + 1)) | head -n 1)
- 
+
     local BYTE_CNT; BYTE_CNT=$((RANDOM % 100 + 1))
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1 count=${BYTE_CNT}
     # avoid taking up local disk space bacase of cache file.
@@ -2206,7 +2207,7 @@ function test_direct_read {
     if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
         return 1
     fi
- 
+
     local KBYTE_CNT; KBYTE_CNT=$((RANDOM % 100 + 1))
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1K count=${KBYTE_CNT}
     echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
@@ -2217,7 +2218,7 @@ function test_direct_read {
     if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
         return 1
     fi
- 
+
     local MBYTE_CNT; MBYTE_CNT=$((RANDOM % 3 + 1)) #less than a chunk
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=${MBYTE_CNT}
     echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
@@ -2228,7 +2229,7 @@ function test_direct_read {
     if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
         return 1
     fi
- 
+
     MBYTE_CNT=$((RANDOM % 100 + 1))
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=${MBYTE_CNT}
     echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
@@ -2239,7 +2240,7 @@ function test_direct_read {
     if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
         return 1
     fi
- 
+
     MBYTE_CNT=$((RANDOM % 100 + 128))
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=${MBYTE_CNT}
     echo ${RANDOM_STRING} >> "${TEMP_DIR}/${TEST_FILE}"
@@ -2250,7 +2251,7 @@ function test_direct_read {
     if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
         return 1
     fi
- 
+
     # test reading file from the middle
     SKIP_CNT=$((RANDOM % 100))
     dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}-read-from-middle" bs=1M skip=${SKIP_CNT}
@@ -2261,7 +2262,7 @@ function test_direct_read {
     if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'` -ne 0 ]; then
         return 1
     fi
- 
+
     # test writing
     local SEEK_COUNT=$((RANDOM % 100 + 1))
     dd if=/dev/zero of="${TEMP_DIR}/${TEST_FILE}" bs=1M seek=${SEEK_COUNT} count=1 conv=notrunc
@@ -2269,14 +2270,14 @@ function test_direct_read {
     if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}"; then
         return 1
     fi
- 
+
     rm -f "${TEMP_DIR}/${TEST_FILE}"
     rm_test_file "${TEST_FILE}"
 }
 
 function test_direct_read_with_out_of_order {
     describe "Testing direct read with out of order ..."
- 
+
     local TEST_FILE="direct-read-test-file-with-out-of-order"
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=256
     aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
@@ -2287,7 +2288,7 @@ function test_direct_read_with_out_of_order {
     if [ $CACHE_SIZE -ne 0 ]; then
         return 1
     fi
- 
+
     ../../direct_read_test -r "${TEMP_DIR}/${TEST_FILE}" -o 100 -s 3 -w "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize.new"
     if ! cmp "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize.new" "${TEMP_DIR}/${TEST_FILE}-skip-less-than-chunksize"; then
         return 1
@@ -2300,25 +2301,25 @@ function test_direct_read_with_out_of_order {
     if [ $CACHE_SIZE -ne 0 ]; then
         return 1
     fi
- 
+
     ../../direct_read_test -r "${TEMP_DIR}/${TEST_FILE}" -o 100 -s 20 -w "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize.new"
     if ! cmp "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize.new" "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize"; then
         return 1
     fi
     rm -f "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize.new"
     rm -f "${TEMP_DIR}/${TEST_FILE}-skip-greater-than-chunksize"
- 
+
     rm -f ${TEMP_DIR}/${TEST_FILE}
     rm_test_file "${TEST_FILE}"
 }
- 
+
 function test_direct_read_with_write {
     describe "Testing direct read with another process write ..."
- 
+
     local TEST_FILE="direct-read-test-file-with-write"
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
     aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
- 
+
     dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}.new" bs=1M &
     echo "" >> "${TEST_FILE}"
     wait
@@ -2335,31 +2336,31 @@ function test_direct_read_with_write {
 
 function test_direct_read_with_rename {
     describe "Testing direct read with another process rename ..."
- 
+
     local TEST_FILE="direct-read-test-file-with-rename"
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
     aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
- 
+
     local CACHE_DIR_SIZE=`du -s ${CACHE_DIR} | awk '{print $1}'`
- 
+
     dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}.new" bs=1M &
     mv "${TEST_FILE}" "${TEST_FILE}.cp"
     wait
     
     local CACHE_DIR_SIZE_NEW=`du -s ${CACHE_DIR} | awk '{print $1}'`
- 
+
     if [ ${CACHE_DIR_SIZE} == ${CACHE_DIR_SIZE_NEW} ]; then
        return 1
     fi
- 
+
     if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEST_FILE}.cp"; then
        return 1
     fi 
- 
+
     if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEMP_DIR}/${TEST_FILE}.new"; then
        return 1
     fi 
- 
+
     rm -f "${TEMP_DIR}/${TEST_FILE}"
     rm -f "${TEMP_DIR}/${TEST_FILE}.new"
     rm_test_file "${TEST_FILE}.cp"
@@ -2367,19 +2368,20 @@ function test_direct_read_with_rename {
 
 function test_direct_read_with_unlink {
     describe "Testing direct read with another process unlink ..."
- 
+
     local TEST_FILE="direct-read-test-file-with-unlink"
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
     aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
- 
+
     dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}.new" bs=1M &
+    sleep 1
     rm -f ${TEST_FILE}
     wait
     
     if ! cmp "${TEMP_DIR}/${TEST_FILE}" "${TEMP_DIR}/${TEST_FILE}.new"; then
        return 1
     fi 
- 
+
     rm -f "${TEMP_DIR}/${TEST_FILE}"
     rm -f "${TEMP_DIR}/${TEST_FILE}.new"
 }
@@ -2390,11 +2392,11 @@ function test_direct_read_with_truncate {
     local TEST_FILE="direct-read-test-file-with-truncate"
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=512
     aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}" --body "${TEMP_DIR}/${TEST_FILE}"
- 
+
     dd if="${TEST_FILE}" of="${TEMP_DIR}/${TEST_FILE}" bs=1M &
     truncate -s 1024M "${TEST_FILE}"
     wait
- 
+
     local CACHE_FILE_SIZE=`du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}" | awk '{print $1}'`
     if [ ${CACHE_FILE_SIZE} -eq 0 ]; then 
         return 1
@@ -2406,52 +2408,56 @@ function test_direct_read_with_truncate {
 
 function test_concurrent_direct_read {
     describe "Testing concurrent direct read ..."
- 
+
     local TEST_FILE="concurrent_direct_read_test_file"
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=254
     for i in $(seq 5); do
         aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}_${i}" --body "${TEMP_DIR}/${TEST_FILE}" &
     done
     wait
- 
+
     #1. read different file
     for i in $(seq 5); do
         dd if="${TEST_FILE}_${i}" of="${TEMP_DIR}/${TEST_FILE}_${i}" bs=1M &
     done
     wait
- 
+
     for i in $(seq 5); do
         if ! cmp "${TEMP_DIR}/${TEST_FILE}_${i}" "${TEMP_DIR}/${TEST_FILE}"; then
             return 1
         fi
- 
+
         if [ `du -s "${CACHE_DIR}/${TEST_BUCKET_1}/$(basename "${PWD}")/${TEST_FILE}_${i}" | awk '{print $1}'` -ne 0 ]; then
             return 1
         fi
     done
- 
-    #2. read same file 
-    rm -f ${TEMP_DIR}/${TEST_FILE}
+
+    #2. clean up files
+    rm -f "${TEMP_DIR}/${TEST_FILE}"
+    for i in $(seq 5); do
+        rm -f "${TEMP_DIR}/${TEST_FILE}_${i}"
+    done
+
     rm_test_file
 }
 
 function test_free_cache_ahead {
     describe "Testing free cache ahead ..."
- 
+
     # fake_diskfree = 200MB
     local TEST_FILE="test_reclaim_cache_ahead"
     dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=100
- 
+
     for i in $(seq 4); do
         aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "$(basename "${PWD}")/${TEST_FILE}_${i}" --body "${TEMP_DIR}/${TEST_FILE}" &
     done
     wait
- 
+
     for i in $(seq 4); do
         dd if="${TEST_FILE}_${i}" of="${TEMP_DIR}/${TEST_FILE}_${i}" bs=1M &
     done
     wait
- 
+
     for i in $(seq 4); do
         if ! cmp "${TEMP_DIR}/${TEST_FILE}_${i}" "${TEMP_DIR}/${TEST_FILE}"; then
             rm -f ${TEMP_DIR}/${TEST_FILE}_${i}
@@ -2459,7 +2465,7 @@ function test_free_cache_ahead {
         fi
         rm -f ${TEMP_DIR}/${TEST_FILE}_${i}
     done
- 
+
     rm_test_file "${TEST_FILE}"
 }
 
@@ -2468,7 +2474,7 @@ function test_default_acl {
     
     local DIR_NAME; DIR_NAME=$(basename "${PWD}")
     touch "test.txt"
- 
+
     local CONTENT_TYPE; CONTENT_TYPE=$(ossutil_cmd stat "oss://${TEST_BUCKET_1}/${DIR_NAME}/test.txt" | grep ACL)
     if ps u -p "${OSSFS_PID}" | grep -q default_acl; then
         if ! echo "${CONTENT_TYPE}" | grep -q "private"; then 
@@ -2479,8 +2485,81 @@ function test_default_acl {
             return 1
         fi
     fi
- 
+
     rm -rf "test.txt"
+}
+
+# TEMP_DIR: set in test-utils.sh
+function test_mix_direct_read {
+    # write several files of random sizes, and calculate their md5s
+    describe "Testing mixed direct read ..."
+
+    local LOCAL_FILE_1="mix_direct_read_test_file_1"
+    local LOCAL_FILE_2="mix_direct_read_test_file_2"
+
+    for i in {0..4}; do
+        # create a file of random size between [$i *1G, ($i+1) *1G)
+        local DD_CNT=$((RANDOM % (256 * 1024) + $i * 256 * 1024))
+        echo "round $i. Create a file sized of $DD_CNT * 4K"
+        dd if=/dev/urandom of="${TEMP_DIR}/${LOCAL_FILE_1}_${i}" bs=4k count=$DD_CNT
+       
+        # calculate its md5
+        local md5_1=`md5sum "${TEMP_DIR}/${LOCAL_FILE_1}_${i}" | awk '{print $1}'`
+        echo "original md5 of ${TEMP_DIR}/${LOCAL_FILE_1}_${i} is $md5_1"
+
+        # put it to oss
+        local cloud_path="$(basename "${PWD}")/${LOCAL_FILE_1}_${i}"
+        aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${cloud_path}" --body "${TEMP_DIR}/${LOCAL_FILE_1}_${i}"
+
+        # read this file from oss and write to a new file on the local disk in a random order
+        ../../mix_direct_read_test -r "${LOCAL_FILE_1}_${i}" -w "${TEMP_DIR}/${LOCAL_FILE_2}_${i}" -s $(($DD_CNT * 4 * 1024))
+
+        # calulate the md5 of the file on local disk
+        local md5_2=`md5sum "${TEMP_DIR}/${LOCAL_FILE_2}_${i}" | awk '{print $1}'`
+        echo "the md5 of the new file ${TEMP_DIR}/${LOCAL_FILE_2}_${i} is $md5_2"
+
+        if [ "$md5_1" != "$md5_2" ]; then
+            return 1
+        fi
+        
+        # clear the file
+        rm -f "${TEMP_DIR}/${LOCAL_FILE_1}_${i}" "${TEMP_DIR}/${LOCAL_FILE_2}_${i}"
+    done
+}
+
+function test_mix_direct_read_with_skip {
+    describe "Testing mixed direct read with skip ..."
+    # write a file sized of 8GB, upload it to oss
+    local TEST_FILE="raw_test_file"
+    dd if=/dev/urandom of="${TEMP_DIR}/${TEST_FILE}" bs=1M count=8192
+
+    local cloud_path="$(basename "${PWD}")/${TEST_FILE}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${cloud_path}" --body "${TEMP_DIR}/${TEST_FILE}"
+
+    local FILE_SKIPPED_READ_1="raw_test_file_skipped_read_1"
+    local FILE_SKIPPED_READ_2="raw_test_file_skipped_read_2"
+
+    for i in {1..5}; do
+        # read part of the file out of order, and write to local disk
+        local write_size_mb=$((RANDOM % (1024 * 4)))
+        local write_offset=$((RANDOM % (1024 * 4)))
+
+        echo "round $i. skip from ${write_offset} MB, skipped size ${write_size_mb} MB, and write to local disk"
+        echo "read from local disk..."
+        ../../direct_read_test -r "${TEMP_DIR}/${TEST_FILE}" -o ${write_offset} -s ${write_size_mb} -w "${TEMP_DIR}/${FILE_SKIPPED_READ_1}"
+        
+        echo "read from oss..."
+        ../../direct_read_test -r "${TEST_FILE}" -o ${write_offset} -s ${write_size_mb} -w "${TEMP_DIR}/${FILE_SKIPPED_READ_2}"
+        
+        # compare these 2 files
+        if ! cmp "${TEMP_DIR}/${FILE_SKIPPED_READ_1}" "${TEMP_DIR}/${FILE_SKIPPED_READ_2}"; then
+            return 1
+        fi
+
+        rm -f "${TEMP_DIR}/${FILE_SKIPPED_READ_1}"
+        rm -f "${TEMP_DIR}/${FILE_SKIPPED_READ_2}"
+    done
+    rm -f "${TEMP_DIR}/${TEST_FILE}"
 }
 
 function add_all_tests {
@@ -2583,8 +2662,8 @@ function add_all_tests {
         fi
         add_tests test_update_directory_time_subdir
     fi
-
-    if ps u -p "${OSSFS_PID}" | grep -q direct_read; then
+    
+    if ps u -p "${OSSFS_PID}" | grep direct_read | grep -v -q direct_read_local_file_cache_size_mb; then
         add_tests test_direct_read
         add_tests test_direct_read_with_out_of_order
         add_tests test_direct_read_with_write
@@ -2592,14 +2671,19 @@ function add_all_tests {
         add_tests test_direct_read_with_unlink
         add_tests test_direct_read_with_truncate
         add_tests test_concurrent_direct_read
+        add_tests test_mix_direct_read_with_skip
     fi
 
     if ps u -p "${OSSFS_PID}" | grep -q parallel_count && ps u -p "${OSSFS_PID}" | grep -q fake_diskfree; then
         add_tests test_free_cache_ahead
     fi
-
+    
     if ! uname | grep -q Darwin; then 
         add_tests test_default_acl
+    fi
+
+    if ps u -p "${OSSFS_PID}" | grep -q direct_read_local_file_cache_size_mb; then
+        add_tests test_mix_direct_read
     fi
 }
 
