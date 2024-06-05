@@ -119,6 +119,8 @@ jobs:
   # Then we do not use macos 11 on GitHub Actions now.
   #
   macos10:
+    if: false
+    
     runs-on: macos-10.15
 
     steps:
