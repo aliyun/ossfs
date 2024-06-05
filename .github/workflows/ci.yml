@@ -55,7 +55,6 @@ jobs:
           - ubuntu:18.04
           - debian:bullseye
           - debian:buster
-          - debian:stretch
           - rockylinux:8
           - centos:centos7
           - fedora:35
