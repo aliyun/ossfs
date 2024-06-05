@@ -1,5 +1,14 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.3 (04/06/2024)
+ - Fixed a bug that IO fails when running out of disk space.
+ - Fixed a bug that default_acl option does not working.
+ - Improved error log details when bucket check fails.
+ - Add debug logs when dir or file type conflicts.
+ - Disable stat cache expiration mechanism by set stat_cache_expire option to -1.
+ - Add a new option backward_chunks for direct-read mode which can maintain more backward chunks in memory.
+ - Add a new option direct_read_local_file_cache_size_mb which will make one file enter into direct read mode only when its loaded size is larger than the specified size.
+
 ## v1.91.2 (06/03/2024)
  - Support direct reading file from OSS without using local disk. 
    When direct reading mode is enabled, OSSFS uses asynchronous memory prefetch to improve sequential read performance dramatically. 
