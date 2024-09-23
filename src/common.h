@@ -50,6 +50,13 @@ extern std::string    mount_prefix;
 extern std::string    endpoint;
 extern std::string    cipher_suites;
 extern std::string    instance_name;
+extern std::string    region;
+extern std::string    cloudbox_id;
+
+//-------------------------------------------------------------------
+// For weak attribute
+//-------------------------------------------------------------------
+#define	S3FS_FUNCATTR_WEAK __attribute__ ((weak,unused))
 
 #endif // S3FS_COMMON_H_
 

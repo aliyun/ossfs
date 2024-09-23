@@ -26,7 +26,8 @@ The ossfs is built based on s3fs and has all the features of s3fs. Main features
 In addition to the above features, ossfs also has its own features.
 * renames via server-side single-part copy to improve large files renaming performance
 * optional saves the symbolic link target in object user metadata
-* optional improve readdir perfermence by ignoring metadata-atime/ctime, uid/gid, and permissions
+* optional improve readdir perfermance by ignoring metadata-atime/ctime, uid/gid, and permissions
+* optional improve sequential-read performance by downloading file data to and reading from the memory instead of the disk
 
 ### Precompiled installer
 

@@ -206,6 +206,30 @@ std::string urlEncode2(const std::string &s)
     return result;
 }
 
+// This part using in calculating ossv4 signature.
+// more detail info: https://help.aliyun.com/zh/oss/developer-reference/recommend-to-use-signature-version-4?spm=a2c4g.11186623.0.0.5cf17294ldSzMn
+std::string urlEncodeOssv4Query(const std::string &s)
+{
+    std::string result;
+    for (size_t i = 0; i < s.length(); ++i) {
+        unsigned char c = s[i];
+        if (c == '.'
+            || c == '-'
+            || c == '_'
+            || c == '~'
+            || (c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9'))
+        {
+            result += c;
+        }else{
+            result += "%";
+            result += s3fs_hex_upper(&c, 1);
+        }
+    }
+    return result;
+}
+
 std::string urlDecode(const std::string& s)
 {
     std::string result;

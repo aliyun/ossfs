@@ -101,6 +101,7 @@ static bool is_readdir_optimize   = false;
 static bool is_refresh_fakemeta   = false;
 static off_t readdir_check_size   = 0;
 static bool is_new_symlink_format = false;
+static bool is_specified_region   = false;
 
 //-------------------------------------------------------------------
 // Global functions : prototype
@@ -3615,7 +3616,7 @@ static void s3fs_exit_fuseloop(int exit_status)
 
 static void* s3fs_init(struct fuse_conn_info* conn)
 {
-    S3FS_PRN_INIT_INFO("init v%s(commit:%s) with %s", VERSION, COMMIT_HASH_VAL, s3fs_crypt_lib_name());
+    S3FS_PRN_INIT_INFO("init v%s(commit:%s) with %s, credential-library(%s)", VERSION, COMMIT_HASH_VAL, s3fs_crypt_lib_name(), ps3fscred->GetCredFuncVersion(false));
 
     // cache(remove cache dirs at first)
     if(is_remove_cache && (!CacheFileStat::DeleteCacheFileStatDirectory() || !FdManager::DeleteCacheDirectory())){
@@ -4741,6 +4742,19 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             S3fsCurl::SetRequesterPays(true);
             return 0;
         }
+        if(0 == strcmp(arg, "sigv4")){
+            S3fsCurl::SetSignatureType(V4_ONLY);
+            return 0;
+        }
+        if (is_prefix(arg, "cloudbox_id=")) {
+            cloudbox_id = strchr(arg, '=') + sizeof(char);
+            return 0;
+        }
+        if (is_prefix(arg, "region=")) {
+            region              = strchr(arg, '=') + sizeof(char);
+            is_specified_region = true;
+            return 0;
+        }
         // [NOTE]
         // following option will be discarding, because these are not for fuse.
         // (Referenced sshfs.c)
@@ -4791,13 +4805,15 @@ int main(int argc, char* argv[])
 
     // set credential object
     //
-    // This local variable is the only credential object.
-    // It is also set in the S3fsCurl class and this object is used.
-    //
-    S3fsCred s3fscredObj;
-    ps3fscred = &s3fscredObj;
-    if(!S3fsCurl::InitCredentialObject(&s3fscredObj)){
+    ps3fscred = new S3fsCred();
+    if(!ps3fscred) {
+      S3FS_PRN_EXIT("Failed to new S3fsCred.");
+      exit(EXIT_FAILURE);
+    }
+
+    if(!S3fsCurl::InitCredentialObject(ps3fscred)){
         S3FS_PRN_EXIT("Failed to setup credential object to ossfs curl.");
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4806,11 +4822,13 @@ int main(int argc, char* argv[])
             case 0:
                 if(strcmp(long_opts[option_index].name, "version") == 0){
                     show_version();
+                    delete ps3fscred;
                     exit(EXIT_SUCCESS);
                 }
                 break;
             case 'h':
                 show_help();
+                delete ps3fscred;
                 exit(EXIT_SUCCESS);
             case 'o':
                 break;
@@ -4824,6 +4842,7 @@ int main(int argc, char* argv[])
             case 'u':   // --incomplete-mpu-list
                 if(NO_UTILITY_MODE != utility_mode){
                     S3FS_PRN_EXIT("already utility mode option is specified.");
+                    delete ps3fscred;
                     exit(EXIT_FAILURE);
                 }
                 utility_mode = INCOMP_TYPE_LIST;
@@ -4831,6 +4850,7 @@ int main(int argc, char* argv[])
             case 'a':   // --incomplete-mpu-abort
                 if(NO_UTILITY_MODE != utility_mode){
                     S3FS_PRN_EXIT("already utility mode option is specified.");
+                    delete ps3fscred;
                     exit(EXIT_FAILURE);
                 }
                 utility_mode = INCOMP_TYPE_ABORT;
@@ -4841,12 +4861,14 @@ int main(int argc, char* argv[])
                 }else if(NULL != optarg){
                     if(!convert_unixtime_from_option_arg(optarg, incomp_abort_time)){
                         S3FS_PRN_EXIT("--incomplete-mpu-abort option argument is wrong.");
+                        delete ps3fscred;
                         exit(EXIT_FAILURE);
                     }
                 }
                 // if optarg is null, incomp_abort_time is 24H(default)
                 break;
             default:
+                delete ps3fscred;
                 exit(EXIT_FAILURE);
         }
     }
@@ -4856,12 +4878,14 @@ int main(int argc, char* argv[])
     // Load SSE environment
     if(!S3fsCurl::LoadEnvSse()){
         S3FS_PRN_EXIT("something wrong about SSE environment.");
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
     // ssl init
     if(!s3fs_init_global_ssl()){
         S3FS_PRN_EXIT("could not initialize for ssl libraries.");
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4869,6 +4893,7 @@ int main(int argc, char* argv[])
     if(!init_parser_xml_lock()){
         S3FS_PRN_EXIT("could not initialize mutex for xml parser.");
         s3fs_destroy_global_ssl();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4892,6 +4917,7 @@ int main(int argc, char* argv[])
         S3FS_PRN_EXIT("Could not initiate curl library.");
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4906,6 +4932,16 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
+        exit(EXIT_FAILURE);
+    }
+
+    if (S3fsCurl::GetSignatureType() == V4_ONLY && !is_specified_region) {
+        S3FS_PRN_EXIT("Using OSSV4 signature requires specifying the region");
+        S3fsCurl::DestroyS3fsCurl();
+        s3fs_destroy_global_ssl();
+        destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4922,6 +4958,7 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
     if(!S3fsCurl::FinalCheckSse()){
@@ -4929,6 +4966,7 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4948,6 +4986,7 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4962,6 +5001,7 @@ int main(int argc, char* argv[])
             S3fsCurl::DestroyS3fsCurl();
             s3fs_destroy_global_ssl();
             destroy_parser_xml_lock();
+            delete ps3fscred;
             exit(EXIT_FAILURE);
         }
     }
@@ -4972,6 +5012,7 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -4981,6 +5022,7 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -5024,6 +5066,7 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(exitcode);
     }
 
@@ -5039,6 +5082,7 @@ int main(int argc, char* argv[])
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();
+        delete ps3fscred;
         exit(EXIT_FAILURE);
     }
 
@@ -5049,6 +5093,7 @@ int main(int argc, char* argv[])
             S3fsCurl::DestroyS3fsCurl();
             s3fs_destroy_global_ssl();
             destroy_parser_xml_lock();
+            delete ps3fscred;
             exit(EXIT_FAILURE);
         }
         is_refresh_fakemeta = true;
@@ -5111,6 +5156,7 @@ int main(int argc, char* argv[])
     }
     s3fs_destroy_global_ssl();
     destroy_parser_xml_lock();
+    delete ps3fscred;
 
     // cleanup xml2
     xmlCleanupParser();

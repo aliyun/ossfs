@@ -22,6 +22,7 @@
 #define S3FS_CRED_H_
 
 #include "autolock.h"
+#include "s3fs_extcred.h"
 
 //----------------------------------------------
 // Typedefs
@@ -73,6 +74,15 @@ class S3fsCred
         std::string         RAM_expiry_field;
         std::string         RAM_role;               // Protect exclusively
 
+        bool                set_builtin_cred_opts;  // true if options other than "credlib" is set
+        std::string         credlib;                // credlib(name or path)
+        std::string         credlib_opts;           // options for credlib
+
+        void*                    hExtCredLib;
+        fp_VersionS3fsCredential pFuncCredVersion;
+        fp_InitS3fsCredential    pFuncCredInit;
+        fp_FreeS3fsCredential    pFuncCredFree;
+        fp_UpdateS3fsCredential  pFuncCredUpdate;
     public:
 
 
@@ -80,7 +90,7 @@ class S3fsCred
         static bool ParseRAMRoleFromMetaDataResponse(const char* response, std::string& rolename);
 
         bool SetPasswdFile(const char* file);
-        bool IsSetPasswdFile();
+        bool IsSetPasswdFile() const;
         bool SetRamRoleMetadataType(bool flag);
 
         bool SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey, AutoLock::Type type);
@@ -112,6 +122,16 @@ class S3fsCred
         bool SetRAMCredentials(const char* response, AutoLock::Type type);
         bool SetRAMRoleFromMetaData(const char* response, AutoLock::Type type);
 
+        bool SetExtCredLib(const char* arg);
+        bool IsSetExtCredLib() const;
+        bool SetExtCredLibOpts(const char* args);
+        bool IsSetExtCredLibOpts() const;
+
+        bool InitExtCredLib();
+        bool LoadExtCredLib();
+        bool UnloadExtCredLib();
+        bool UpdateExtCredentials(AutoLock::Type type);
+
         bool CheckForbiddenBucketParams();
 
     public:
@@ -126,6 +146,7 @@ class S3fsCred
         bool LoadIAMRoleFromMetaData();
 
         bool CheckIAMCredentialUpdate(std::string* access_key_id = NULL, std::string* secret_access_key = NULL, std::string* access_token = NULL);
+        const char* GetCredFuncVersion(bool detail) const;
 
         int DetectParam(const char* arg);
         bool CheckAllParams();

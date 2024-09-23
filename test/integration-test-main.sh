@@ -974,6 +974,8 @@ function test_update_time_append() {
     # append -> update ctime/mtime, not update atime
     #
     echo foo >> "${TEST_TEXT_FILE}"
+    sleep 1
+    
     local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
     local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
     local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
@@ -999,6 +1001,8 @@ function test_update_time_cp_p() {
     #
     local TIME_TEST_TEXT_FILE=test-ossfs-time.txt
     cp -p "${TEST_TEXT_FILE}" "${TIME_TEST_TEXT_FILE}"
+    sleep 1
+
     local atime; atime=$(get_atime "${TIME_TEST_TEXT_FILE}")
     local ctime; ctime=$(get_ctime "${TIME_TEST_TEXT_FILE}")
     local mtime; mtime=$(get_mtime "${TIME_TEST_TEXT_FILE}")
@@ -1337,6 +1341,21 @@ function test_concurrent_writes {
     done
     wait
     rm_test_file
+}
+
+function test_concurrent_writes_with_insufficient_disk_space {
+    describe "Test concurrent writes to multiple files when disk space is not enough ..."
+    file_name_prefix="concurrent_write_file"
+
+    # adjust the file num & file size below to test the case of insufficient disk space
+    for i in $(seq 20); do
+        dd if=/dev/zero of="${file_name_prefix}_${i}" count=20 bs=1M &
+    done
+    wait
+
+    for i in $(seq 20); do
+        rm_test_file "${file_name_prefix}_${i}"
+    done
 }
 
 function test_open_second_fd {
@@ -2610,6 +2629,11 @@ function add_all_tests {
     add_tests test_concurrent_directory_updates
     add_tests test_concurrent_reads
     add_tests test_concurrent_writes
+
+    if ps u -p "${OSSFS_PID}" | grep -q fake_diskfree; then
+        add_tests test_concurrent_writes_with_insufficient_disk_space
+    fi
+
     add_tests test_open_second_fd
     add_tests test_write_multiple_offsets
     add_tests test_write_multiple_offsets_backwards

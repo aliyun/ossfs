@@ -22,6 +22,7 @@
 #define S3FS_CURL_UTIL_H_
 
 #include <curl/curl.h>
+#include <sstream>
 
 class sse_type_t;
 
@@ -47,8 +48,8 @@ const char* getCurlDebugHead(curl_infotype type);
 bool etag_equals(std::string s1, std::string s2);
 
 std::string get_canonical_headers_oss(const struct curl_slist* list, bool only_oss = false);
+std::string get_canonical_headers_ossv4(const struct curl_slist* list);
 bool get_canonical_resource_oss(const char* realpath, std::string& resourcepath);
-
 
 #endif // S3FS_CURL_UTIL_H_
 
