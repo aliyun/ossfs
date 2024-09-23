@@ -98,7 +98,8 @@ WinFsp/
 bin/
 
 .vscode/
-
+dist
+configure~
 #
 # Local variables:
 # tab-width: 4

@@ -66,6 +66,7 @@ if [ -n "${ALL_TESTS}" ]; then
         "fake_diskfree=${FAKE_FREE_DISK_SIZE} -oparallel_count=10 -omultipart_size=10"
         "default_acl=private"
         "direct_read -o direct_read_local_file_cache_size_mb=${DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB}"
+        "sigv4 -o region=${OSS_REGION}"
     )
 else
     FLAGS=(

@@ -145,6 +145,7 @@ class FdEntity
 };
 
 typedef std::map<std::string, class FdEntity*> fdent_map_t;   // key=path, value=FdEntity*
+typedef std::map<std::string, FdEntity*> fdent_direct_map_t; // key=path, value=FdEntity*
 
 #endif // S3FS_FDCACHE_ENTITY_H_
 

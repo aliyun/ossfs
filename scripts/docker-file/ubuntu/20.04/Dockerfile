@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN    apt-get update \
     && apt-get install -y software-properties-common
- 
+
 RUN    add-apt-repository ppa:brightbox/ruby-ng \
     && apt-get update \
     && apt-get install -y automake autotools-dev g++ git libcurl4-gnutls-dev curl\

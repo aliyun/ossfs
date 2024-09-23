@@ -20,7 +20,7 @@
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.59)
-AC_INIT(ossfs, 1.91.3)
+AC_INIT(ossfs, 1.91.4)
 AC_CONFIG_HEADER([config.h])
 
 AC_CANONICAL_SYSTEM
@@ -319,6 +319,11 @@ AC_COMPILE_IFELSE(
    AC_MSG_RESULT(no)
   ]
 )
+
+dnl ----------------------------------------------
+dnl dl library
+dnl ----------------------------------------------
+AC_CHECK_LIB([dl], [dlopen, dlclose, dlerror, dlsym], [], [AC_MSG_ERROR([Could not found dlopen, dlclose, dlerror and dlsym])])
 
 dnl ----------------------------------------------
 dnl build date

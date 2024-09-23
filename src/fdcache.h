@@ -33,6 +33,7 @@ class FdManager
       static pthread_mutex_t fd_manager_lock;
       static pthread_mutex_t cache_cleanup_lock;
       static pthread_mutex_t reserved_diskspace_lock;
+      static pthread_mutex_t except_entmap_lock;
       static bool            is_lock_init;
       static std::string     cache_dir;
       static bool            check_cache_dir_exist;
@@ -44,6 +45,9 @@ class FdManager
       static std::string     tmp_dir;
 
       fdent_map_t            fent;
+
+      // A map of delayed deletion fdentity, see https://github.com/s3fs-fuse/s3fs-fuse/pull/2478
+      fdent_direct_map_t     except_fent;
 
   private:
       static off_t GetFreeDiskSpace(const char* path);
@@ -95,6 +99,7 @@ class FdManager
       void Rename(const std::string &from, const std::string &to);
       bool Close(FdEntity* ent, int fd);
       bool ChangeEntityToTempPath(FdEntity* ent, const char* path);
+      bool UpdateEntityToTempPath();
       void CleanupCacheDir();
 
       bool CheckAllCache();

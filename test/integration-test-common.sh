@@ -65,13 +65,15 @@ OSSFS=../src/ossfs
 
 # Allow these defaulted values to be overridden
 : "${OSS_URL:="https://127.0.0.1:8080"}"
-: "${OSS_REGION:="cn-hangzhou"}"
+: "${OSS_REGION:="cn-zhangjiakou"}"
 : "${OSSFS_CREDENTIALS_FILE:="passwd-ossfs"}"
 : "${TEST_BUCKET_1:="ossfs-integration-test"}"
+: "${OSS_SIGNATURE_VERSION:="sigv1"}"
 
 export TEST_BUCKET_1
 export OSS_URL
 export OSS_REGION
+export OSS_SIGNATURE_VERSION
 TEST_SCRIPT_DIR=$(pwd)
 export TEST_SCRIPT_DIR
 export TEST_BUCKET_MOUNT_POINT_1=${TEST_BUCKET_1}
@@ -263,6 +265,8 @@ function start_ossfs {
             -o dbglevel="${DBGLEVEL:=info}" \
             -o no_time_stamp_msg \
             -o retries=3 \
+            -o region="${OSS_REGION}" \
+            -o ${OSS_SIGNATURE_VERSION} \
             -f \
             "${@}" &
         echo $! >&3

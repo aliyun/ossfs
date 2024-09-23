@@ -80,6 +80,7 @@ FdManager       FdManager::singleton;
 pthread_mutex_t FdManager::fd_manager_lock;
 pthread_mutex_t FdManager::cache_cleanup_lock;
 pthread_mutex_t FdManager::reserved_diskspace_lock;
+pthread_mutex_t FdManager::except_entmap_lock;
 bool            FdManager::is_lock_init(false);
 std::string     FdManager::cache_dir;
 bool            FdManager::check_cache_dir_exist(false);
@@ -465,6 +466,10 @@ FdManager::FdManager()
             S3FS_PRN_CRIT("failed to init reserved_diskspace_lock: %d", result);
             abort();
         }
+        if(0 != (result = pthread_mutex_init(&FdManager::except_entmap_lock, &attr))){
+            S3FS_PRN_CRIT("failed to init except_entmap_lock: %d", result);
+            abort();
+        }
         FdManager::is_lock_init = true;
     }else{
         abort();
@@ -480,6 +485,7 @@ FdManager::~FdManager()
             delete ent;
         }
         fent.clear();
+        except_fent.clear();
 
         if(FdManager::is_lock_init){
             int result;
@@ -493,6 +499,10 @@ FdManager::~FdManager()
             }
             if(0 != (result = pthread_mutex_destroy(&FdManager::reserved_diskspace_lock))){
                 S3FS_PRN_CRIT("failed to destroy reserved_diskspace_lock: %d", result);
+                abort();
+            }
+            if(0 != (result = pthread_mutex_destroy(&FdManager::except_entmap_lock))){
+                S3FS_PRN_CRIT("failed to destroy except_entmap_lock: %d", result);
                 abort();
             }
             FdManager::is_lock_init = false;
@@ -510,6 +520,8 @@ FdEntity* FdManager::GetFdEntity(const char* path, int& existfd, bool newfd, boo
         return NULL;
     }
     AutoLock auto_lock(&FdManager::fd_manager_lock, lock_already_held ? AutoLock::ALREADY_LOCKED : AutoLock::NONE);
+
+    UpdateEntityToTempPath();
 
     fdent_map_t::iterator iter = fent.find(std::string(path));
     if(fent.end() != iter && iter->second){
@@ -564,6 +576,8 @@ FdEntity* FdManager::Open(int& fd, const char* path, headers_t* pmeta, off_t siz
     }
 
     AutoLock auto_lock(&FdManager::fd_manager_lock);
+
+    UpdateEntityToTempPath();
 
     // search in mapping by key(path)
     fdent_map_t::iterator iter = fent.find(std::string(path));
@@ -652,6 +666,8 @@ FdEntity* FdManager::GetExistFdEntity(const char* path, int existfd)
 
     AutoLock auto_lock(&FdManager::fd_manager_lock);
 
+    UpdateEntityToTempPath();
+
     // search from all entity.
     for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ++iter){
         if(iter->second && iter->second->FindPseudoFd(existfd)){
@@ -688,6 +704,8 @@ int FdManager::GetPseudoFdCount(const char* path)
         return 0;
     }
 
+    UpdateEntityToTempPath();
+    
     // search from all entity.
     for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ++iter){
         if(iter->second && 0 == strcmp(iter->second->GetPath(), path)){
@@ -702,6 +720,8 @@ int FdManager::GetPseudoFdCount(const char* path)
 void FdManager::Rename(const std::string &from, const std::string &to)
 {
     AutoLock auto_lock(&FdManager::fd_manager_lock);
+
+    UpdateEntityToTempPath();
 
     fdent_map_t::iterator iter = fent.find(from);
     if(fent.end() == iter && !FdManager::IsCacheDir()){
@@ -747,6 +767,8 @@ bool FdManager::Close(FdEntity* ent, int fd)
     }
     AutoLock auto_lock(&FdManager::fd_manager_lock);
 
+    UpdateEntityToTempPath();
+
     for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ++iter){
         if(iter->second == ent){
             ent->Close(fd);
@@ -772,20 +794,44 @@ bool FdManager::Close(FdEntity* ent, int fd)
 
 bool FdManager::ChangeEntityToTempPath(FdEntity* ent, const char* path)
 {
-    AutoLock auto_lock(&FdManager::fd_manager_lock);
+    AutoLock auto_lock(&FdManager::except_entmap_lock);
+    
+    except_fent[path] = ent;
+    return true;
+}
 
-    for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ){
-        if(iter->second == ent){
-            fent.erase(iter++);
+// [NOTE]
+// FdManager::fd_manager_lock should be locked by the caller.
+//
+bool FdManager::UpdateEntityToTempPath()
+{
+    AutoLock auto_lock(&FdManager::except_entmap_lock);
 
-            std::string tmppath;
-            FdManager::MakeRandomTempPath(path, tmppath);
-            fent[tmppath] = ent;
+    for(fdent_direct_map_t::iterator except_iter = except_fent.begin(); except_iter != except_fent.end(); ){
+        std::string tmppath;
+        FdManager::MakeRandomTempPath(except_iter->first.c_str(), tmppath);
+
+        fdent_map_t::iterator iter = fent.find(except_iter->first);
+        if(fent.end() != iter && iter->second == except_iter->second){
+            fent[tmppath] = except_iter->second;
+            iter          = fent.erase(iter);
+            except_iter   = except_fent.erase(except_iter);
         }else{
-            ++iter;
+            // [NOTE]
+            // ChangeEntityToTempPath method is called and the FdEntity pointer
+            // set into except_fent is mapped into fent.
+            // And since this method is always called before manipulating fent,
+            // it will not enter here.
+            // Thus, if it enters here, a warning is output.
+            //
+            S3FS_PRN_WARN("For some reason the FdEntity pointer(for %s) is not found in the fent map. Recovery procedures are being performed, but the cause needs to be identified.", except_iter->first.c_str());
+
+            // Add the entry for recovery procedures
+            fent[tmppath] = except_iter->second;
+            except_iter   = except_fent.erase(except_iter);
         }
     }
-    return false;
+    return true;
 }
 
 void FdManager::CleanupCacheDir()
@@ -841,6 +887,9 @@ void FdManager::CleanupCacheDirInternal(const std::string &path)
                 S3FS_PRN_INFO("could not get fd_manager_lock when clean up file(%s), then skip it.", next_path.c_str());
                 continue;
             }
+
+            UpdateEntityToTempPath();
+
             fdent_map_t::iterator iter = fent.find(next_path);
             if(fent.end() == iter) {
                 S3FS_PRN_DBG("cleaned up: %s", next_path.c_str());
@@ -950,6 +999,7 @@ bool FdManager::RawCheckAllCache(FILE* fp, const char* cache_stat_top_dir, const
             {
                 AutoLock auto_lock(&FdManager::fd_manager_lock);
 
+                UpdateEntityToTempPath();
                 fdent_map_t::iterator iter = fent.find(object_file_path);
                 if(fent.end() != iter){
                     // This file is opened now, then we need to put warning message.

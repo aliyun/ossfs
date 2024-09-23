@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <pwd.h>
 #include <sys/types.h>
+#include <dlfcn.h>
 #include <fstream>
 #include <sstream>
 
@@ -35,6 +36,80 @@
 // Symbols
 //-------------------------------------------------------------------
 #define DEFAULT_PASSWD_FILE    "/etc/passwd-ossfs"
+
+#define DEFAULT_AWS_PROFILE_NAME    "default"
+
+//-------------------------------------------------------------------
+// External Credential dummy function
+//-------------------------------------------------------------------
+// [NOTE]
+// This function expects the following values:
+//
+// detail=false   ex. "Custom AWS Credential Library - v1.0.0"
+// detail=true    ex. "Custom AWS Credential Library - v1.0.0
+//                     s3fs-fuse credential I/F library for S3 compatible strage X.
+//                     Copyright(C) 2022 Foo"
+//
+const char* VersionS3fsCredential(bool detail)
+{
+    static const char version[]        = "built-in";
+    static const char detail_version[] = 
+    "ossfs built-in Credential I/F Function\n"
+    "Copyright(C) 2010 ossfs\n";
+
+    S3FS_PRN_CRIT("Check why built-in function was called, the external credential library must have VersionS3fsCredential function.");
+
+    if(detail){
+        return detail_version;
+    }else{
+        return version;
+    }
+}
+
+bool InitS3fsCredential(const char* popts, char** pperrstr)
+{
+    if(popts && 0 < strlen(popts)){
+        S3FS_PRN_WARN("The external credential library does not have InitS3fsCredential function, but credlib_opts value is not empty(%s)", popts);
+    }
+    if(pperrstr){
+        *pperrstr = strdup("The external credential library does not have InitS3fsCredential function, so built-in function was called.");
+    }else{
+        S3FS_PRN_INFO("The external credential library does not have InitS3fsCredential function, so built-in function was called.");
+    }
+    return true;
+}
+
+bool FreeS3fsCredential(char** pperrstr)
+{
+    if(pperrstr){
+        *pperrstr = strdup("The external credential library does not have FreeS3fsCredential function, so built-in function was called.");
+    }else{
+        S3FS_PRN_INFO("The external credential library does not have FreeS3fsCredential function, so built-in function was called.");
+    }
+    return true;
+}
+
+bool UpdateS3fsCredential(char** ppaccess_key_id, char** ppserect_access_key, char** ppaccess_token, long long* ptoken_expire, char** pperrstr)
+{
+    S3FS_PRN_INFO("Parameters : ppaccess_key_id=%p, ppserect_access_key=%p, ppaccess_token=%p, ptoken_expire=%p", ppaccess_key_id, ppserect_access_key, ppaccess_token, ptoken_expire);
+
+    if(pperrstr){
+        *pperrstr = strdup("Check why built-in function was called, the external credential library must have UpdateS3fsCredential function.");
+    }else{
+        S3FS_PRN_CRIT("Check why built-in function was called, the external credential library must have UpdateS3fsCredential function.");
+    }
+
+    if(ppaccess_key_id){
+        *ppaccess_key_id = NULL;
+    }
+    if(ppserect_access_key){
+        *ppserect_access_key = NULL;
+    }
+    if(ppaccess_token){
+        *ppaccess_token = NULL;
+    }
+    return false;   // always false
+}
 //-------------------------------------------------------------------
 // Class Variables
 //-------------------------------------------------------------------
@@ -104,7 +179,13 @@ S3fsCred::S3fsCred() :
     RAM_field_count(4),
     RAM_token_field("Token"),
     RAM_expiry_field("Expiration"),
-    RAM_role("")
+    RAM_role(""),
+    set_builtin_cred_opts(false),
+    hExtCredLib(NULL),
+    pFuncCredVersion(VersionS3fsCredential),
+    pFuncCredInit(InitS3fsCredential),
+    pFuncCredFree(FreeS3fsCredential),
+    pFuncCredUpdate(UpdateS3fsCredential)
 {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -121,6 +202,7 @@ S3fsCred::S3fsCred() :
 
 S3fsCred::~S3fsCred()
 {
+    UnloadExtCredLib();
     if(is_lock_init){
         int result;
         if(0 != (result = pthread_mutex_destroy(&token_lock))){
@@ -144,7 +226,7 @@ bool S3fsCred::SetPasswdFile(const char* file)
     return true;
 }
 
-bool S3fsCred::IsSetPasswdFile()
+bool S3fsCred::IsSetPasswdFile() const
 {
     return !passwd_file.empty();
 }
@@ -696,7 +778,7 @@ bool S3fsCred::InitialCredentials()
     }
 
     // access key loading is deferred
-    if(load_ramrole){
+    if(load_ramrole || IsSetExtCredLib()){
         return true;
     }
 
@@ -847,14 +929,21 @@ bool S3fsCred::CheckIAMCredentialUpdate(std::string* access_key_id, std::string*
 {
     AutoLock auto_lock(&token_lock);
 
-    if(IsSetRAMRole(AutoLock::ALREADY_LOCKED)){
+    if(IsSetExtCredLib() || IsSetRAMRole(AutoLock::ALREADY_LOCKED)){
         if(SecurityTokenExpire < (time(NULL) + S3fsCred::RAM_EXPIRE_MERGIN)){
             S3FS_PRN_INFO("Security Token refreshing...");
 
             // update
-            if(!LoadRAMCredentials(AutoLock::ALREADY_LOCKED)){
-                S3FS_PRN_ERR("Security Token refresh failed");
-                return false;
+            if(!IsSetExtCredLib()){
+                if(!LoadRAMCredentials(AutoLock::ALREADY_LOCKED)){
+                    S3FS_PRN_ERR("Security Token refresh failed");
+                    return false;
+                }
+            }else{
+                if(!UpdateExtCredentials(AutoLock::ALREADY_LOCKED)){
+                    S3FS_PRN_ERR("Access Token refresh by %s(external credential library) failed", credlib.c_str());
+                    return false;
+                }
             }
             S3FS_PRN_INFO("Security Token refreshed");
         }
@@ -868,7 +957,7 @@ bool S3fsCred::CheckIAMCredentialUpdate(std::string* access_key_id, std::string*
         *secret_access_key = AccessKeySecret;
     }
     if(access_token){
-        if(IsSetRAMRole(AutoLock::ALREADY_LOCKED) || is_use_session_token){
+        if(IsSetRAMRole(AutoLock::ALREADY_LOCKED) || IsSetExtCredLib() || is_use_session_token){
             *access_token = SecurityToken;
         }else{
             access_token->erase();
@@ -876,6 +965,219 @@ bool S3fsCred::CheckIAMCredentialUpdate(std::string* access_key_id, std::string*
     }
 
     return true;
+}
+
+const char* S3fsCred::GetCredFuncVersion(bool detail) const
+{
+    static const char errVersion[] = "unknown";
+
+    if(!pFuncCredVersion){
+        return errVersion;
+    }
+    return (*pFuncCredVersion)(detail);
+}
+
+//-------------------------------------------------------------------
+// Methods : External Credential Library
+//-------------------------------------------------------------------
+bool S3fsCred::SetExtCredLib(const char* arg)
+{
+    if(!arg || strlen(arg) == 0){
+        return false;
+    }
+    credlib = arg;
+
+    return true;
+}
+
+bool S3fsCred::IsSetExtCredLib() const
+{
+    return !credlib.empty();
+}
+
+bool S3fsCred::SetExtCredLibOpts(const char* args)
+{
+    if(!args || strlen(args) == 0){
+        return false;
+    }
+    credlib_opts = args;
+
+    return true;
+}
+
+bool S3fsCred::IsSetExtCredLibOpts() const
+{
+    return !credlib_opts.empty();
+}
+
+bool S3fsCred::InitExtCredLib()
+{
+    if(!LoadExtCredLib()){
+        return false;
+    }
+    // Initialize library
+    if(!pFuncCredInit){
+        S3FS_PRN_CRIT("\"InitS3fsCredential\" function pointer is NULL, why?");
+        UnloadExtCredLib();
+        return false;
+    }
+
+    const char* popts   = credlib_opts.empty() ? NULL : credlib_opts.c_str();
+    char*       perrstr = NULL;
+    if(!(*pFuncCredInit)(popts, &perrstr)){
+        S3FS_PRN_ERR("Could not initialize %s(external credential library) by \"InitS3fsCredential\" function : %s", credlib.c_str(), perrstr ? perrstr : "unknown");
+        // cppcheck-suppress unmatchedSuppression
+        // cppcheck-suppress knownConditionTrueFalse
+        if(perrstr){
+            free(perrstr);
+        }
+        UnloadExtCredLib();
+        return false;
+    }
+    // cppcheck-suppress unmatchedSuppression
+    // cppcheck-suppress knownConditionTrueFalse
+    if(perrstr){
+        free(perrstr);
+    }
+
+    return true;
+}
+
+bool S3fsCred::LoadExtCredLib()
+{
+    if(credlib.empty()){
+        return false;
+    }
+    UnloadExtCredLib();
+
+    S3FS_PRN_INFO("Load External Credential Library : %s", credlib.c_str());
+
+    // Open Library
+    //
+    // Search Library: (RPATH ->) LD_LIBRARY_PATH -> (RUNPATH ->) /etc/ld.so.cache -> /lib -> /usr/lib
+    //
+    if(NULL == (hExtCredLib = dlopen(credlib.c_str(), RTLD_LAZY))){
+        const char* preason = dlerror();
+        S3FS_PRN_ERR("Could not load %s(external credential library) by error : %s", credlib.c_str(), preason ? preason : "unknown");
+        return false;
+    }
+
+    // Set function pointers
+    if(NULL == (pFuncCredVersion = reinterpret_cast<fp_VersionS3fsCredential>(dlsym(hExtCredLib, "VersionS3fsCredential")))){
+        S3FS_PRN_ERR("%s(external credential library) does not have \"VersionS3fsCredential\" function which is required.", credlib.c_str());
+        UnloadExtCredLib();
+        return false;
+    }
+
+    if(NULL == (pFuncCredUpdate = reinterpret_cast<fp_UpdateS3fsCredential>(dlsym(hExtCredLib, "UpdateS3fsCredential")))){
+        S3FS_PRN_ERR("%s(external credential library) does not have \"UpdateS3fsCredential\" function which is required.", credlib.c_str());
+        UnloadExtCredLib();
+        return false;
+    }
+
+    if(NULL == (pFuncCredInit = reinterpret_cast<fp_InitS3fsCredential>(dlsym(hExtCredLib, "InitS3fsCredential")))){
+        S3FS_PRN_INFO("%s(external credential library) does not have \"InitS3fsCredential\" function which is optional.", credlib.c_str());
+        pFuncCredInit = InitS3fsCredential;     // set built-in function
+    }
+
+    if(NULL == (pFuncCredFree = reinterpret_cast<fp_FreeS3fsCredential>(dlsym(hExtCredLib, "FreeS3fsCredential")))){
+        S3FS_PRN_INFO("%s(external credential library) does not have \"FreeS3fsCredential\" function which is optional.", credlib.c_str());
+        pFuncCredFree = FreeS3fsCredential;     // set built-in function
+    }
+    S3FS_PRN_INFO("Succeed loading External Credential Library : %s", credlib.c_str());
+
+    return true;
+}
+
+bool S3fsCred::UnloadExtCredLib()
+{
+    if(hExtCredLib){
+        S3FS_PRN_INFO("Unload External Credential Library : %s", credlib.c_str());
+
+        // Uninitialize library
+        if(!pFuncCredFree){
+            S3FS_PRN_CRIT("\"FreeS3fsCredential\" function pointer is NULL, why?");
+        }else{
+            char* perrstr = NULL;
+            if(!(*pFuncCredFree)(&perrstr)){
+                S3FS_PRN_ERR("Could not uninitialize by \"FreeS3fsCredential\" function : %s", perrstr ? perrstr : "unknown");
+            }
+            // cppcheck-suppress unmatchedSuppression
+            // cppcheck-suppress knownConditionTrueFalse
+            if(perrstr){
+                free(perrstr);
+            }
+        }
+
+        // reset
+        pFuncCredVersion = VersionS3fsCredential;
+        pFuncCredInit    = InitS3fsCredential;
+        pFuncCredFree    = FreeS3fsCredential;
+        pFuncCredUpdate  = UpdateS3fsCredential;
+
+        // close
+        dlclose(hExtCredLib);
+        hExtCredLib = NULL;
+    }
+    return true;
+}
+
+bool S3fsCred::UpdateExtCredentials(AutoLock::Type type)
+{
+    if(!hExtCredLib){
+        S3FS_PRN_CRIT("External Credential Library is not loaded, why?");
+        return false;
+    }
+
+    AutoLock auto_lock(&token_lock, type);
+
+    char* paccess_key_id     = nullptr;
+    char* pserect_access_key = nullptr;
+    char* paccess_token      = nullptr;
+    char* perrstr            = nullptr;
+    long long token_expire   = 0;
+    bool result = (*pFuncCredUpdate)(&paccess_key_id, &pserect_access_key, &paccess_token, &token_expire, &perrstr);
+    if(!result){
+        // error occurred
+        S3FS_PRN_ERR("Could not update credential by \"UpdateS3fsCredential\" function : %s", perrstr ? perrstr : "unknown");
+
+    // cppcheck-suppress unmatchedSuppression
+    // cppcheck-suppress knownConditionTrueFalse
+    }else if(!paccess_key_id || !pserect_access_key || !paccess_token || token_expire <= 0){
+        // some variables are wrong
+        S3FS_PRN_ERR("After updating credential by \"UpdateS3fsCredential\" function, but some variables are wrong : paccess_key_id=%p, pserect_access_key=%p, paccess_token=%p, token_expire=%lld", paccess_key_id, pserect_access_key, paccess_token, token_expire);
+        result = false;
+    }else{
+        // succeed updating
+        AccessKeyId       = paccess_key_id;
+        AccessKeySecret   = pserect_access_key;
+        SecurityToken       = paccess_token;
+        SecurityTokenExpire = token_expire;
+    }
+
+    // clean
+    // cppcheck-suppress unmatchedSuppression
+    // cppcheck-suppress knownConditionTrueFalse
+    if(paccess_key_id){
+        free(paccess_key_id);
+    }
+    // cppcheck-suppress unmatchedSuppression
+    // cppcheck-suppress knownConditionTrueFalse
+    if(pserect_access_key){
+        free(pserect_access_key);
+    }
+    // cppcheck-suppress unmatchedSuppression
+    // cppcheck-suppress knownConditionTrueFalse
+    if(paccess_token){
+        free(paccess_token);
+    }
+    // cppcheck-suppress unmatchedSuppression
+    // cppcheck-suppress knownConditionTrueFalse
+    if(perrstr){
+        free(perrstr);
+    }
+
+    return result;
 }
 
 //-------------------------------------------------------------------
@@ -894,11 +1196,13 @@ int S3fsCred::DetectParam(const char* arg)
 
     if(is_prefix(arg, "passwd_file=")){
         SetPasswdFile(strchr(arg, '=') + sizeof(char));
+        set_builtin_cred_opts = true;
         return 0;
     }
 
     if(0 == strcmp(arg, "use_session_token")){
         SetIsUseSessionToken(true);
+        set_builtin_cred_opts = true;
         return 0;
     }
 
@@ -906,6 +1210,7 @@ int S3fsCred::DetectParam(const char* arg)
         if(0 == strcmp(arg, "ram_role") || 0 == strcmp(arg, "ram_role=auto")){
             // loading RAM role name in s3fs_init(), because we need to wait initializing curl.
             SetRamRoleMetadataType(true);
+            set_builtin_cred_opts = true;
             return 0;
 
         }else if(is_prefix(arg, "ram_role=")){
@@ -913,11 +1218,28 @@ int S3fsCred::DetectParam(const char* arg)
             SetRAMRole(role, AutoLock::NONE);
             SetRamRoleMetadataType(false);
             // compatible with old mode
+            set_builtin_cred_opts = true;
             if(0 == strncmp(role, "http", 4)){
                 SetRAMCredentialsURL("");
             }
             return 0;
         }
+    }
+
+    if(is_prefix(arg, "credlib=")){
+        if(!SetExtCredLib(strchr(arg, '=') + sizeof(char))){
+             S3FS_PRN_EXIT("failed to set credlib option : %s", (strchr(arg, '=') + sizeof(char)));
+             return -1;
+        }
+        return 0;
+    }
+
+    if(is_prefix(arg, "credlib_opts=")){
+        if(!SetExtCredLibOpts(strchr(arg, '=') + sizeof(char))){
+             S3FS_PRN_EXIT("failed to set credlib_opts option : %s", (strchr(arg, '=') + sizeof(char)));
+             return -1;
+        }
+        return 0;
     }
 
     return 1;
@@ -976,7 +1298,7 @@ bool S3fsCred::CheckAllParams()
         return false;
     }
 
-    if(!S3fsCurl::IsPublicBucket() && !load_ramrole){
+    if(!S3fsCurl::IsPublicBucket() && !load_ramrole && !IsSetExtCredLib()){
         if(!InitialCredentials()){
             return false;
         }
@@ -986,6 +1308,31 @@ bool S3fsCred::CheckAllParams()
         }
         // More error checking on the access key pair can be done
         // like checking for appropriate lengths and characters  
+    }
+
+    // check External Credential Library
+    //
+    // [NOTE]
+    // If credlib(_opts) option (for External Credential Library) is specified,
+    // no other Credential related options can be specified. It is exclusive.
+    //
+    if(set_builtin_cred_opts && (IsSetExtCredLib() || IsSetExtCredLibOpts())){
+        S3FS_PRN_EXIT("The \"credlib\" or \"credlib_opts\" option and other credential-related options(passwd_file, iam_role, profile, use_session_token, ecs, imdsv1only, ibm_iam_auth, ibm_iam_endpoint, etc) cannot be specified together.");
+        return false;
+    }
+
+    // Load and Initialize external credential library
+    if(IsSetExtCredLib() || IsSetExtCredLibOpts()){
+        if(!IsSetExtCredLib()){
+            S3FS_PRN_EXIT("The \"credlib_opts\"(%s) is specifyed but \"credlib\" option is not specified.", credlib_opts.c_str());
+            return false;
+        }
+
+        if(!InitExtCredLib()){
+             S3FS_PRN_EXIT("failed to load the library specified by the option credlib(%s, %s).", credlib.c_str(), credlib_opts.c_str());
+             return false;
+        }
+        S3FS_PRN_INFO("Loaded External Credential Library:\n%s", GetCredFuncVersion(true));
     }
 
     return true;

@@ -435,6 +435,40 @@ std::string get_canonical_headers_oss(const struct curl_slist* list, bool only_o
     return canonical_headers;
 }
 
+std::string get_canonical_headers_ossv4(const struct curl_slist* list)
+{
+    std::string canonical_headers;
+
+    if(!list){
+        canonical_headers = "\n";
+        return canonical_headers;
+    }
+
+    for( ; list; list = list->next){
+        std::string strhead = list->data;
+        size_t pos;
+        if(std::string::npos != (pos = strhead.find(':', 0))){
+            std::string strkey = trim(lower(strhead.substr(0, pos)));
+            std::string strval = trim(strhead.substr(pos + 1));
+            if (strval.empty()) {
+                // skip empty-value headers (as they are discarded by libcurl)
+                continue;
+            }
+            strhead = strkey;
+            strhead += ":";
+            strhead += strval;
+        }else{
+            strhead = trim(lower(strhead));
+        }
+        if(strhead.substr(0, 5) != "x-oss" && strhead.substr(0, 12) != "content-type" && strhead.substr(0, 11) != "content-md5"){
+            continue;
+        }
+        canonical_headers += strhead;
+        canonical_headers += "\n";
+    }
+    return canonical_headers;
+}
+
 bool get_canonical_resource_oss(const char* realpath, std::string& resourcepath)
 {
     if(!realpath){

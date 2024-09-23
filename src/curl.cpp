@@ -2854,7 +2854,12 @@ void S3fsCurl::insertAuthHeaders()
     // }else{
     //     insertV4Headers(access_key_id, secret_access_key, access_token);
     // }
-    insertOSSV1Headers(access_key_id, secret_access_key, access_token);
+
+    if (S3fsCurl::signature_type == V1_ONLY) {
+        insertOSSV1Headers(access_key_id, secret_access_key, access_token);
+    } else {
+        insertOSSV4Headers(access_key_id, secret_access_key, access_token);
+    }
 
 }
 
@@ -3661,7 +3666,7 @@ int S3fsCurl::GetObjectStreamRequest(const char* tpath, char* buf, off_t start, 
 int S3fsCurl::CheckBucket(const char* check_path)
 {
     S3FS_PRN_INFO3("check a bucket.");
-
+  
     if(!check_path || 0 == strlen(check_path)){
         return -EIO;
     }
@@ -4531,6 +4536,161 @@ void S3fsCurl::insertOSSV1Headers(const std::string& access_key_id, const std::s
     if(!S3fsCurl::IsPublicBucket()){
         std::string Signature = CalcSignatureOSSV1(op, get_header_value(requestHeaders, "Content-MD5"), get_header_value(requestHeaders, "Content-Type"), date, resource, secret_access_key, access_token);
         requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", std::string("OSS " + access_key_id + ":" + Signature).c_str());
+    }
+}
+
+// more detail info: https://help.aliyun.com/zh/oss/developer-reference/recommend-to-use-signature-version-4?spm=a2c4g.11186623.0.0.7cfa19c22p3CtK
+std::string S3fsCurl::CalcSignatureOSSV4(const std::string& method, const std::string& canonical_url, const std::string& canonical_query_string, const std::string& canonical_headers, const std::string& additional_headers, const std::string& hash_payload, const std::string& secret_access_key)
+{
+    std::string canonicalRequest;
+    std::string stringToSign;   
+    std::string signature;
+    
+    // step1
+    canonicalRequest += method + "\n";
+    canonicalRequest += canonical_url + "\n";
+    canonicalRequest += canonical_query_string + "\n";
+    canonicalRequest += canonical_headers + "\n";
+    canonicalRequest += additional_headers + "\n";
+    canonicalRequest += hash_payload;
+    
+    // step 2
+    const unsigned char* cdata = reinterpret_cast<const unsigned char*>(canonicalRequest.c_str());
+    size_t cdata_len           = canonicalRequest.size();
+    unsigned char* md          = NULL;
+    unsigned int md_len        = 0;
+
+    s3fs_sha256(cdata, cdata_len, &md, &md_len);
+
+    std::string hexDigest = s3fs_hex_lower(md, md_len);
+    delete[] md;
+
+    std::string hashCode = "OSS4-HMAC-SHA256";
+    std::string timeStamp = get_date_iso8601(time(NULL));
+    
+    std::string signingDate = get_date_string(time(NULL));
+    std::string signingRegion = region;
+    std::string signingProduct;
+    std::string signingRequest = "aliyun_v4_request";
+
+    if (cloudbox_id.empty()) {
+        signingProduct = "oss";
+    } else {
+        signingProduct = "oss-cloudbox";
+        signingRegion = cloudbox_id;
+    }
+
+    std::string scope = signingDate + "/" + signingRegion + "/" + signingProduct + "/" + signingRequest;
+
+    // get stringToSign
+    stringToSign = hashCode + "\n" + timeStamp + "\n" + scope + "\n" + hexDigest;
+
+    // step 3
+    std::string alsk = "aliyun_v4" + secret_access_key;
+    unsigned char *kDate, *kRegion, *kService, *kSigning            = NULL;
+    unsigned int  kDate_len,kRegion_len, kService_len, kSigning_len = 0;
+
+    s3fs_HMAC256(alsk.c_str(), alsk.size(), reinterpret_cast<const unsigned char*>(signingDate.c_str()), signingDate.size(), &kDate, &kDate_len);
+    s3fs_HMAC256(kDate, kDate_len, reinterpret_cast<const unsigned char*>(signingRegion.c_str()), signingRegion.size(), &kRegion, &kRegion_len);
+    s3fs_HMAC256(kRegion, kRegion_len, reinterpret_cast<const unsigned char*>(signingProduct.c_str()), signingProduct.size(), &kService, &kService_len);
+    s3fs_HMAC256(kService, kService_len, reinterpret_cast<const unsigned char*>(signingRequest.c_str()), signingRequest.size(), &kSigning, &kSigning_len);
+    delete[] kDate;
+    delete[] kRegion;
+    delete[] kService;
+    const unsigned char* cscope         = reinterpret_cast<const unsigned char*>(stringToSign.c_str());
+    size_t               cscope_len     = stringToSign.size();
+    unsigned char*       signingKey     = NULL;
+    unsigned int         signingKey_len = 0;
+
+    s3fs_HMAC256(kSigning, kSigning_len, cscope, cscope_len, &signingKey, &signingKey_len);
+    delete[] kSigning;
+    
+    signature = s3fs_hex_lower(signingKey, signingKey_len);
+    delete[] signingKey;
+    
+    return signature;
+}
+
+void S3fsCurl::insertOSSV4Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token)
+{
+    std::string canonical_url;
+    std::string canonical_query_string;
+    std::string scope;
+    std::string signature;
+    std::string server_path = type == REQTYPE_LISTBUCKET ? "/" : path;
+    
+    get_canonical_resource_oss(server_path.c_str(), canonical_url);
+    canonical_url = urlEncode(canonical_url);
+
+    if (!query_string.empty()) {
+        std::map<std::string, std::vector<std::string>> query_map;
+        std::stringstream query_stream(query_string);
+        std::string token;
+
+        while (std::getline(query_stream, token, '&')) {
+            size_t pos = token.find("=");
+            std::string key = urlDecode(token.substr(0, pos));
+            std::string value = urlDecode((pos == std::string::npos) ? "" : token.substr(pos + 1));
+            query_map[urlEncodeOssv4Query(key)].push_back(urlEncodeOssv4Query(value));
+        }
+
+        std::stringstream result;
+        for (auto it = query_map.begin(); it != query_map.end(); ++ it) {
+            for (size_t i = 0; i < it->second.size(); ++ i) {
+                if (i > 0) {
+                    result << "&";
+                }
+                result << it->first;
+                if (!it->second[i].empty()) {
+                    result << "=" << it->second[i];
+                }
+            }
+            if (std::next(it) != query_map.end()) {
+                result << "&";
+            }
+        }
+
+        canonical_query_string = result.str();
+    }
+
+    std::string hash_payload = "UNSIGNED-PAYLOAD";
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-content-sha256", hash_payload.c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-date", get_date_iso8601(time(NULL)).c_str());
+
+    if(!access_token.empty()){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", access_token.c_str());
+    }
+
+    if(op != "PUT" && op != "POST"){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", NULL);
+    }
+
+    if (S3fsCurl::IsRequesterPays()) {
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-request-payer", "requester");
+        S3FS_PRN_INFO3("Now Requester Pays buckets");
+    }
+
+    std::string signingDate = get_date_string(time(NULL));
+    std::string signingRegion = region;
+    std::string signingProduct;
+    std::string signingRequest = "aliyun_v4_request";
+
+    if (cloudbox_id.empty()) {
+        signingProduct = "oss";
+    } else {
+        signingProduct = "oss-cloudbox";
+        signingRegion = cloudbox_id;
+    }
+
+    scope = signingDate + "/" + signingRegion + "/" + signingProduct + "/" + signingRequest;
+    // The additional headers are empty in ossfs
+    signature = CalcSignatureOSSV4(op, canonical_url, canonical_query_string, get_canonical_headers_ossv4(requestHeaders), "", hash_payload, secret_access_key);
+    
+    if(!S3fsCurl::IsPublicBucket()){
+        std::string authorization = std::string("OSS4-HMAC-SHA256 ") + \
+                                "Credential=" + access_key_id + "/" + scope + ", " + \
+                                "Signature=" + signature;
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "Authorization", authorization.c_str());
     }
 }
 

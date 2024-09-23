@@ -94,6 +94,7 @@ bool convert_unixtime_from_option_arg(const char* argv, time_t& unixtime);
 //
 std::string urlEncode(const std::string &s);
 std::string urlEncode2(const std::string &s);
+std::string urlEncodeOssv4Query(const std::string &s);
 std::string urlDecode(const std::string& s);
 
 bool takeout_str_dquart(std::string& str);

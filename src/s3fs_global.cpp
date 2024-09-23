@@ -37,6 +37,8 @@ std::string program_name;
 std::string service_path          = "/";
 std::string s3host                = "https://oss-cn-hangzhou.aliyuncs.com";
 std::string endpoint              = "cn-hangzhou";
+std::string region                = "cn-hangzhou";
+std::string cloudbox_id;
 std::string cipher_suites;
 std::string instance_name;
 
