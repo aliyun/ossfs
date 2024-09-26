@@ -798,7 +798,7 @@ bool S3fsCred::InitialCredentials()
     // 3  - environment variables
     char* OSSACCESSKEYID     = getenv("OSSACCESSKEYID") ?     getenv("OSSACCESSKEYID") :     getenv("OSS_ACCESS_KEY_ID");
     char* OSSSECRETACCESSKEY = getenv("OSSSECRETACCESSKEY") ? getenv("OSSSECRETACCESSKEY") : getenv("OSS_ACCESS_KEY_SECRET");
-    char* OSSSESSIONTOKEN    = getenv("OSSSSESSIONTOKEN") ?   getenv("OSSSSESSIONTOKEN") :   getenv("OSS_SESSION_TOKEN");
+    char* OSSSESSIONTOKEN    = getenv("OSSSESSIONTOKEN") ?   getenv("OSSSESSIONTOKEN") :   getenv("OSS_SESSION_TOKEN");
 
     if(OSSACCESSKEYID != NULL || OSSSECRETACCESSKEY != NULL){
         if( (OSSACCESSKEYID == NULL && OSSSECRETACCESSKEY != NULL) ||
