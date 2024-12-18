@@ -57,27 +57,26 @@ void read_from_oss_and_write_to_disk_rand(const char* read_path,
     // shuffle the read order in the unit of 100MB
     std::vector<int> read_order_in_the_unit_of_100MB;
     std::cout << "total size " << total_size << std::endl;
-    for (int i = 0; i < (total_size+100*MB-1) / 100 / MB; ++i) {
+    for (int i = 0; i < (total_size + 100 * MB - 1) / 100 / MB; ++i) {
         read_order_in_the_unit_of_100MB.push_back(i);
     }
-    std::random_shuffle(read_order_in_the_unit_of_100MB.begin(), 
-                        read_order_in_the_unit_of_100MB.end());
-    size_t sub_total_size = 100*MB;
+    std::random_shuffle(read_order_in_the_unit_of_100MB.begin(), read_order_in_the_unit_of_100MB.end());
+    size_t sub_total_size = 100 * MB;
 
     for (int i = 0; i < read_order_in_the_unit_of_100MB.size(); ++i) {
         int index = read_order_in_the_unit_of_100MB[i];
-        sub_total_size = std::min(100 * MB, total_size - index * 100 * MB);
+        sub_total_size = std::min<size_t>(100 * MB, total_size - index * 100 * MB);
         off_t start_offset = index * 100 * MB;
-        std::cout << "random read, start from " << index*100 << "MB, sub_total_size: " << sub_total_size << std::endl;
+        std::cout << "random read, start from " << index * 100 << "MB, sub_total_size: " << sub_total_size << std::endl;
         offset = 0;
         while (offset < sub_total_size) {
-            size_t buf_size = std::min(MB, sub_total_size - offset);
-            bytesread = pread(fd, buf, buf_size, start_offset+offset);
-            byteswritten = pwrite(wfd, buf, bytesread, start_offset+offset);
+            size_t buf_size = std::min<size_t>(MB, sub_total_size - offset);
+            bytesread = pread(fd, buf, buf_size, start_offset + offset);
+            byteswritten = pwrite(wfd, buf, bytesread, start_offset + offset);
             offset += byteswritten;
         }
     }
-    
+
     close(fd);
     close(wfd);
 }
