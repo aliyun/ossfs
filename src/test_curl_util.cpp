@@ -150,10 +150,64 @@ void test_slist_remove()
     curl_slist_free_all(list);
 }
 
+void test_curl_slist_sort_insert() 
+{
+    struct curl_slist* list = NULL;
+    ASSERT_IS_SORTED(list);
+    
+    list = curl_slist_sort_insert(list, "2:val2");
+    ASSERT_IS_SORTED(list);
+    ASSERT_STREQUALS("2: val2", list->data);
+    
+    list = curl_slist_sort_insert(list, "4:val4");
+    ASSERT_IS_SORTED(list);
+    ASSERT_STREQUALS("2: val2", list->data);
+    
+    list = curl_slist_sort_insert(list, "1:val1");
+    ASSERT_IS_SORTED(list);
+    ASSERT_STREQUALS("1: val1", list->data);
+    
+    list = curl_slist_sort_insert(list, "3:val3");
+    ASSERT_IS_SORTED(list);
+    ASSERT_STREQUALS("1: val1", list->data);
+    
+    ASSERT_EQUALS(static_cast<size_t>(4), curl_slist_length(list));
+
+    // check all elements in list
+    int i = 1;
+    for(auto head = list; head != NULL; head = head->next, i ++) {
+        std::string element = std::to_string(i) + ": val" + std::to_string(i);
+        ASSERT_STREQUALS(element.c_str(), head->data);
+    }
+    curl_slist_free_all(list);
+}    
+void test_make_md5_from_binary() {
+    std::string md5;
+
+    // Normal case: Non-empty input
+    const char* data = "Hello, World!";
+    size_t length = strlen(data);
+    ASSERT_TRUE(make_md5_from_binary(data, length, md5));
+
+    // Invalid case: Empty input
+    const char* empty_data = "";
+    size_t empty_length = strlen(empty_data);
+    ASSERT_FALSE(make_md5_from_binary(empty_data, empty_length, md5));
+
+    // Invalid case: Null pointer
+    ASSERT_FALSE(make_md5_from_binary(nullptr, 0, md5));
+    
+    // Invalid case: Empty string with non-null pointer
+    const char* empty_string = "\0";
+    ASSERT_FALSE(make_md5_from_binary(empty_string, 1, md5));
+}
+
 int main(int argc, char *argv[])
 {
     test_sort_insert();
     test_slist_remove();
+    test_curl_slist_sort_insert();
+    test_make_md5_from_binary();
     return 0;
 }
 

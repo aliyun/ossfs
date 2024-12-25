@@ -46,6 +46,14 @@ template <> void assert_equals(const std::string &x, const std::string &y, const
     }
 }
 
+template <> void assert_equals(const time_t &x, const time_t &y, const char *file, int line)
+{
+    if (x != y) {
+        std::cerr << x << " != " << y << " at " << file << ":" << line << std::endl;
+        std::cerr << std::endl;
+        std::exit(1);
+    }
+}
 
 template <typename T> void assert_nequals(const T &x, const T &y, const char *file, int line)
 {
@@ -89,7 +97,7 @@ void assert_bufequals(const char *x, size_t len1, const char *y, size_t len2, co
 
 #define ASSERT_TRUE(x)          assert_equals((x), true, __FILE__, __LINE__)
 #define ASSERT_FALSE(x)         assert_equals((x), false, __FILE__, __LINE__)
-#define ASSERT_EQUALS(x, y)     assert_equals((x), (y), __FILE__, __LINE__)
+#define ASSERT_EQUALS(x, y)     assert_equals(static_cast<decltype(y)>(x), y, __FILE__, __LINE__)
 #define ASSERT_NEQUALS(x, y)    assert_nequals((x), (y), __FILE__, __LINE__)
 #define ASSERT_STREQUALS(x, y)  assert_strequals((x), (y), __FILE__, __LINE__)
 #define ASSERT_BUFEQUALS(x, len1, y, len2) assert_bufequals((x), (len1), (y), (len2), __FILE__, __LINE__)

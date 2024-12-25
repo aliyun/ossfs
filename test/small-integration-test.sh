@@ -29,6 +29,8 @@ set -o pipefail
 source integration-test-common.sh
 
 CACHE_DIR="/tmp/ossfs-cache"
+LOGFILE="/tmp/ossfs.log"
+CHECK_CACHE_FILE="/tmp/ossfs-cache-check.log"
 rm -rf "${CACHE_DIR}"
 mkdir "${CACHE_DIR}"
 
@@ -39,21 +41,24 @@ FAKE_FREE_DISK_SIZE=200
 ENSURE_DISKFREE_SIZE=10
 BACKWARD_CHUNKS=1
 DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB=2048
+AHBE_CONFIG="./sample_ahbe.conf"
 
 export CACHE_DIR
+export LOGFILE
+export CHECK_CACHE_FILE
 export ENSURE_DISKFREE_SIZE 
 export DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB
 if [ -n "${ALL_TESTS}" ]; then
     FLAGS=(
-        "use_cache=${CACHE_DIR} -o ensure_diskfree=${ENSURE_DISKFREE_SIZE} -o fake_diskfree=${FAKE_FREE_DISK_SIZE}"
+        "use_cache=${CACHE_DIR} -o ensure_diskfree=${ENSURE_DISKFREE_SIZE} -o fake_diskfree=${FAKE_FREE_DISK_SIZE} -o del_cache"
         enable_content_md5
         enable_noobj_cache
-        "max_stat_cache_size=100"
+        "max_stat_cache_size=100 -o stat_cache_expire=-1"
         nocopyapi
         nomultipart
         notsup_compat_dir
         sigv1
-        "singlepart_copy_limit=10"  # limit size to exercise multipart code paths
+        "singlepart_copy_limit=10 -o noshallowcopyapi"  # limit size to exercise multipart code paths
         use_sse
         use_sse=kms
         listobjectsv2
@@ -67,6 +72,10 @@ if [ -n "${ALL_TESTS}" ]; then
         "default_acl=private"
         "direct_read -o direct_read_local_file_cache_size_mb=${DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB}"
         "sigv4 -o region=${OSS_REGION}"
+        ahbe_conf=${AHBE_CONFIG}
+        "use_cache=${CACHE_DIR} -o del_cache -o set_check_cache_sigusr1=${CHECK_CACHE_FILE} -o logfile=${LOGFILE} -o check_cache_dir_exist"
+        "max_dirty_data=50"
+        "use_cache=${CACHE_DIR} -o free_space_ratio=1 -o del_cache"
     )
 else
     FLAGS=(

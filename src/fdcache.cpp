@@ -272,6 +272,11 @@ bool FdManager::InitFakeUsedDiskSize(off_t fake_freesize)
     return true;
 }
 
+off_t FdManager::GetTotalDiskSpaceByRatio(int ratio)
+{
+    return FdManager::GetTotalDiskSpace(nullptr) * ratio / 100;
+}
+
 off_t FdManager::GetTotalDiskSpace(const char* path)
 {
     struct statvfs vfsbuf;
@@ -326,6 +331,18 @@ bool FdManager::IsSafeDiskSpace(const char* path, off_t size)
 {
     off_t fsize = FdManager::GetFreeDiskSpace(path);
     return size + FdManager::GetEnsureFreeDiskSpace() <= fsize;
+}
+
+bool FdManager::IsSafeDiskSpaceWithLog(const char* path, off_t size)
+{
+    off_t fsize = FdManager::GetFreeDiskSpace(path);
+    off_t needsize = size + FdManager::GetEnsureFreeDiskSpace();
+    if(needsize <= fsize){
+        return true;
+    } else {
+        S3FS_PRN_EXIT("There is no enough disk space for used as cache(or temporary) directory by ossfs. Requires %.3f MB, already has %.3f MB.", static_cast<double>(needsize) / 1024 / 1024, static_cast<double>(fsize) / 1024 / 1024);
+        return false;
+    }
 }
 
 bool FdManager::HaveLseekHole()

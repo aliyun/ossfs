@@ -1,5 +1,17 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.5 (25/12/2024)
+ - Fixed some bugs that users get unexpected results on mounting with specific policies for the bucket/prefix set.
+ - Fixed a bug that ossfs take a file as existing if HeadObj returns 403.
+ - Change the default value of complement_stat to true.
+ - Support free_space_ratio.
+
+## v1.91.4 (24/09/2024)
+ - Add a new option sigv4 to support OSS V4 signature. 
+ - Fixed a bug that concurrent writing may cause deadlock when disk space is insufficient.
+ - Support authentication via dynamic lib.
+ - Fixed a bug that AK and SK are stored in wrong environment variables.
+
 ## v1.91.3 (04/06/2024)
  - Fixed a bug that IO fails when running out of disk space.
  - Fixed a bug that default_acl option does not working.

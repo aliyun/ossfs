@@ -131,7 +131,6 @@ static int rename_object(const char* from, const char* to, bool update_ctime);
 static int rename_object_nocopy(const char* from, const char* to, bool update_ctime);
 static int clone_directory_object(const char* from, const char* to, bool update_ctime);
 static int rename_directory(const char* from, const char* to);
-static int remote_mountpath_exists(const char* path);
 static void free_xattrs(xattrs_t& xattrs);
 static bool parse_xattr_keyval(const std::string& xattrpair, std::string& key, PXATTRVAL& pval);
 static size_t parse_xattrs(const std::string& strxattrs, xattrs_t& xattrs);
@@ -396,26 +395,7 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
     s3fscurl.DestroyCurlHandle();
 
     // if not found target path object, do over checking
-    if(-EPERM == result){
-        // [NOTE]
-        // In case of a permission error, it exists in directory
-        // file list but inaccessible. So there is a problem that
-        // it will send a HEAD request every time, because it is
-        // not registered in the Stats cache.
-        // Therefore, even if the file has a permission error, it
-        // should be registered in the Stats cache. However, if
-        // the response without modifying is registered in the
-        // cache, the file permission will be 0644(umask dependent)
-        // because the meta header does not exist.
-        // Thus, set the mode of 0000 here in the meta header so
-        // that ossfs can print a permission error when the file
-        // is actually accessed.
-        // It is better not to set meta header other than mode,
-        // so do not do it.
-        //
-        (*pheader)["x-oss-meta-mode"] = str(0);
-
-    }else if(0 != result){
+   if(0 != result){
         if(overcheck){
             // when support_compat_dir is disabled, strpath maybe have "_$folder$".
             if('/' != *strpath.rbegin() && std::string::npos == strpath.find("_$folder$", 0)){
@@ -467,7 +447,7 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
     // If the file is listed but not allowed access, put it in
     // the positive cache instead of the negative cache.
     // 
-    if(0 != result && -EPERM != result){
+    if(0 != result){
         // finally, "path" object did not find. Add no object cache.
         strpath = path;  // reset original
         StatCache::getStatCacheData()->AddNoObjectCache(strpath);
@@ -3031,24 +3011,6 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     return 0;
 }
 
-static int remote_mountpath_exists(const char* path)
-{
-    struct stat stbuf;
-    int result;
-
-    S3FS_PRN_INFO1("[path=%s]", path);
-
-    // getattr will prefix the path with the remote mountpoint
-    if(0 != (result = get_object_attribute("/", &stbuf, NULL))){
-        return result;
-    }
-    if(!S_ISDIR(stbuf.st_mode)){
-        return -ENOTDIR;
-    }
-    return 0;
-}
-
-
 static void free_xattrs(xattrs_t& xattrs)
 {
     for(xattrs_t::iterator iter = xattrs.begin(); iter != xattrs.end(); ++iter){
@@ -3777,7 +3739,7 @@ static int s3fs_check_service()
 
     S3fsCurl s3fscurl;
     int      res;
-    if(0 > (res = s3fscurl.CheckBucket("/"))){
+    if(0 > (res = s3fscurl.CheckBucket(get_realpath("/").c_str()))){
         // get response code
         long responseCode = s3fscurl.GetLastResponseCode();
 
@@ -3828,7 +3790,9 @@ static int s3fs_check_service()
                 } else {
                     s3host = "http://" + expecthost;
                 }
-                //extract region from host for sigv4
+                // extract region from host for sigv4
+                // The region of the government cloud/financial cloud may not be derived from the domain name
+                // https://help.aliyun.com/zh/oss/user-guide/regions-and-endpoints?spm=a2c4g.11186623.0.0.13ad12c1N7PoaV
                 if(!strncasecmp(expecthost.c_str(), "oss-", 4)){
                     std::size_t found;
                     if ((found = expecthost.find_first_of(".")) != std::string::npos) {
@@ -3838,16 +3802,9 @@ static int s3fs_check_service()
                 }
                 // retry to check with new host
                 s3fscurl.DestroyCurlHandle();
-                res          = s3fscurl.CheckBucket("/");
+                res          = s3fscurl.CheckBucket(get_realpath("/").c_str());
                 responseCode = s3fscurl.GetLastResponseCode();
             }
-        }
-
-        // retry to check with mount prefix
-        if(300 <= responseCode && responseCode < 500 && !mount_prefix.empty()){
-            s3fscurl.DestroyCurlHandle();
-            res          = s3fscurl.CheckBucket(get_realpath("/").c_str());
-            responseCode = s3fscurl.GetLastResponseCode();
         }
 
         // try signature v2
@@ -3864,35 +3821,39 @@ static int s3fs_check_service()
         }
         */
         // check errors(after retrying)
+        // [NOTE]
+        // When mounting a bucket, an error code is returned and the mount fails. 
+        // However, when mounting a prefix, success should be returned if the prefix does not exist.
+        // 
         if(0 > res && responseCode != 200 && responseCode != 301){
             // parse error message if existed
             std::string errMessage;
             const std::string* body = s3fscurl.GetBodyData();
             check_error_message(body->c_str(), body->size(), errMessage);
-
+            bool is_failure = true;
             if(responseCode == 400){
                 S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Bad Request(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }else if(responseCode == 403){
                  S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Invalid Credentials(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
-            }else if(responseCode == 404){
-                S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Bucket or directory not found(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+            }else if (responseCode == 404) {
+                std::string value;
+                if(simple_parse_xml(body->c_str(), body->size(), "Code", value)) {
+                    if(value == "NoSuchBucket") {
+                        S3FS_PRN_CRIT("Failed to check bucket : Bucket not found(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+                    } else {
+                        is_failure = false;
+                    }
+                }
             }else{
                 S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Unable to connect(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }
-            return EXIT_FAILURE;
-        }
-    }
-    s3fscurl.DestroyCurlHandle();
-
-    // make sure remote mountpath exists and is a directory
-    if(!mount_prefix.empty()){
-        if(remote_mountpath_exists(mount_prefix.c_str()) != 0){
-            S3FS_PRN_CRIT("remote mountpath %s not found.", mount_prefix.c_str());
-            return EXIT_FAILURE;
+            if (is_failure) {
+                return EXIT_FAILURE;
+            }
         }
     }
     S3FS_MALLOCTRIM(0);
-
+    
     return EXIT_SUCCESS;
 }
 
@@ -4407,8 +4368,34 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             max_dirty_data = size;
             return 0;
         }
+        if(is_prefix(arg, "free_space_ratio=")){
+            int ratio = static_cast<int>(cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10));
+            if(FdManager::GetEnsureFreeDiskSpace()!=0){
+                S3FS_PRN_EXIT("option free_space_ratio conflicts with ensure_diskfree, please set only one of them.");
+                return -1;
+            }
+            if(ratio < 0 || ratio > 100){
+                S3FS_PRN_EXIT("option free_space_ratio must between 0 to 100, which is: %d", ratio);
+                return -1;
+            }
+            off_t dfsize = FdManager::GetTotalDiskSpaceByRatio(ratio);
+            S3FS_PRN_INFO("Free space ratio set to %d %%, ensure the available disk space is greater than %.3f MB", ratio, static_cast<double>(dfsize) / 1024 / 1024);
+            if(dfsize < S3fsCurl::GetMultipartSize()){
+                S3FS_PRN_WARN("specified size to ensure disk free space is smaller than multipart size, so set multipart size to it.");
+                dfsize = S3fsCurl::GetMultipartSize();
+            }
+            FdManager::SetEnsureFreeDiskSpace(dfsize);
+            return 0;
+        }
         if(is_prefix(arg, "ensure_diskfree=")){
             off_t dfsize = cvt_strtoofft(strchr(arg, '=') + sizeof(char), /*base=*/ 10) * 1024 * 1024;
+            
+            if(FdManager::GetEnsureFreeDiskSpace()!=0){
+                S3FS_PRN_EXIT("option free_space_ratio conflicts with ensure_diskfree, please set only one of them.");
+                return -1;
+            }
+            S3FS_PRN_INFO("Set and ensure the available disk space is greater than %.3f MB.", static_cast<double>(dfsize) / 1024 / 1024);
+
             if(dfsize < S3fsCurl::GetMultipartSize()){
                 S3FS_PRN_WARN("specified size to ensure disk free space is smaller than multipart size, so set multipart size to it.");
                 dfsize = S3fsCurl::GetMultipartSize();
@@ -5078,12 +5065,16 @@ int main(int argc, char* argv[])
 
     // check free disk space
     if(!FdManager::IsSafeDiskSpace(NULL, S3fsCurl::GetMultipartSize() * S3fsCurl::GetMaxParallelCount())){
-        S3FS_PRN_EXIT("There is no enough disk space for used as cache(or temporary) directory by s3fs.");
-        S3fsCurl::DestroyS3fsCurl();
-        s3fs_destroy_global_ssl();
-        destroy_parser_xml_lock();
-        delete ps3fscred;
-        exit(EXIT_FAILURE);
+        // clean cache dir and retry
+        S3FS_PRN_WARN("No enough disk space for ossfs, try to clean cache dir");
+        FdManager::get()->CleanupCacheDir();
+        if(!FdManager::IsSafeDiskSpaceWithLog(nullptr, S3fsCurl::GetMultipartSize() * S3fsCurl::GetMaxParallelCount())){
+            S3fsCurl::DestroyS3fsCurl();
+            s3fs_destroy_global_ssl();
+            destroy_parser_xml_lock();
+            delete ps3fscred;
+            exit(EXIT_FAILURE);
+        }
     }
 
     // check readdir_optimize 
@@ -5099,6 +5090,11 @@ int main(int argc, char* argv[])
         is_refresh_fakemeta = true;
         StatCache::getStatCacheData()->SetNoExtendedMeta(true, readdir_check_size);
         S3FS_PRN_INFO("Readdir optimize, flag(%d, %lld)", is_refresh_fakemeta, static_cast<long long int>(readdir_check_size));
+    }
+
+    // try to check s3fs service
+    if (EXIT_SUCCESS != s3fs_check_service()) {
+        exit(EXIT_FAILURE);
     }
 
     s3fs_oper.getattr     = s3fs_getattr;
