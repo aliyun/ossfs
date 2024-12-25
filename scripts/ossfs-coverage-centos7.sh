@@ -34,6 +34,10 @@ rm -rf ${OSSFS_SOURCE_DIR}/coverage_html && mkdir ${OSSFS_SOURCE_DIR}/coverage_h
 
 DBGLEVEL=debug ALL_TESTS=1 OSSFS_CREDENTIALS_FILE=/root/.passwd-ossfs TEST_BUCKET_1=${BUCKET}  S3PROXY_BINARY="" OSS_URL=${URL} ./small-integration-test.sh
 
+${OSSFS_SOURCE_DIR}/src/test_page_list 
+${OSSFS_SOURCE_DIR}/src/test_curl_util
+${OSSFS_SOURCE_DIR}/src/test_string_util
+
 gcovr -r ${OSSFS_SOURCE_DIR}/src --html-details -o ${OSSFS_SOURCE_DIR}/coverage_html/coverage.html
 
 

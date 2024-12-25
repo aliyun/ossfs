@@ -1,0 +1,17 @@
+{
+	"Version": "1",
+	"Statement": [{
+		"Effect": "Allow",
+		"Action": [
+			"oss:*"
+		],
+		"Principal": [
+			"*"
+		],
+		"Resource": [
+			"acs:oss:*:************:test-policy-bucket/dir",
+			"acs:oss:*:************:test-policy-bucket/dir/",
+			"acs:oss:*:************:test-policy-bucket/dir/*"
+		]
+	}]
+}

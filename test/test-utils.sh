@@ -79,6 +79,14 @@ function get_xattr() {
     fi
 }
 
+function list_xattr() {
+    if [ "$(uname)" = "Darwin" ]; then
+        xattr -l "$1"
+    else
+        getfattr -d -m . --absolute-names "$1"
+    fi
+}
+
 function set_xattr() {
     if [ "$(uname)" = "Darwin" ]; then
         xattr -w "$1" "$2" "$3"

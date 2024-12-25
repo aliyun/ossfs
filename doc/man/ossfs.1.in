@@ -187,6 +187,12 @@ sets MB to ensure disk free space. This option means the threshold of free space
 ossfs makes file for downloading, uploading and caching files.
 If the disk free space is smaller than this value, ossfs do not use disk space as possible in exchange for the performance.
 .TP
+\fB\-o\fR free_space_ratio (default="0")
+sets min free space ratio of the disk. The value of this option can be between 0 and 100. It will control
+the size of the cache according to this ratio to ensure that the idle ratio of the disk is greater than this value.
+For example, when the disk space is 50GB, the 10% value will
+ensure that the disk will reserve at least 50GB * 10% = 5GB of remaining space.
+.TP
 \fB\-o\fR multipart_threshold (default="25")
 threshold, in MB, to use multipart upload instead of
 single-part. Must be at least 5 MB.
@@ -291,9 +297,9 @@ https://curl.haxx.se/docs/ssl-ciphers.html
 The instance name of the current ossfs mountpoint.
 This name will be added to logging messages and user agent headers sent by ossfs.
 .TP
-\fB\-o\fR complement_stat (complement lack of file/directory mode)
+\fB\-o\fR complement_stat (complement lack of file/directory mode, enabled by default)
 ossfs complements lack of information about file/directory mode if a file or a directory object does not have x-oss-meta-mode header.
-As default, ossfs does not complements stat information for a object, then the object will not be able to be allowed to list/modify.
+If disabled, ossfs does not complements stat information for a object, then the object will not be able to be allowed to list/modify.
 .TP
 \fB\-o\fR notsup_compat_dir (disable support of alternative directory names)
 .RS

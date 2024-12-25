@@ -27,7 +27,7 @@
 bool foreground                   = false;
 bool nomultipart                  = false;
 bool pathrequeststyle             = false;
-bool complement_stat              = false;
+bool complement_stat              = true;
 bool noxmlns                      = true;
 bool direct_read                  = false;
 

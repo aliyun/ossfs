@@ -352,6 +352,30 @@ function test_list {
     rm_test_dir
 }
 
+function test_list_more {
+    describe "Testing list more ..."
+    local DIR_NAME="listdir"
+    mkdir ${DIR_NAME}
+ 
+    # [NOTE]
+    # The maximum number of objects returned by ossfs listobject is 1000. 
+    # If it exceeds this number, some flags are required for paging. 
+    # Therefore, the number of files is set to 1100.
+    #
+    for i in $(seq 1 1100); do
+        touch ${DIR_NAME}/file${i}
+    done
+    
+    ls_cnt=$(ls ${DIR_NAME} -1 | wc -l)
+ 
+    if [ "${ls_cnt}" -ne 1100 ]; then
+        echo "Expected 1100 file but got ${ls_cnt}"
+        return 1
+    fi
+    
+    rm -rf ${DIR_NAME}
+}
+
 function test_remove_nonempty_directory {
     describe "Testing removing a non-empty directory ..."
     mk_test_dir
@@ -578,6 +602,26 @@ function test_rename_before_close {
     rm -f "${TEST_TEXT_FILE}"
 }
 
+function test_rename_large_file {
+    describe "Testing rename large file ..."
+ 
+    # create a big file larger than singlepart_copy_limit
+    dd if=/dev/urandom of="${BIG_FILE}" bs="${BIG_FILE_BLOCK_SIZE}" count="${BIG_FILE_COUNT}"
+    
+    local md5=$(md5sum "${BIG_FILE}" | awk '{print $1}')
+    
+    mv "${BIG_FILE}" "${BIG_FILE}.new"
+ 
+    local new_md5=$(md5sum "${BIG_FILE}.new" | awk '{print $1}')
+ 
+    if [ "${md5}" != "${new_md5}" ]; then
+        echo "md5 mismatch, rename file failed"
+        return 1
+    fi
+    
+    rm_test_file "${BIG_FILE}.new"
+}
+
 function test_multipart_upload {
     describe "Testing multi-part upload ..."
 
@@ -768,6 +812,41 @@ function test_symlink {
     rm -f "${ALT_TEST_TEXT_FILE}"
 }
 
+function test_mknod {
+    describe "Testing mknod ..."
+ 
+    local major=$((RANDOM % 256))
+    local minor=$((RANDOM % 256))
+    
+    # Attempt to create a character device file
+    mknod "${ALT_TEST_TEXT_FILE}" c "${major}" "${minor}"
+    if [ ! -c "${ALT_TEST_TEXT_FILE}" ]; then
+        echo "mknod failed" 
+        return 1
+    fi
+    
+    rm -f "${ALT_TEST_TEXT_FILE}"
+    
+    if [ -e "${ALT_TEST_TEXT_FILE}" ]; then 
+        echo "rm character device file failed"
+        return 1
+    fi
+    
+    # Attempt to create a block device file
+    mknod "${ALT_TEST_TEXT_FILE}" b "${major}" "${minor}"
+    if [ ! -b "${ALT_TEST_TEXT_FILE}" ]; then
+        echo "mknod failed" 
+        return 1
+    fi
+    
+    rm -f "${ALT_TEST_TEXT_FILE}"
+
+    if [ -e "${ALT_TEST_TEXT_FILE}" ]; then 
+        echo "rm block device file failed"
+        return 1
+    fi
+}
+
 function test_extended_attributes {
     describe "Testing extended attributes ..."
 
@@ -788,6 +867,44 @@ function test_extended_attributes {
     get_xattr key1 "${TEST_TEXT_FILE}" && exit 1
     get_xattr key2 "${TEST_TEXT_FILE}" | grep -q '^value2$'
 
+    rm_test_file
+}
+
+function test_all_extended_attributes {
+    describe "Testing all extended attributes ..."
+ 
+    rm_test_file
+    mk_test_file
+    
+    # set value
+    set_xattr key1 value1 "${TEST_TEXT_FILE}"
+    if ! get_xattr key1 "${TEST_TEXT_FILE}" | grep -q '^value1$'; then
+        echo "The value of key1 is not 'value1' or the attribute does not exist."
+        return 1
+    fi
+    
+    # append value
+    set_xattr key2 value2 "${TEST_TEXT_FILE}"
+    if ! get_xattr key2 "${TEST_TEXT_FILE}" | grep -q '^value2$'; then
+        echo "The value of key2 is not 'value2' or the attribute does not exist."
+        return 1
+    fi
+    
+    # list all value
+    set_xattr key3 value3 "${TEST_TEXT_FILE}"
+    ls_cnt=$(list_xattr "${TEST_TEXT_FILE}" | sed '1d;$d' | wc -l)
+    if [ "$ls_cnt" -ne 3 ]; then
+        echo "The number of attributes is not 3."
+        return 1
+    fi
+ 
+    # remove value
+    del_xattr key1 "${TEST_TEXT_FILE}"
+    if get_xattr key1 "${TEST_TEXT_FILE}" | grep -q '^value1$'; then
+        echo "The value of key1 is still exist, del_xattr failed."
+        return 1
+    fi
+ 
     rm_test_file
 }
 
@@ -1464,6 +1581,37 @@ function test_truncate_cache() {
 
     # shellcheck disable=SC2046
     rm -rf $(seq 2)
+}
+
+function test_truncate_symlink_cache {
+    describe "Test truncate symlink cache ..."
+ 
+    local SRC_DIR="source_dir"
+    local DST_DIR="destination_dir"
+ 
+    mkdir "${SRC_DIR}"
+    mkdir "${DST_DIR}"
+    
+    # [NOTE]
+    # create more symlink files than -o max_stat_cache_size.
+    # ossfs truncate symlink files require the number of 
+    # symlink files to be greater than max_stat_cache_size. 
+    # Set max_stat_cache_size=100 in the mount parameters. 
+    # Therefore, 110 symlink files are created here.
+    #
+    for i in $(seq 110); do 
+        touch "${SRC_DIR}/file${i}"
+        ln -s "${SRC_DIR}/file${i}" "${DST_DIR}/file${i}"
+    done
+    
+    ls_cnt=$(ls -1 "${DST_DIR}" | wc -l)
+    if [ "${ls_cnt}" -ne 110 ]; then
+        echo "Unexpected ls count: ${ls_cnt}, expected: 110. symlink failed"
+        return 1;
+    fi
+    
+    rm -rf "${SRC_DIR}"
+    rm -rf "${DST_DIR}"
 }
 
 function test_cache_file_stat() {
@@ -2581,6 +2729,115 @@ function test_mix_direct_read_with_skip {
     rm -f "${TEMP_DIR}/${TEST_FILE}"
 }
 
+function test_check_cache_sigusr1 {
+    describe "Testing check cache sigusr1 ..."
+
+    # create the test file again
+    mk_test_file
+
+    # trigger the check cache
+    kill -SIGUSR1 "${OSSFS_PID}"
+    
+    #check the cache
+    error_files=$(cat ${CHECK_CACHE_FILE} | grep "Detected error files" | awk '{print $4}' | tail -n -1)
+
+    if [[ -n "$error_files" && "$error_files" != "0" ]]; then
+        echo "check cache failed, there are $error_files error files"
+        return 1
+    fi
+    
+    error_directories=$(cat ${CHECK_CACHE_FILE} | grep "Detected error directories" | awk '{print $4}' | tail -n -1)
+    
+    if [[ -n "$error_directories" && "$error_directories" != "0" ]]; then
+        echo "check cache failed, there are $error_directories error directories"
+        return 1
+    fi
+    
+    # clean up
+    rm_test_file
+}
+
+function test_reopen_log_with_sighup {
+    describe "Testing reopen log ..."
+ 
+    rm -rf "${LOGFILE}"
+    
+    # [NOTE]
+    # this signal will trigger reopen log.
+    # it will touch a new log file if old log file is deleted.
+    kill -SIGHUP "${OSSFS_PID}"
+ 
+    sleep 1
+ 
+    if [ ! -e "${LOGFILE}" ]; then 
+        echo "reopen log failed"
+        return 1
+    fi
+ }
+ 
+function test_change_log_level_with_sigusr2 {
+    describe "Testing change log level ..."
+ 
+    # [NOTE]
+    # The log level can be changed by sending a SIGUSR2 signal to the ossfs process.
+    # The log level changes through the following sequence:
+    # DBG -> CRT -> ERR -> WAN -> INF -> DBG
+    # The current log level is DBG, and we need to cycle through the levels to return to DBG.
+    # Therefore, 5 signals are sent to complete one full cycle.
+    #
+    kill -SIGUSR2 "${OSSFS_PID}"
+    kill -SIGUSR2 "${OSSFS_PID}"
+    kill -SIGUSR2 "${OSSFS_PID}"
+    kill -SIGUSR2 "${OSSFS_PID}"
+    kill -SIGUSR2 "${OSSFS_PID}"
+ 
+    # Capture the log file content.
+    cat "${LOGFILE}"
+ 
+    # Verify that the log level has changed from INF back to DBG.
+    if grep -q "change debug level" "${LOGFILE}"; then
+        echo "Log level change successful."
+    else
+        echo "change log level failed"
+        return 1
+    fi
+}
+
+function test_add_head {
+    describe "Testing add_head ..."
+
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}.bz2"
+
+    touch "${TEST_TEXT_FILE}.bz2"
+
+    if ! aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME}" | grep -q "bzip2"; then
+        echo "The Content-Encoding of ${OBJECT_NAME} is not bzip2, add head failed"
+        return 1
+    fi
+    
+    rm -f "${TEST_TEXT_FILE}.bz2"
+}
+
+function test_statvfs {
+    describe "Testing the free/available size on mount point(statvfs)..."
+ 
+    # [NOTE]
+    # The df command result format is different between Linux and macos,
+    # but the order of Total/Used/Available size is the same.
+    #
+    local MOUNTPOINT_DIR; MOUNTPOINT_DIR=$(cd ..; pwd)
+    local DF_RESULT;  DF_RESULT=$(df "${MOUNTPOINT_DIR}" 2>/dev/null | tail -n +2)
+    local TOTAL_SIZE; TOTAL_SIZE=$(echo "${DF_RESULT}" | awk '{print $2}')
+    local USED_SIZE;  USED_SIZE=$(echo "${DF_RESULT}" | awk '{print $3}')
+    local AVAIL_SIZE; AVAIL_SIZE=$(echo "${DF_RESULT}" | awk '{print $4}')
+ 
+    df -h > /dev/null
+    if [ -z "${TOTAL_SIZE}" ] || [ -z "${AVAIL_SIZE}" ] || [ -z "${USED_SIZE}" ] || [ "${TOTAL_SIZE}" = "0" ] || [ "${AVAIL_SIZE}" = "0" ] || [ "${TOTAL_SIZE}" != "${AVAIL_SIZE}" ] || [ "${USED_SIZE}" != "0" ]; then
+        echo "The result of df <mount point> command is wrong: Total=${TOTAL_SIZE}, Used=${USED_SIZE}, Available=${AVAIL_SIZE}"
+        return 1
+    fi
+}
+
 function add_all_tests {
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
@@ -2604,6 +2861,7 @@ function add_all_tests {
     add_tests test_redirects
     add_tests test_mkdir_rmdir
     add_tests test_list
+    add_tests test_list_more
     add_tests test_remove_nonempty_directory
     add_tests test_external_directory_creation
     add_tests test_external_modification
@@ -2613,6 +2871,7 @@ function add_all_tests {
     add_tests test_update_metadata_external_small_object
     add_tests test_update_metadata_external_large_object
     add_tests test_rename_before_close
+    add_tests test_rename_large_file
     add_tests test_multipart_upload
     add_tests test_multipart_copy
     add_tests test_multipart_mix
@@ -2620,6 +2879,7 @@ function add_all_tests {
     add_tests test_special_characters
     add_tests test_hardlink
     add_tests test_symlink
+    add_tests test_mknod
     add_tests test_update_chmod_opened_file
 
     add_tests test_rm_rf_dir
@@ -2638,6 +2898,12 @@ function add_all_tests {
     add_tests test_write_multiple_offsets
     add_tests test_write_multiple_offsets_backwards
     add_tests test_content_type
+
+    if ps u -p "${OSSFS_PID}" | grep -q max_stat_cache_size; then
+        add_tests test_truncate_cache
+        add_tests test_truncate_symlink_cache
+    fi
+    
     add_tests test_truncate_cache
     add_tests test_upload_sparsefile
     add_tests test_mix_upload_entities
@@ -2664,6 +2930,7 @@ function add_all_tests {
         add_tests test_chmod
         add_tests test_chown
         add_tests test_extended_attributes
+        add_tests test_all_extended_attributes
         add_tests test_mtime_file
 
         add_tests test_update_time_chmod
@@ -2709,6 +2976,18 @@ function add_all_tests {
     if ps u -p "${OSSFS_PID}" | grep -q direct_read_local_file_cache_size_mb; then
         add_tests test_mix_direct_read
     fi
+    
+    if ps u -p "${OSSFS_PID}" | grep -q set_check_cache_sigusr1; then
+        add_tests test_check_cache_sigusr1
+    fi
+
+    if ps u -p "${OSSFS_PID}" | grep -q logfile; then
+        add_tests test_reopen_log_with_sighup
+        add_tests test_change_log_level_with_sigusr2
+    fi
+
+    add_tests test_add_head
+    add_tests test_statvfs
 }
 
 init_suite

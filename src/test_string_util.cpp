@@ -150,6 +150,102 @@ void test_wtf8_encoding()
     ASSERT_EQUALS(s3fs_wtf8_decode(s3fs_wtf8_encode(mixed)), mixed);
 }
 
+void test_get_keyword_value() {
+    std::string value;
+
+    // Normal case: Keyword exists and has a value
+    ASSERT_TRUE(get_keyword_value("http://example.com?keyword=value&other=param", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "value");
+
+    // Multiple parameters: Keyword exists among other parameters
+    ASSERT_TRUE(get_keyword_value("http://example.com?keyword=value&other=param&another=param2", "other", value));
+    ASSERT_STREQUALS(value.c_str(), "param");
+
+    // Keyword at the end: Keyword is the last parameter in the URL
+    ASSERT_TRUE(get_keyword_value("http://example.com?other=param&another=param2&keyword=value", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "value");
+
+    // Single parameter: URL contains only one parameter
+    ASSERT_TRUE(get_keyword_value("http://example.com?keyword=value", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "value");
+
+    // Keyword does not exist: URL does not contain the specified keyword
+    ASSERT_FALSE(get_keyword_value("http://example.com?other=param", "keyword", value));
+
+    // No equal sign after keyword: Keyword is not followed by an equal sign
+    ASSERT_FALSE(get_keyword_value("http://example.com?keywordvalue&other=param", "keyword", value));
+
+    // Empty keyword: Keyword is an empty string
+    ASSERT_FALSE(get_keyword_value("http://example.com?=value&other=param", "", value));
+
+    // Null keyword: Keyword is NULL
+    ASSERT_FALSE(get_keyword_value("http://example.com?keyword=value&other=param", nullptr, value));
+
+    // Empty URL: URL is an empty string
+    ASSERT_FALSE(get_keyword_value("", "keyword", value));
+
+    // Null URL: URL is NULL (empty string in this case)
+    ASSERT_FALSE(get_keyword_value("", nullptr, value));
+
+    // No parameters: URL does not contain any parameters
+    ASSERT_FALSE(get_keyword_value("http://example.com", "keyword", value));
+
+    // No equal sign: Keyword is not followed by an equal sign
+    ASSERT_FALSE(get_keyword_value("http://example.com?keyword", "keyword", value));
+
+    // No value: Keyword is followed by an equal sign but no value
+    ASSERT_TRUE(get_keyword_value("http://example.com?keyword=&other=param", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "");
+
+    // Keyword at the beginning: Keyword is the first parameter in the URL
+    ASSERT_TRUE(get_keyword_value("keyword=value&other=param", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "value");
+
+    // Keyword in the middle: Keyword is in the middle of the URL
+    ASSERT_TRUE(get_keyword_value("other=param&keyword=value&another=param2", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "value");
+
+    // Keyword at the end: Keyword is the last parameter in the URL
+    ASSERT_TRUE(get_keyword_value("other=param&another=param2&keyword=value", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "value");
+
+    // Multiple same keywords: URL contains multiple occurrences of the same keyword
+    ASSERT_TRUE(get_keyword_value("http://example.com?keyword=value1&keyword=value2&other=param", "keyword", value));
+    ASSERT_STREQUALS(value.c_str(), "value1");
+}
+
+void test_get_unixtime_from_iso8601() {
+    time_t unixtime;
+
+    // Normal case: Valid ISO8601 date string
+    ASSERT_TRUE(get_unixtime_from_iso8601("2023-10-11T12:34:56", unixtime));
+    ASSERT_EQUALS(unixtime, 1697027696); // Expected Unix timestamp for 2023-10-11T12:34:56
+
+    // Different valid ISO8601 date string
+    ASSERT_TRUE(get_unixtime_from_iso8601("2024-11-12T01:02:03", unixtime));
+    ASSERT_EQUALS(unixtime, 1731373323); // Expected Unix timestamp for 2024-11-12T01:02:03
+
+    // Date string with zero time
+    ASSERT_TRUE(get_unixtime_from_iso8601("2023-10-11T00:00:00", unixtime));
+    ASSERT_EQUALS(unixtime, 1696982400); // Expected Unix timestamp for 2023-10-11T00:00:00
+}
+
+void test_convert_unixtime_from_option_arg() {
+    time_t unixtime;
+
+    // Normal case: Valid input with all units
+    ASSERT_TRUE(convert_unixtime_from_option_arg("1Y2M3D4h5m6s", unixtime));
+    ASSERT_EQUALS(unixtime, 36993906);
+
+    // Only years
+    ASSERT_TRUE(convert_unixtime_from_option_arg("1Y", unixtime));
+    ASSERT_EQUALS(unixtime, 31536000);
+
+    // Mixed units
+    ASSERT_TRUE(convert_unixtime_from_option_arg("1Y2D4h", unixtime));
+    ASSERT_EQUALS(unixtime, 31723200);
+}
+
 int main(int argc, char *argv[])
 {
     S3fsLog singletonLog;
@@ -158,7 +254,9 @@ int main(int argc, char *argv[])
     test_base64();
     test_strtoofft();
     test_wtf8_encoding();
-
+    test_get_keyword_value();
+    test_get_unixtime_from_iso8601();
+    test_convert_unixtime_from_option_arg();
     return 0;
 }
 
