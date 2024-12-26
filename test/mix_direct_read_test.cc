@@ -66,12 +66,12 @@ void read_from_oss_and_write_to_disk_rand(const char* read_path,
 
     for (int i = 0; i < read_order_in_the_unit_of_100MB.size(); ++i) {
         int index = read_order_in_the_unit_of_100MB[i];
-        sub_total_size = std::min(100 * MB, total_size - index * 100 * MB);
+        sub_total_size = std::min<size_t>(100 * MB, total_size - index * 100 * MB);
         off_t start_offset = index * 100 * MB;
         std::cout << "random read, start from " << index*100 << "MB, sub_total_size: " << sub_total_size << std::endl;
         offset = 0;
         while (offset < sub_total_size) {
-            size_t buf_size = std::min(MB, sub_total_size - offset);
+            size_t buf_size = std::min<size_t>(MB, sub_total_size - offset);
             bytesread = pread(fd, buf, buf_size, start_offset+offset);
             byteswritten = pwrite(wfd, buf, bytesread, start_offset+offset);
             offset += byteswritten;
