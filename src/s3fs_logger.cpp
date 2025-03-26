@@ -272,7 +272,7 @@ void s3fs_low_logprn(S3fsLog::s3fs_log_level level, const char* file, const char
 
         if(foreground || S3fsLog::IsSetLogFile()){
             S3fsLog::SeekEnd();
-            fprintf(S3fsLog::GetOutputLogFile(), "%s%s%s:%s(%d): %s\n", S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(level), file, func, line, message);
+            fprintf(S3fsLog::GetOutputLogFile(), "%s%s%s%s:%s(%d): %s\n", instance_name.c_str(), S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(level), file, func, line, message);
             S3fsLog::Flush();
         }else{
             // TODO: why does this differ from s3fs_low_logprn2?
@@ -298,7 +298,7 @@ void s3fs_low_logprn2(S3fsLog::s3fs_log_level level, int nest, const char* file,
 
         if(foreground || S3fsLog::IsSetLogFile()){
             S3fsLog::SeekEnd();
-            fprintf(S3fsLog::GetOutputLogFile(), "%s%s%s%s:%s(%d): %s\n", S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(level), S3fsLog::GetS3fsLogNest(nest), file, func, line, message);
+            fprintf(S3fsLog::GetOutputLogFile(), "%s%s%s%s%s:%s(%d): %s\n", instance_name.c_str(), S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(level), S3fsLog::GetS3fsLogNest(nest), file, func, line, message);
             S3fsLog::Flush();
         }else{
             syslog(S3fsLog::GetSyslogLevel(level), "%s%s%s", instance_name.c_str(), S3fsLog::GetS3fsLogNest(nest), message);

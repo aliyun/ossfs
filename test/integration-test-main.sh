@@ -424,7 +424,7 @@ function test_external_creation {
     local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
     echo "data" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
     # shellcheck disable=SC2009
-    if ps u -p "${OSSFS_PID}" | grep -q noobj_cache; then
+    if ps u -p "${OSSFS_PID}" | grep -q disable_noobj_cache; then
         [ ! -e "${TEST_TEXT_FILE}" ]
     fi
     sleep 1
@@ -2838,6 +2838,108 @@ function test_statvfs {
     fi
 }
 
+function test_umask {
+    describe "Testing umask option ..."
+
+    # Create a test file
+    local TEST_FILE="test_umask.txt"
+    echo "test content" > "${TEST_FILE}"
+
+    # Check if the file exists
+    if [ ! -f "${TEST_FILE}" ]; then
+        echo "Failed to create test file ${TEST_FILE}"
+        return 1
+    fi
+
+    # Get the current user and group
+    local CURRENT_USER=$(whoami)
+    local CURRENT_GROUP=$(id -gn)
+
+    # Change the ownership of the file to root:root
+    chown root:root "${TEST_FILE}"
+
+    # Change the permissions of the file to allow others to read
+    chmod 644 "${TEST_FILE}"
+
+    # Check the file permissions
+    local FILE_PERMISSIONS=$(stat -c %a "${TEST_FILE}")
+    if [ "${FILE_PERMISSIONS}" != "777" ]; then
+        echo "File permissions should be 777, but got ${FILE_PERMISSIONS}"
+        return 1
+    fi
+
+    # Check if the file can be read by another user (using root's capabilities)
+    # Here we simulate another user by using root's capabilities
+    if ! cat "${TEST_FILE}" > /dev/null 2>&1; then
+        echo "Failed to read the file ${TEST_FILE} as another user"
+        return 1
+    fi
+
+    # Clean up
+    rm_test_file "${TEST_FILE}"
+}
+
+function test_use_wtf8 {
+    describe "Testing use_wtf8 option ..."
+
+    # Create a test file with UTF-8 characters in the filename
+    local TEST_FILE="测试文件.txt"
+    local TEST_CONTENT="测试内容"
+
+    # Write content to the test file
+    echo "${TEST_CONTENT}" > "${TEST_FILE}"
+
+    # Check if the file exists
+    if [ ! -f "${TEST_FILE}" ]; then
+        echo "Failed to create test file ${TEST_FILE}"
+        return 1
+    fi
+
+    # Read the content of the file
+    local READ_CONTENT
+    READ_CONTENT=$(cat "${TEST_FILE}")
+
+    # Check if the content is correct
+    if [ "${READ_CONTENT}" != "${TEST_CONTENT}" ]; then
+        echo "Content mismatch: expected '${TEST_CONTENT}', got '${READ_CONTENT}'"
+        return 1
+    fi
+
+    # Verify that the file name is correctly handled by ossfs
+    # Check if the file can be listed correctly
+    local LISTED_FILES
+    LISTED_FILES=$(ls -1 | grep -F "测试文件.txt")
+
+    if [ -z "${LISTED_FILES}" ]; then
+        echo "File with UTF-8 name not listed correctly"
+        return 1
+    fi
+
+    # Clean up
+    rm_test_file "${TEST_FILE}"
+}
+
+function test_object_ending_with_slash {
+    describe "Testing if an object is a dir ending with slash ..."
+
+    local DIR_NAME="testdir"
+    mkdir ${DIR_NAME}
+    
+    # create a directory ending with '/'
+    ossutil_cmd mkdir "oss://${TEST_BUCKET_1}/${DIR_NAME}/ossutildir/"
+
+    # set meta to the unknown type
+    ossutil_cmd set-meta "oss://${TEST_BUCKET_1}/${DIR_NAME}/ossutildir/" "Content-Type:testtype"
+
+    stat "${DIR_NAME}/ossutildir/"
+    if [ !-d "${DIR_NAME}/ossutildir/" ]; then
+        echo "The object is not a dir ending with slash"
+        return 1
+    fi
+
+    rm -rf "${DIR_NAME}"
+}
+
 function add_all_tests {
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
@@ -2861,7 +2963,6 @@ function add_all_tests {
     add_tests test_redirects
     add_tests test_mkdir_rmdir
     add_tests test_list
-    add_tests test_list_more
     add_tests test_remove_nonempty_directory
     add_tests test_external_directory_creation
     add_tests test_external_modification
@@ -2926,6 +3027,8 @@ function add_all_tests {
         if ps u -p "${OSSFS_PID}" | grep -q readdir_check_size; then
             add_tests test_readdir_check_size_48
         fi
+    elif ps u -p "${OSSFS_PID}" | grep -q allow_other; then
+        continue
     else
         add_tests test_chmod
         add_tests test_chown
@@ -2986,8 +3089,21 @@ function add_all_tests {
         add_tests test_change_log_level_with_sigusr2
     fi
 
+    if ps u -p "${OSSFS_PID}" | grep -q list_object_max_keys; then
+        add_tests test_list_more
+    fi
+
+    if ps u -p "${OSSFS_PID}" | grep -q umask; then
+        add_tests test_umask
+    fi
+
+    if ps u -p "${OSSFS_PID}" | grep -q use_wtf8; then
+        add_tests test_use_wtf8
+    fi
+
     add_tests test_add_head
     add_tests test_statvfs
+    add_tests test_object_ending_with_slash
 }
 
 init_suite

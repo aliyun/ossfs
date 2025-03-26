@@ -199,24 +199,12 @@ mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir
                             // Nextcloud uses this MIME type for directory objects when mounting bucket as external Storage
                             mode |= S_IFDIR;
                         }else if(!strpath.empty() && '/' == *strpath.rbegin()){
-                            if(strConType == "binary/octet-stream" || strConType == "application/octet-stream"){
+                            // If complement lack stat mode, when the object has '/' character at end of name
+                            // it should be directory. This follows ossfs's behavior.
+                            if(complement_stat || strConType == "binary/octet-stream" || strConType == "application/octet-stream"){
                                 mode |= S_IFDIR;
                             }else{
-                                if(complement_stat){
-                                    // If complement lack stat mode, when the object has '/' character at end of name
-                                    // and content type is text/plain and the object's size is 0 or 1, it should be
-                                    // directory.
-                                    off_t size = get_size(meta);
-                                    if(strConType == "text/plain" && (0 == size || 1 == size)){
-                                        mode |= S_IFDIR;
-                                    }else{
-                                        S3FS_PRN_DBG("Type Conflict[path=%s][content-type=%s][size=%ld]", strpath.c_str(), strConType.c_str(), size);
-                                        mode |= S_IFREG;
-                                    }
-                                }else{
-                                    S3FS_PRN_DBG("Type Conflict[path=%s][content-type=%s]", strpath.c_str(), strConType.c_str());
-                                    mode |= S_IFREG;
-                                }
+                                mode |= S_IFREG;
                             }
                         }else{
                             mode |= S_IFREG;

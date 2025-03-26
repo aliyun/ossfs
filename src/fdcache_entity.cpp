@@ -1420,6 +1420,14 @@ int FdEntity::RowFlush(int fd, const char* tpath, bool force_sync)
         result = RowFlushMultipart(pseudo_obj, tpath);
     }
 
+    // [NOTE]
+    // if something went wrong, so if you are using a cache file,
+    // the cache file may not be correct. So delete cache files.
+    //
+    if(0 != result && !cachepath.empty()){
+        FdManager::DeleteCacheFile(tpath);
+    }
+
     return result;
 }
 

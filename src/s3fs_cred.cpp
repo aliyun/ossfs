@@ -57,9 +57,8 @@ const char* VersionS3fsCredential(bool detail)
     "ossfs built-in Credential I/F Function\n"
     "Copyright(C) 2010 ossfs\n";
 
-    S3FS_PRN_CRIT("Check why built-in function was called, the external credential library must have VersionS3fsCredential function.");
-
     if(detail){
+        S3FS_PRN_CRIT("Check why built-in function was called, the external credential library must have VersionS3fsCredential function.");
         return detail_version;
     }else{
         return version;
@@ -500,7 +499,7 @@ bool S3fsCred::CheckPasswdFilePerms()
 
     // let's get the file info
     if(stat(passwd_file.c_str(), &info) != 0){
-        S3FS_PRN_EXIT("unexpected error from stat(%s).", passwd_file.c_str());
+        S3FS_PRN_EXIT("unexpected error from stat(%s): %s", passwd_file.c_str(), strerror(errno));
         return false;
     }
 

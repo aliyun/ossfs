@@ -81,6 +81,7 @@ src/ossfs
 src/test_curl_util
 src/test_page_list
 src/test_string_util
+src/test_mempool
 test/chaos-http-proxy-*
 test/junk_data
 test/s3proxy-*

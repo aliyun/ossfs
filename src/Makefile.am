@@ -58,7 +58,8 @@ ossfs_SOURCES = \
     autolock.cpp \
     common_auth.cpp \
     threadpoolman.cpp \
-    direct_reader.cpp
+    direct_reader.cpp \
+    memorypool.cpp
 if USE_SSL_OPENSSL
     ossfs_SOURCES += openssl_auth.cpp
 endif
@@ -74,7 +75,8 @@ ossfs_LDADD = $(DEPS_LIBS)
 noinst_PROGRAMS = \
     test_curl_util \
     test_page_list \
-    test_string_util
+    test_string_util \ 
+    test_mempool
 
 test_curl_util_SOURCES = common_auth.cpp curl_util.cpp string_util.cpp test_curl_util.cpp s3fs_global.cpp s3fs_logger.cpp
 if USE_SSL_OPENSSL
@@ -98,10 +100,15 @@ test_page_list_SOURCES = \
 
 test_string_util_SOURCES = string_util.cpp test_string_util.cpp s3fs_logger.cpp
 
+test_mempool_SOURCES = memorypool.cpp test_mempool.cpp s3fs_logger.cpp s3fs_global.cpp string_util.cpp
+test_mempool_LDFLAGS = -pthread
+test_mempool_LDADD = $(DEPS_LIBS)
+
 TESTS = \
     test_curl_util \
     test_page_list \
-    test_string_util
+    test_string_util \
+    test_mempool
 
 clang-tidy:
 	clang-tidy $(ossfs_SOURCES) -- $(DEPS_CFLAGS) $(CPPFLAGS)

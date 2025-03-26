@@ -529,6 +529,8 @@ FdManager::~FdManager()
     }
 }
 
+// newfd is always false currently
+// existfd == -1: called by HasOpenEntityFd()
 FdEntity* FdManager::GetFdEntity(const char* path, int& existfd, bool newfd, bool lock_already_held)
 {
     S3FS_PRN_INFO3("[path=%s][pseudo_fd=%d]", SAFESTRPTR(path), existfd);
@@ -556,31 +558,32 @@ FdEntity* FdManager::GetFdEntity(const char* path, int& existfd, bool newfd, boo
     }
 
     if(-1 != existfd){
+        // Path is only changed in Rename() which is protected by fd_manager_lock.
+        // So there are no chance that the path does not correspond with the pseudo_fd.
         for(iter = fent.begin(); iter != fent.end(); ++iter){
-            if(iter->second && iter->second->FindPseudoFd(existfd)){
+            if(iter->second && 
+              strcmp(iter->second->GetPath(), path) == 0 &&
+               iter->second->FindPseudoFd(existfd)){
                 // found opened fd in map
-                if(0 == strcmp(iter->second->GetPath(), path)){
-                    if(newfd){
-                        existfd = iter->second->Dup(existfd);
-                    }
-                    return iter->second;
+                if(newfd){
+                    existfd = iter->second->Dup(existfd);
                 }
-                // found fd, but it is used another file(file descriptor is recycled)
-                // so returns NULL.
-                break;
-            }
-        }
-    }
-
-    // If the cache directory is not specified, ossfsopens a temporary file
-    // when the file is opened.
-    if(!FdManager::IsCacheDir()){
-        for(iter = fent.begin(); iter != fent.end(); ++iter){
-            if(iter->second && iter->second->IsOpen() && 0 == strcmp(iter->second->GetPath(), path)){
                 return iter->second;
             }
         }
+    } else { // -1 == existfd, means this func is called by HasOpenEntityFd()
+      // If the cache directory is not specified, ossfsopens a temporary file
+      // when the file is opened.
+      if(!FdManager::IsCacheDir()){
+        // Fdentity cannot be found using path as key above, traverse the map to look for it.
+        for(iter = fent.begin(); iter != fent.end(); ++iter){
+          if(iter->second && iter->second->IsOpen() && 0 == strcmp(iter->second->GetPath(), path)){
+            return iter->second;
+          }
+        }
+      }
     }
+
     return NULL;
 }
 
@@ -685,9 +688,15 @@ FdEntity* FdManager::GetExistFdEntity(const char* path, int existfd)
 
     UpdateEntityToTempPath();
 
-    // search from all entity.
+    // no matter use_cache is enabled or not, search from all entities to 
+    // find the entity with the same path. And then compare the pseudo fd.
     for(fdent_map_t::iterator iter = fent.begin(); iter != fent.end(); ++iter){
-        if(iter->second && iter->second->FindPseudoFd(existfd)){
+        // path is protected by fd_manager_lock (in RenamePath), therefore there 
+        // is no need to hold entity lock inside it (FindPseudoFd holds 
+        // lock inside).
+        if(iter->second &&
+           strcmp(iter->second->GetPath(), path) == 0 &&
+           iter->second->FindPseudoFd(existfd)) {
             // found existfd in entity
             return iter->second;
         }

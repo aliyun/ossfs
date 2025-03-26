@@ -1,5 +1,17 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.6 (17/03/2025)
+ - Print information to suggest users to mount with OSS V4 signature.
+ - Optimized the prefetch-task generation logic under direct-read mode to better performance.
+ - Improved concurrent IO performance.
+ - Modify the folder size in the mount point to 4096.
+ - Fixed a bug that in use_cache mode, when the ram user does not have bucket write permission, the cache file is overwritten incorrectly, resulting in data read errors.
+ - Optimized the printing of error information when specifying an incorrect passwd-file.
+ - Optimized the printing of log information when instance_name is specified.
+ - Enable noobj_cache by default.
+ - Force objects ending with '/' to be recognized as folders.
+ - Optimized memory usage in direct reading mode.
+
 ## v1.91.5 (25/12/2024)
  - Fixed some bugs that users get unexpected results on mounting with specific policies for the bucket/prefix set.
  - Fixed a bug that ossfs take a file as existing if HeadObj returns 403.

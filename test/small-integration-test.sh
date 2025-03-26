@@ -52,7 +52,7 @@ if [ -n "${ALL_TESTS}" ]; then
     FLAGS=(
         "use_cache=${CACHE_DIR} -o ensure_diskfree=${ENSURE_DISKFREE_SIZE} -o fake_diskfree=${FAKE_FREE_DISK_SIZE} -o del_cache"
         enable_content_md5
-        enable_noobj_cache
+        disable_noobj_cache
         "max_stat_cache_size=100 -o stat_cache_expire=-1"
         nocopyapi
         nomultipart
@@ -67,7 +67,8 @@ if [ -n "${ALL_TESTS}" ]; then
         "use_xattr=0 -o readdir_optimize"
         "use_xattr=0 -o readdir_optimize -o listobjectsv2 -ouse_sse=kms"
         "use_xattr=0 -o readdir_optimize -o readdir_check_size=48 -o symlink_in_meta"
-        "use_cache=${CACHE_DIR} -o direct_read -o direct_read_backward_chunks=${BACKWARD_CHUNKS}"
+        "use_cache=${CACHE_DIR} -o direct_read -o direct_read_backward_chunks=${BACKWARD_CHUNKS} -o direct_read_prefetch_thread=64
+        -o direct_read_chunk_size=4 -o direct_read_prefetch_chunks=32 -o direct_read_prefetch_limit=1024"
         "fake_diskfree=${FAKE_FREE_DISK_SIZE} -oparallel_count=10 -omultipart_size=10"
         "default_acl=private"
         "direct_read -o direct_read_local_file_cache_size_mb=${DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB}"
@@ -76,6 +77,9 @@ if [ -n "${ALL_TESTS}" ]; then
         "use_cache=${CACHE_DIR} -o del_cache -o set_check_cache_sigusr1=${CHECK_CACHE_FILE} -o logfile=${LOGFILE} -o check_cache_dir_exist"
         "max_dirty_data=50"
         "use_cache=${CACHE_DIR} -o free_space_ratio=1 -o del_cache"
+        "public_bucket=0 -o no_check_certificate -o connect_timeout=300 -o readwrite_timeout=120 -o list_object_max_keys=1000"
+        "use_wtf8 -o curldbg -o use_xattr -o ensure_diskfree=1"
+        "allow_other -o uid=0 -o gid=0 -o mp_umask=000 -o umask=000"
     )
 else
     FLAGS=(

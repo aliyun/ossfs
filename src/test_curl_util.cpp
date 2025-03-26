@@ -23,6 +23,7 @@
 
 #include "curl_util.h"
 #include "test_util.h"
+#include "common.h"
 
 //---------------------------------------------------------
 // S3fsCred Stub
@@ -42,6 +43,7 @@ class S3fsCred
         static std::string  bucket_name;
     public:
         static const std::string& GetBucket();
+        static bool SetBucket(const std::string& bucket);
 };
 
 std::string  S3fsCred::bucket_name;
@@ -49,6 +51,12 @@ std::string  S3fsCred::bucket_name;
 const std::string& S3fsCred::GetBucket()
 {
 	return S3fsCred::bucket_name;
+}
+
+bool S3fsCred::SetBucket(const std::string& bucket)
+{
+    S3fsCred::bucket_name = bucket;
+    return true;
 }
 //---------------------------------------------------------
 
@@ -84,6 +92,9 @@ void test_sort_insert()
 {
     struct curl_slist* list = NULL;
     ASSERT_IS_SORTED(list);
+    // add NULL key
+    list = curl_slist_sort_insert(list, NULL, "val");
+    ASSERT_IS_SORTED(list);
     // add to head
     list = curl_slist_sort_insert(list, "2", "val");
     ASSERT_IS_SORTED(list);
@@ -110,6 +121,7 @@ void test_slist_remove()
     struct curl_slist* list = NULL;
 
     // remove no elements
+    list = curl_slist_remove(list, NULL);
     ASSERT_EQUALS(static_cast<size_t>(0), curl_slist_length(list));
     list = curl_slist_remove(list, "1");
     ASSERT_EQUALS(static_cast<size_t>(0), curl_slist_length(list));
@@ -202,12 +214,81 @@ void test_make_md5_from_binary() {
     ASSERT_FALSE(make_md5_from_binary(empty_string, 1, md5));
 }
 
+void test_get_sorted_header_keys() {
+    struct curl_slist* list = NULL;
+    list = curl_slist_sort_insert(list, "Content-Type", "application/json");
+    list = curl_slist_sort_insert(list, "Authorization", "Bearer token");
+    list = curl_slist_sort_insert(list, "Date", "Wed, 21 Oct 2015 07:28:00 GMT");
+
+    std::string sorted_keys = get_sorted_header_keys(list);
+    ASSERT_STREQUALS("authorization;content-type;date", sorted_keys.c_str());
+
+    curl_slist_free_all(list);
+}
+
+void test_get_canonical_headers() {
+    struct curl_slist* list = NULL;
+    std::string canonical_headers = get_canonical_headers(list);
+    ASSERT_STREQUALS("\n", canonical_headers.c_str());
+
+    canonical_headers = get_canonical_headers(list, true);
+    ASSERT_STREQUALS("\n", canonical_headers.c_str());
+
+    list = curl_slist_sort_insert(list, "Content-Type", "application/json");
+    list = curl_slist_sort_insert(list, "Authorization", "Bearer token");
+    list = curl_slist_sort_insert(list, "Date", "Wed, 19 Feb 2025 07:28:00 GMT");
+
+    canonical_headers = get_canonical_headers(list);
+    ASSERT_STREQUALS("authorization:Bearer token\ncontent-type:application/json\ndate:Wed, 19 Feb 2025 07:28:00 GMT\n", canonical_headers.c_str());
+
+    canonical_headers = get_canonical_headers(list, false);
+    ASSERT_STREQUALS("authorization:Bearer token\ncontent-type:application/json\ndate:Wed, 19 Feb 2025 07:28:00 GMT\n", canonical_headers.c_str());
+
+    canonical_headers = get_canonical_headers(list, true);
+    ASSERT_STREQUALS("", canonical_headers.c_str());
+
+    curl_slist_free_all(list);
+}
+
+void test_url_to_host() {
+    std::string url1 = "http://example.com/path/to/resource";
+    std::string host1 = url_to_host(url1);
+    ASSERT_STREQUALS("example.com", host1.c_str());
+
+    std::string url2 = "https://subdomain.example.com/path/to/resource";
+    std::string host2 = url_to_host(url2);
+    ASSERT_STREQUALS("subdomain.example.com", host2.c_str());
+
+    std::string url3 = "http://example.com";
+    std::string host3 = url_to_host(url3);
+    ASSERT_STREQUALS("example.com", host3.c_str());
+}
+
+void test_get_bucket_host() {
+    // Assuming pathrequeststyle is false
+    pathrequeststyle = false;
+    s3host = "http://oss-cn-hangzhou.aliyuncs.com";
+
+    S3fsCred::SetBucket("mybucket");
+    std::string bucket_host = get_bucket_host();
+    ASSERT_STREQUALS("mybucket.oss-cn-hangzhou.aliyuncs.com", bucket_host.c_str());
+
+    // Assuming pathrequeststyle is true
+    pathrequeststyle = true;
+    bucket_host = get_bucket_host();
+    ASSERT_STREQUALS("oss-cn-hangzhou.aliyuncs.com", bucket_host.c_str());
+}
+
 int main(int argc, char *argv[])
 {
     test_sort_insert();
     test_slist_remove();
     test_curl_slist_sort_insert();
     test_make_md5_from_binary();
+    test_get_sorted_header_keys();
+    test_get_canonical_headers();
+    test_url_to_host();
+    test_get_bucket_host();
     return 0;
 }
 
