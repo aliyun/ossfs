@@ -256,12 +256,8 @@ class S3fsCurl
         bool ResetHandle(bool lock_already_held = false);
         bool RemakeHandle();
         bool ClearInternalData();
-        void insertV4Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token);
-        void insertV2Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token);
         void insertIBMIAMHeaders(const std::string& access_key_id, const std::string& access_token);
         void insertAuthHeaders();
-        std::string CalcSignatureV2(const std::string& method, const std::string& strMD5, const std::string& content_type, const std::string& date, const std::string& resource, const std::string& secret_access_key, const std::string& access_token);
-        std::string CalcSignature(const std::string& method, const std::string& canonical_uri, const std::string& query_string, const std::string& strdate, const std::string& payload_hash, const std::string& date8601, const std::string& secret_access_key, const std::string& access_token);
         int UploadMultipartPostSetup(const char* tpath, int part_num, const std::string& upload_id);
         int CopyMultipartPostSetup(const char* from, const char* to, int part_num, const std::string& upload_id, headers_t& meta);
         bool UploadMultipartPostComplete();
@@ -307,7 +303,6 @@ class S3fsCurl
         static bool IsSseCType() { return (sse_type_t::SSE_C == S3fsCurl::ssetype); }
         static bool IsSseKmsType() { return (sse_type_t::SSE_KMS == S3fsCurl::ssetype); }
         static bool FinalCheckSse();
-        static bool SetSseCKeys(const char* filepath);
         static bool SetSseKmsid(const char* kmsid);
         static bool IsSetSseKmsId() { return !S3fsCurl::ssekmsid.empty(); }
         static const char* GetSseKmsId() { return S3fsCurl::ssekmsid.c_str(); }

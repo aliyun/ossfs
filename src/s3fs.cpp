@@ -48,6 +48,7 @@
 #include "s3fs_util.h"
 #include "mpu_util.h"
 #include "threadpoolman.h"
+#include "memorypool.h"
 
 //-------------------------------------------------------------------
 // Symbols
@@ -783,6 +784,9 @@ static int s3fs_getattr(const char* _path, struct stat* stbuf)
             if(ent->GetStats(tmpstbuf)){
                 stbuf->st_size = tmpstbuf.st_size;
             }
+        }
+        if(0 == strcmp(path, "/")){
+            stbuf->st_size = 4096;
         }
         stbuf->st_blksize = 4096;
         stbuf->st_blocks  = get_blocks(stbuf->st_size);
@@ -3611,10 +3615,17 @@ static void* s3fs_init(struct fuse_conn_info* conn)
     if((unsigned int)conn->capable & FUSE_CAP_BIG_WRITES){
          conn->want |= FUSE_CAP_BIG_WRITES;
     }
-    
-    if(direct_read && !ThreadPoolMan::Initialize(direct_read_max_prefetch_thread_count)){
-        S3FS_PRN_CRIT("Could not create thread pool(%d)", direct_read_max_prefetch_thread_count);
-        s3fs_exit_fuseloop(EXIT_FAILURE);
+
+    if(direct_read) {
+        if (!ThreadPoolMan::Initialize(direct_read_max_prefetch_thread_count)) {
+            S3FS_PRN_CRIT("Could not create thread pool(%d)", direct_read_max_prefetch_thread_count);
+            s3fs_exit_fuseloop(EXIT_FAILURE);
+        }
+        uint64_t mem_capacity = DirectReader::GetPrefetchCacheLimits() / DirectReader::GetChunkSize();
+        if(!MemoryPool::Initialize(mem_capacity, DirectReader::GetChunkSize())) {
+            S3FS_PRN_CRIT("Could not initialize DirectReader memory pool.");
+            s3fs_exit_fuseloop(EXIT_FAILURE);
+        }
     }
 
     // Signal object
@@ -3635,6 +3646,7 @@ static void s3fs_destroy(void*)
     }
 
     ThreadPoolMan::Destroy();
+    MemoryPool::Destroy();
 
     // cache(remove at last)
     if(is_remove_cache && (!CacheFileStat::DeleteCacheFileStatDirectory() || !FdManager::DeleteCacheDirectory())){
@@ -4316,8 +4328,8 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             StatCache::getStatCacheData()->SetExpireTime(expr_time, true);
             return 0;
         }
-        if(0 == strcmp(arg, "enable_noobj_cache")){
-            StatCache::getStatCacheData()->EnableCacheNoObject();
+        if(0 == strcmp(arg, "disable_noobj_cache")){
+            StatCache::getStatCacheData()->DisableCacheNoObject();
             return 0;
         }
         if(0 == strcmp(arg, "nodnscache")){
@@ -4803,6 +4815,8 @@ int main(int argc, char* argv[])
         delete ps3fscred;
         exit(EXIT_FAILURE);
     }
+
+    printf("[NOTICE] OSS signature V1 service will not be available for new uids since March 1st, 2025. It is recommended to mount with OSS signature V4:\n\t ossfs [oss-bucket] [mount-path] [options] -osigv4 -oregion=[your-region-id]\n");
 
     while((ch = getopt_long(argc, argv, "dho:fsu", long_opts, &option_index)) != -1){
         switch(ch){

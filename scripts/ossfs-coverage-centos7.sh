@@ -37,6 +37,7 @@ DBGLEVEL=debug ALL_TESTS=1 OSSFS_CREDENTIALS_FILE=/root/.passwd-ossfs TEST_BUCKE
 ${OSSFS_SOURCE_DIR}/src/test_page_list 
 ${OSSFS_SOURCE_DIR}/src/test_curl_util
 ${OSSFS_SOURCE_DIR}/src/test_string_util
+${OSSFS_SOURCE_DIR}/src/test_mempool
 
 gcovr -r ${OSSFS_SOURCE_DIR}/src --html-details -o ${OSSFS_SOURCE_DIR}/coverage_html/coverage.html
 

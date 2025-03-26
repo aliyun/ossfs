@@ -32,7 +32,6 @@ static const uint64_t MIN_PREFETCH_CACHE_LIMITS = 128 * 1024 * 1024;
 // Class Chunk
 //-------------------------------------------------------------------
 std::atomic<uint64_t> Chunk::cache_usage = ATOMIC_VAR_INIT(0);
-
 bool Chunk::cache_usage_check() 
 {
     return cache_usage < DirectReader::GetPrefetchCacheLimits();
@@ -94,7 +93,7 @@ bool DirectReader::SetBackwardChunks(int chunk_num) {
 //-------------------------------------------------------------------
 DirectReader::DirectReader(const std::string& path, off_t size) : 
     filepath(path), filesize(size), prefetched_sem(0), instruct_count(0), completed_count(0),
-    is_direct_read_lock_init(false), ongoing_prefetch(0)
+    is_direct_read_lock_init(false)
 {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -258,6 +257,7 @@ void* direct_read_worker(void* arg)
     ssize_t rsize;
 
     Chunk* chunk = new Chunk(start, len); 
+    uint32_t chunk_id = start / DirectReader::GetChunkSize();
     int result = s3fscurl.GetObjectStreamRequest(direct_reader->filepath.c_str(),
                                                  chunk->buf, start, len, rsize);
 
@@ -268,7 +268,7 @@ void* direct_read_worker(void* arg)
 
         if(!is_sync_download) {
             AutoLock lock(&direct_reader->direct_read_lock);
-            direct_reader->ongoing_prefetch--;
+            direct_reader->ongoing_prefetches.erase(chunk_id);
             direct_reader->CompleteInstruction(AutoLock::ALREADY_LOCKED);
         }
 
@@ -278,7 +278,6 @@ void* direct_read_worker(void* arg)
 
     AutoLock lock(&direct_reader->direct_read_lock, is_sync_download ? AutoLock::ALREADY_LOCKED : AutoLock::NONE);
     
-    uint32_t chunk_id = start / DirectReader::GetChunkSize();
     if (!direct_reader->chunks.count(chunk_id)) {
         S3FS_PRN_DBG("add new chunk[pid=%lu][path=%s][chunkid=%d][start=%ld][len=%ld]", pthread_self(), direct_reader->filepath.c_str(), chunk_id, start, len);
         direct_reader->chunks[start/DirectReader::GetChunkSize()] = chunk;
@@ -289,7 +288,7 @@ void* direct_read_worker(void* arg)
     }
 
     if (!is_sync_download) {
-        direct_reader->ongoing_prefetch--;
+        direct_reader->ongoing_prefetches.erase(chunk_id);
         direct_reader->CompleteInstruction(AutoLock::ALREADY_LOCKED);
     }
 

@@ -26,9 +26,11 @@
 #include <map>
 #include <stdint.h>
 #include <atomic>
+#include <set>
 
 #include "threadpoolman.h"
 #include "s3fs_logger.h"
+#include "memorypool.h"
 #include "autolock.h"
 #include "curl.h"
 
@@ -42,19 +44,18 @@ struct Chunk
 
     Chunk(off_t off, off_t size) : offset(off), size(size)    
     {
-        buf = static_cast<char*>(malloc(size));
+        buf = MemoryPool::memoryPool->Allocate();
         memset(buf, 0, size);
         cache_usage += size;
     }
 
     ~Chunk() {
         if (buf) {
-            free(buf);
+            MemoryPool::memoryPool->Deallocate(buf);
             buf = NULL;
             cache_usage -= size;
         }
     }
-    
     static std::atomic<uint64_t> cache_usage;
     static bool cache_usage_check();
 };
@@ -112,7 +113,7 @@ class DirectReader
         // following members used outside (generating prefetch task and releasing chunks)
         pthread_mutex_t             direct_read_lock;
         std::map<uint32_t, Chunk*>  chunks;
-        uint32_t                    ongoing_prefetch;
+        std::set<uint32_t>          ongoing_prefetches;
 };
 
 struct DirectReadParam {

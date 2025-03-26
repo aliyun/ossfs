@@ -149,7 +149,11 @@ bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, s
     }
 
     // size
-    pst->st_size = get_size(meta);
+    if (S_ISDIR(pst->st_mode)) {
+        pst->st_size = 4096;
+    } else {
+        pst->st_size = get_size(meta);
+    }
 
     //change symlink to S_IFREG
     if (noextendedmeta && S_ISLNK(pst->st_mode) && !is_check_meta(pst->st_size, check_size_meta)) {
@@ -217,7 +221,7 @@ pthread_mutex_t StatCache::stat_cache_lock;
 //-------------------------------------------------------------------
 // Constructor/Destructor
 //-------------------------------------------------------------------
-StatCache::StatCache() : IsExpireTime(true), IsExpireIntervalType(false), ExpireTime(15 * 60), CacheSize(100000), IsCacheNoObject(false),
+StatCache::StatCache() : IsExpireTime(true), IsExpireIntervalType(false), ExpireTime(15 * 60), CacheSize(100000), IsCacheNoObject(true),
  IsNoExtendedMeta(false), CheckSizeForMeta(0LL)
 {
     if(this == StatCache::getStatCacheData()){
