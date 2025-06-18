@@ -35,6 +35,8 @@ docker_images = {
     'ubuntu20.04:test':'ossfs-ubuntu20.04:test',
     'ubuntu22.04:dev':'ossfs-ubuntu22.04:dev',
     'ubuntu22.04:test':'ossfs-ubuntu22.04:test',
+    'ubuntu24.04:dev':'ossfs-ubuntu24.04:dev',
+    'ubuntu24.04:test':'ossfs-ubuntu24.04:test',
     'anolisos7.0:dev':'ossfs-anolisos7.0:dev',
     'anolisos7.0:test':'ossfs-anolisos7.0:test',
     'anolisos8.0:dev':'ossfs-anolisos8.0:dev',
@@ -45,7 +47,7 @@ docker_images = {
     'alinux3:test':'ossfs-alinux3:test',
 }
 
-os_list = ['ubuntu14.04', 'ubuntu16.04', 'ubuntu18.04', 'ubuntu20.04', 'ubuntu22.04', 'centos7.0', 'centos8.0', 'alinux2', 'alinux3']
+os_list = ['ubuntu14.04', 'ubuntu16.04', 'ubuntu18.04', 'ubuntu20.04', 'ubuntu22.04', 'ubuntu24.04', 'centos7.0', 'centos8.0', 'alinux2', 'alinux3']
 working_dir = '/tmp/ossfs'
 dest_dir = '/var/ossfs'
 ossfs_source_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -136,7 +138,7 @@ def command_build_package(f, install_dir):
     f.write('cd %s/package\n' % dest_dir)
 
 def command_test_package(f):
-    f.write('version=$(ossfs --version | grep -E -o "V[0-9.]+[^ ]+" | cut -d"V" -f2)\n')
+    f.write('version=$(ossfs --version | grep -E -o "V[0-9]+\.[0-9]+\.[0-9]+" | sed "s/^V//")\n')
     f.write('test "$version" = "%s"\n' % ossfs_version)
 
 def command_build_package_centos65():
@@ -251,8 +253,14 @@ def command_test_package_ubuntu(os_name):
     test_dir = os.path.join(dest_dir, 'source/test')
     f = open(os.path.join(cmd_dir, 'test_package_%s.sh'%os_name), 'w')
     f.write('#!/bin/bash\n')
-    f.write('apt-get update -y\n')
-    f.write('apt-get install gdebi-core -y\n')
+    if os_name == 'ubuntu24.04':
+        f.write('export DEBIAN_FRONTEND=noninteractive\n')
+        f.write('apt-get update -y && apt-get install -y curl apt-utils\n')
+        f.write('curl -L -o /tmp/gdebi.deb https://launchpad.net/ubuntu/+archive/primary/+files/gdebi-core_0.9.5.8_all.deb\n')
+        f.write('apt-get install /tmp/gdebi.deb -y\n')
+    else:
+        f.write('apt-get update -y\n')
+        f.write('apt-get install gdebi-core -y\n')
     f.write('gdebi -n %s/package/%s\n' % (dest_dir,pkg))
     command_test_package(f)
     f.close()
@@ -340,6 +348,11 @@ def build_docker_image():
     exec_cmd('docker pull ubuntu:22.04')
     exec_cmd('docker tag ubuntu:22.04 ossfs-ubuntu22.04:test')
     exec_cmd('docker build -t ossfs-ubuntu22.04:dev %s/scripts/docker-file/ubuntu/22.04'%ossfs_source_dir)
+    
+    #ubuntu:24.04
+    exec_cmd('docker pull ubuntu:24.04')
+    exec_cmd('docker tag ubuntu:24.04 ossfs-ubuntu24.04:test')
+    exec_cmd('docker build -t ossfs-ubuntu24.04:dev %s/scripts/docker-file/ubuntu/24.04'%ossfs_source_dir)
 
     #centos:7.x
     exec_cmd('docker pull centos:centos7')
