@@ -19,22 +19,18 @@ from subprocess import Popen, PIPE
 import shlex, random, string, os, shutil, glob, ntpath, re
 
 docker_images = {
-    'centos6.5:dev':'ossfs-centos6.5:dev',
-    'centos6.5:test':'ossfs-centos6.5:test',
     'centos7.0:dev':'ossfs-centos7.0:dev',
     'centos7.0:test':'ossfs-centos7.0:test',
     'centos8.0:dev':'ossfs-centos8.0:dev',
     'centos8.0:test':'ossfs-centos8.0:test',
-    'ubuntu14.04:dev':'ossfs-ubuntu14.04:dev',
-    'ubuntu14.04:test':'ossfs-ubuntu14.04:test',
-    'ubuntu16.04:dev':'ossfs-ubuntu16.04:dev',
-    'ubuntu16.04:test':'ossfs-ubuntu16.04:test',
     'ubuntu18.04:dev':'ossfs-ubuntu18.04:dev',
     'ubuntu18.04:test':'ossfs-ubuntu18.04:test',
     'ubuntu20.04:dev':'ossfs-ubuntu20.04:dev',
     'ubuntu20.04:test':'ossfs-ubuntu20.04:test',
     'ubuntu22.04:dev':'ossfs-ubuntu22.04:dev',
     'ubuntu22.04:test':'ossfs-ubuntu22.04:test',
+    'ubuntu24.04:dev':'ossfs-ubuntu24.04:dev',
+    'ubuntu24.04:test':'ossfs-ubuntu24.04:test',
     'anolisos7.0:dev':'ossfs-anolisos7.0:dev',
     'anolisos7.0:test':'ossfs-anolisos7.0:test',
     'anolisos8.0:dev':'ossfs-anolisos8.0:dev',
@@ -43,9 +39,11 @@ docker_images = {
     'alinux2:test':'ossfs-alinux2:test',
     'alinux3:dev':'ossfs-alinux3:dev',
     'alinux3:test':'ossfs-alinux3:test',
+    'rockylinux9:dev':'ossfs-rockylinux9:dev',
+    'rockylinux9:test':'ossfs-rockylinux9:test',
 }
 
-os_list = ['ubuntu14.04', 'ubuntu16.04', 'ubuntu18.04', 'ubuntu20.04', 'ubuntu22.04', 'centos7.0', 'centos8.0', 'alinux2', 'alinux3']
+os_list = ['ubuntu18.04', 'ubuntu20.04', 'ubuntu22.04', 'ubuntu24.04', 'centos7.0', 'centos8.0', 'alinux2', 'alinux3', 'rockylinux9']
 working_dir = '/tmp/ossfs'
 dest_dir = '/var/ossfs'
 ossfs_source_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -138,36 +136,6 @@ def command_build_package(f, install_dir):
 def command_test_package(f):
     f.write('version=$(ossfs --version | grep -E -o "V[0-9.]+[^ ]+" | cut -d"V" -f2)\n')
     f.write('test "$version" = "%s"\n' % ossfs_version)
-
-def command_build_package_centos65():
-    """
-    Generate the build package script running in docker container
-    """
-    cmd_dir = os.path.join(working_dir, 'command')
-    install_dir = '/root/ossfs_install'
-    f = open(os.path.join(cmd_dir, 'build_package_centos65.sh'), 'w')
-    f.write('#!/bin/bash\n')
-    f.write('export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/lib64/pkgconfig/\n')
-    command_build_package(f, install_dir)
-    f.write('fpm -s dir -t rpm -n ossfs -v %s -C %s -p ossfs_VERSION_centos6.5_ARCH.rpm  -d "libcurl >= 7.0" -d "libxml2 >= 2.6" -d "openssl-devel >= 0.9" --after-install /root/post_action.sh --after-upgrade /root/post_action.sh' % (ossfs_version, install_dir))
-    f.close()
-
-def command_test_package_centos65():
-    """
-    Generate the test package script running in docker container
-    """
-    pkg_list = glob.glob(os.path.join(working_dir, 'package/*centos6.5*'))
-    if not pkg_list:
-        raise RuntimeError("Can not found centos6.5 package! May be build fail?")
-    pkg = ntpath.basename(pkg_list[0])
-    cmd_dir = os.path.join(working_dir, 'command')
-    test_dir = os.path.join(dest_dir, 'source/test')
-    f = open(os.path.join(cmd_dir, 'test_package_centos65.sh'), 'w')
-    f.write('#!/bin/bash\n')
-    f.write('rpm --rebuilddb\n')
-    f.write('yum -y localinstall %s/package/%s --nogpgcheck\n' % (dest_dir, pkg))
-    command_test_package(f)
-    f.close()
 
 def command_build_package_centos70():
     """
@@ -315,17 +283,36 @@ def command_test_package_alinux(os_name):
     command_test_package(f)
     f.close()
 
+def command_build_package_rockylinux(os_name):
+    """
+    Generate the build package script running in docker container
+    """
+    cmd_dir = os.path.join(working_dir, 'command')
+    install_dir = '/tmp/ossfs_install'
+    f = open(os.path.join(cmd_dir, 'build_package_%s.sh'%os_name), 'w')
+    f.write('#!/bin/bash\n')
+    command_build_package(f, install_dir)
+    f.write('fpm -s dir -t rpm -n ossfs -v %s -C %s -p ossfs_VERSION_%s_ARCH.rpm -d "fuse >= 2.8.4" -d "fuse-libs >= 2.8.4" -d "libcurl >= 7.0" -d "libxml2 >= 2.6" -d "openssl-libs >= 0.9"\n' % (ossfs_version, install_dir, os_name))
+    f.close()
+
+def command_test_package_rockylinux(os_name):
+    """
+    Generate the test package script running in docker container
+    """
+    pkg_list = glob.glob(os.path.join(working_dir, 'package/*%s*'%os_name))
+    if not pkg_list:
+        raise RuntimeError("Can not found %s package! May be build fail?"%os_name)
+    pkg = ntpath.basename(pkg_list[0])
+    cmd_dir = os.path.join(working_dir, 'command')
+    test_dir = os.path.join(dest_dir, 'source/test')
+    f = open(os.path.join(cmd_dir, 'test_package_%s.sh'%os_name), 'w')
+    f.write('#!/bin/bash\n')
+    f.write('yum -y update\n')
+    f.write('yum -y localinstall %s/package/%s --nogpgcheck\n' % (dest_dir, pkg))
+    command_test_package(f)
+    f.close()
+
 def build_docker_image():
-    #ubuntu:14.04
-    exec_cmd('docker pull ubuntu:14.04')
-    exec_cmd('docker tag ubuntu:14.04 ossfs-ubuntu14.04:test')
-    exec_cmd('docker build -t ossfs-ubuntu14.04:dev %s/scripts/docker-file/ubuntu/14.04'%ossfs_source_dir)
-
-    #ubuntu:16.04
-    exec_cmd('docker pull ubuntu:16.04')
-    exec_cmd('docker tag ubuntu:16.04 ossfs-ubuntu16.04:test')
-    exec_cmd('docker build -t ossfs-ubuntu16.04:dev %s/scripts/docker-file/ubuntu/16.04'%ossfs_source_dir)
-
     #ubuntu:18.04
     exec_cmd('docker pull ubuntu:18.04')
     exec_cmd('docker tag ubuntu:18.04 ossfs-ubuntu18.04:test')
@@ -340,6 +327,11 @@ def build_docker_image():
     exec_cmd('docker pull ubuntu:22.04')
     exec_cmd('docker tag ubuntu:22.04 ossfs-ubuntu22.04:test')
     exec_cmd('docker build -t ossfs-ubuntu22.04:dev %s/scripts/docker-file/ubuntu/22.04'%ossfs_source_dir)
+
+    #ubuntu:24.04
+    exec_cmd('docker pull ubuntu:24.04')
+    exec_cmd('docker tag ubuntu:24.04 ossfs-ubuntu24.04:test')
+    exec_cmd('docker build -t ossfs-ubuntu24.04:dev %s/scripts/docker-file/ubuntu/24.04'%ossfs_source_dir)
 
     #centos:7.x
     exec_cmd('docker pull centos:centos7')
@@ -360,6 +352,11 @@ def build_docker_image():
     exec_cmd('docker pull alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest')
     exec_cmd('docker tag alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest ossfs-alinux3:test')
     exec_cmd('docker build -t ossfs-alinux3:dev %s/scripts/docker-file/alinux/3'%ossfs_source_dir)
+    
+    #rocky Linux 9
+    exec_cmd('docker pull rockylinux:9')
+    exec_cmd('docker tag rockylinux:9 ossfs-rockylinux9:test')
+    exec_cmd('docker build -t ossfs-rockylinux9:dev %s/scripts/docker-file/rockylinux/9.x'%ossfs_source_dir)
     pass
 
 def build_package():
@@ -369,23 +366,7 @@ def build_package():
         dev_image = docker_images[os_name+':dev']
         test_image = docker_images[os_name+':test']
 
-        if os_name == 'centos6.5':
-            # build package
-            print("===========================")
-            print("build centos6.5 package ...")
-            print("===========================")
-            command_build_package_centos65()
-            container_name = 'ossfs_%s'%random_string(5)
-            docker_run(container_name, dev_image, volumes, '/bin/bash %s/command/build_package_centos65.sh'%dest_dir)
-
-            # test package
-            print("==========================")
-            print("test centos6.5 package ...")
-            print("==========================")
-            command_test_package_centos65()
-            container_name = 'ossfs_%s'%random_string(5)
-            docker_run(container_name, test_image, volumes, '/bin/bash %s/command/test_package_centos65.sh'%dest_dir)
-        elif os_name == 'centos7.0':
+        if os_name == 'centos7.0':
             # build package
             print("===========================")
             print("build centos7.0 package ...")
@@ -450,6 +431,22 @@ def build_package():
             container_name = 'ossfs_%s'%random_string(5)
             docker_run(container_name, test_image, volumes, '/bin/bash %s/command/test_package_%s.sh' % (dest_dir, os_name))
         elif os_name.startswith('alinux'):
+            # build package
+            print("=============================")
+            print("build %s package ..." % os_name)
+            print("=============================")
+            command_build_package_alinux(os_name)
+            container_name = 'ossfs_%s'%random_string(5)
+            docker_run(container_name, dev_image, volumes, '/bin/bash %s/command/build_package_%s.sh' % (dest_dir, os_name))
+
+            # test package
+            print("============================")
+            print("test %s package ..." % os_name)
+            print("============================")
+            command_test_package_alinux(os_name)
+            container_name = 'ossfs_%s'%random_string(5)
+            docker_run(container_name, test_image, volumes, '/bin/bash %s/command/test_package_%s.sh' % (dest_dir, os_name))
+        elif os_name.startswith('rockylinux'):
             # build package
             print("=============================")
             print("build %s package ..." % os_name)

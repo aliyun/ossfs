@@ -83,10 +83,11 @@ class DirectReader
         
         // following three members are used for waiting all prefetch threads exit, keep consistence with s3fs.
         Semaphore                   prefetched_sem;      
-        int                         instruct_count;      // num of prefetch workers in threadpool's instruction_list
-        int                         completed_count;
+        int                         instruct_count = 0;      // num of prefetch workers in threadpool's instruction_list
+        int                         completed_count = 0;
         
-        bool                        is_direct_read_lock_init;
+        bool                        is_direct_read_lock_init = false;
+        bool                        need_abort = false;
    
     public:
         static bool SetChunkSize(off_t size);
@@ -109,6 +110,7 @@ class DirectReader
         bool Prefetch(off_t start, off_t len);
         off_t GetFileSize() { return filesize; };
         void CleanUpChunks(); 
+        bool CanGenerateTask(uint32_t chunkid);
 
         // following members used outside (generating prefetch task and releasing chunks)
         pthread_mutex_t             direct_read_lock;

@@ -2689,7 +2689,7 @@ int S3fsCurl::GetIAMv2ApiToken(const char* token_url, int token_ttl, const char*
     // Curl appends an "Expect: 100-continue" header to the token request, 
     // and aws responds with a 417 Expectation Failed. This ensures the 
     // Expect header is empty before the request is sent.
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "Expect", "");
+    // requestHeaders = curl_slist_sort_insert(requestHeaders, "Expect", "");
 
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_PUT, true)){
         return -EIO;
@@ -2776,7 +2776,7 @@ bool S3fsCurl::GetRAMCredentials(const char* cred_url, const char* iam_v2_token,
     }
 
     if(iam_v2_token){
-        //requestHeaders = curl_slist_sort_insert(requestHeaders, S3fsCred::IAMv2_token_hdr, iam_v2_token);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, S3fsCred::RAMv2_token_hdr.c_str(), iam_v2_token);
     }
 
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
@@ -2834,7 +2834,7 @@ bool S3fsCurl::GetRAMRoleFromMetaData(const char* cred_url, const char* iam_v2_t
     bodydata.clear();
 
     if(iam_v2_token){
-        //requestHeaders = curl_slist_sort_insert(requestHeaders, S3fsCred::IAMv2_token_hdr, iam_v2_token);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, S3fsCred::RAMv2_token_hdr.c_str(), iam_v2_token);
     }
 
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){

@@ -124,6 +124,8 @@ const char* S3fsCred::RAMCRED_SECRETACCESSKEY   = "SecretAccessKey";
 const char* S3fsCred::RAMCRED_ACCESSKEYSECRET   = "AccessKeySecret";
 const char* S3fsCred::RAMCRED_ROLEARN           = "RoleArn";
 
+std::string S3fsCred::RAMv2_token_hdr           = "X-aliyun-ecs-metadata-token";
+
 std::string S3fsCred::bucket_name;
 
 //-------------------------------------------------------------------
@@ -179,6 +181,7 @@ S3fsCred::S3fsCred() :
     RAM_token_field("Token"),
     RAM_expiry_field("Expiration"),
     RAM_role(""),
+    imds_v2(true),
     set_builtin_cred_opts(false),
     hExtCredLib(NULL),
     pFuncCredVersion(VersionS3fsCredential),
@@ -382,8 +385,21 @@ bool S3fsCred::LoadRAMCredentials(AutoLock::Type type)
 
     S3fsCurl    s3fscurl;
     std::string response;
-    if(!s3fscurl.GetRAMCredentials(url.c_str(), NULL, NULL, response)){
+
+    bool successful = false;
+    if (imds_v2) {
+      // get token first
+      std::string token;
+      if (GetTokenIMDSV2(token)) {
+        successful = s3fscurl.GetRAMCredentials(url.c_str(), token.c_str(), NULL, response);
+      }
+    } 
+    
+    // if imds_v2 is enabled but failed to get cred, fall back to the normal way
+    if (!successful) {
+      if(!s3fscurl.GetRAMCredentials(url.c_str(), NULL, NULL, response)){
         return false;
+      }
     }
 
     if(!SetRAMCredentials(response.c_str(), AutoLock::ALREADY_LOCKED)){
@@ -410,8 +426,19 @@ bool S3fsCred::LoadIAMRoleFromMetaData()
 
         S3fsCurl    s3fscurl;
         std::string token;
-        if(!s3fscurl.GetRAMRoleFromMetaData(url.c_str(), NULL, token)){
+
+        bool successful = false;
+        if (imds_v2) {
+          std::string api_token;
+          if (GetTokenIMDSV2(api_token)) {
+            successful = s3fscurl.GetRAMRoleFromMetaData(url.c_str(), api_token.c_str(), token);
+          }
+        }
+        
+        if (!successful) {
+          if(!s3fscurl.GetRAMRoleFromMetaData(url.c_str(), NULL, token)){
             return false;
+          }
         }
 
         if(!SetRAMRoleFromMetaData(token.c_str(), AutoLock::ALREADY_LOCKED)){
@@ -459,6 +486,19 @@ bool S3fsCred::SetRAMRoleFromMetaData(const char* response, AutoLock::Type type)
 
     SetRAMRole(rolename.c_str(), type);
     return true;
+}
+
+bool S3fsCred::GetTokenIMDSV2(std::string &token) {
+  std::string get_token_url = "http://100.100.100.200/latest/api/token";
+  S3fsCurl    s3fscurl;
+  std::string response;
+  const char *token_ttl_header = "X-aliyun-ecs-metadata-token-ttl-seconds";
+  if (s3fscurl.GetIAMv2ApiToken(get_token_url.c_str(), 180, token_ttl_header,
+                                token) == 0) {
+    return true;
+  }
+
+  return false;
 }
 
 //-------------------------------------------------------------------
@@ -1223,6 +1263,11 @@ int S3fsCred::DetectParam(const char* arg)
             }
             return 0;
         }
+    }
+
+    if (0 == strcmp(arg, "disable_imdsv2")) {
+        imds_v2 = false;
+        return 0;
     }
 
     if(is_prefix(arg, "credlib=")){

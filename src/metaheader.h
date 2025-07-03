@@ -40,9 +40,11 @@ typedef std::map<std::string, std::string, header_nocase_cmp> headers_t;
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
+void set_simulate_mtime_ns_with_crc64(bool simulate);
 struct timespec get_mtime(const headers_t& meta, bool overcheck = true, bool noextendedmeta = false);
 struct timespec get_ctime(const headers_t& meta, bool overcheck = true, bool noextendedmeta = false);
 struct timespec get_atime(const headers_t& meta, bool overcheck = true, bool noextendedmeta = false);
+unsigned long long get_crc64(const headers_t& meta);
 off_t get_size(const char *s);
 off_t get_size(const headers_t& meta);
 mode_t get_mode(const char *s, int base = 0);

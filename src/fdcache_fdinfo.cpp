@@ -367,12 +367,12 @@ ssize_t PseudoFdInfo::DirectReadAndPrefetch(char* bytes, off_t start, size_t siz
         }
         
         if (direct_reader_mgr->chunks.count(id)) {
-            S3FS_PRN_DBG("reading from buffer[chunkid=%d][offset=%ld][chunk_off=%ld][real_read_size=%ld]", id, offset, chunk_off, real_read_size);
+            S3FS_PRN_DBG("reading from buffer[pseudo_fd=%d][chunkid=%d][offset=%ld][chunk_off=%ld][real_read_size=%ld]", pseudo_fd, id, offset, chunk_off, real_read_size);
             assert(chunk_off + static_cast<off_t>(real_read_size) <= direct_reader_mgr->chunks[id]->size);
             memcpy(bytes, direct_reader_mgr->chunks[id]->buf + chunk_off, real_read_size);
         } else {
             // if the chunk does not exist, we should download it from oss directly.
-            S3FS_PRN_DBG("reading from cloud[chunkid=%d][start=%ld][chunk_off=%ld][real_read_size=%ld]", id, offset, chunk_off,real_read_size);
+            S3FS_PRN_DBG("reading from cloud[pseudo_fd=%d][chunkid=%d][start=%ld][chunk_off=%ld][real_read_size=%ld]", pseudo_fd, id, offset, chunk_off,real_read_size);
             off_t direct_read_size = std::min(chunk_size, file_size - id * chunk_size);
             DirectReadParam* direct_read_param = new DirectReadParam;
             direct_read_param->len = direct_read_size;
@@ -416,20 +416,21 @@ void PseudoFdInfo::GeneratePrefetchTask(uint32_t start_prefetch_chunk, uint32_t 
     uint32_t last_prefetch_chunk = std::min(max_prefetch_chunk, start_prefetch_chunk + prefetch_cnt);
     
     AutoLock auto_lock(&direct_reader_mgr->direct_read_lock);
-    S3FS_PRN_DBG("generate prefetch task[start_chunk=%d][end_chunk=%d]", start_prefetch_chunk+1, last_prefetch_chunk);
-    for (uint32_t i = start_prefetch_chunk + 1 ; i <= last_prefetch_chunk; i++) {
-        if (direct_reader_mgr->ongoing_prefetches.count(i) || 
-            direct_reader_mgr->chunks.count(i) ||    
-            !Chunk::cache_usage_check()) {
-            continue;
-        }
-        direct_reader_mgr->ongoing_prefetches.insert(i);
+    for (uint32_t i = start_prefetch_chunk + 1; i <= last_prefetch_chunk; i++) {
+      if (!direct_reader_mgr->CanGenerateTask(i)) {
+        continue;
+      }
+      direct_reader_mgr->ongoing_prefetches.insert(i);
 
-        off_t prefetch_size = std::min(chunk_size, file_size - i * chunk_size);
-        if (!direct_reader_mgr->Prefetch(i * chunk_size, prefetch_size)) {
-            direct_reader_mgr->ongoing_prefetches.erase(i);
-        }
+      off_t prefetch_size = std::min(chunk_size, file_size - i * chunk_size);
+      if (!direct_reader_mgr->Prefetch(i * chunk_size, prefetch_size)) {
+        direct_reader_mgr->ongoing_prefetches.erase(i);
+      }
     }
+    S3FS_PRN_DBG(
+      "generate prefetch task[pseudo_fd=%d][start_chunk=%d][end_chunk=%d][ongoing_prefetch=%d]",
+      pseudo_fd, start_prefetch_chunk + 1, last_prefetch_chunk, 
+      direct_reader_mgr->ongoing_prefetches.size());
     return;
 }
 

@@ -76,7 +76,8 @@ noinst_PROGRAMS = \
     test_curl_util \
     test_page_list \
     test_string_util \ 
-    test_mempool
+    test_mempool \
+    test_threadpool
 
 test_curl_util_SOURCES = common_auth.cpp curl_util.cpp string_util.cpp test_curl_util.cpp s3fs_global.cpp s3fs_logger.cpp
 if USE_SSL_OPENSSL
@@ -104,11 +105,15 @@ test_mempool_SOURCES = memorypool.cpp test_mempool.cpp s3fs_logger.cpp s3fs_glob
 test_mempool_LDFLAGS = -pthread
 test_mempool_LDADD = $(DEPS_LIBS)
 
+test_threadpool_SOURCES = threadpoolman.cpp test_threadpool.cpp s3fs_logger.cpp s3fs_global.cpp string_util.cpp autolock.cpp
+test_threadpool_LDADD = $(DEPS_LIBS)
+
 TESTS = \
     test_curl_util \
     test_page_list \
     test_string_util \
-    test_mempool
+    test_mempool \ 
+    test_threadpool
 
 clang-tidy:
 	clang-tidy $(ossfs_SOURCES) -- $(DEPS_CFLAGS) $(CPPFLAGS)

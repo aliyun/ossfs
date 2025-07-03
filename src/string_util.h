@@ -71,6 +71,9 @@ bool s3fs_strtoofft(off_t* value, const char* str, int base = 0);
 //
 off_t cvt_strtoofft(const char* str, int base);
 
+bool s3fs_strtoull(unsigned long long int* value, const char* str, int base);
+unsigned long long int cvt_strtoull(const char* str, int base);
+
 //
 // String Manipulation
 //

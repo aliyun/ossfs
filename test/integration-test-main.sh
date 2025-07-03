@@ -2729,6 +2729,61 @@ function test_mix_direct_read_with_skip {
     rm -f "${TEMP_DIR}/${TEST_FILE}"
 }
 
+# REQUIRE: -ologfile=${LOG_FILE}, -odbglevel=dbg
+function test_direct_read_ongoing_prefetch {
+    echo "test_direct_read_ongoing_prefetch"
+    FILE_NAME="test_ongoing_prefetch_1GB"
+
+    rm -f "${TEMP_DIR}/${FILE_NAME}"
+    dd if=/dev/zero of="${TEMP_DIR}/${FILE_NAME}" bs=1024 count=$((1024 * 1024))
+    local cloud_path="$(basename "${PWD}")/${FILE_NAME}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${cloud_path}" --body "${TEMP_DIR}/${FILE_NAME}"
+
+    # sequential read
+    ../../direct_read_test -r "${FILE_NAME}" -o 0 -s 0 -w /dev/null &
+    sleep 1s
+    ps -ef | grep direct_read_test | grep -v grep | awk '{print $2}' | xargs kill -9
+
+    s=`grep -n "ongoing_prefetch=" ${LOGFILE} | tail -1`
+    ongoing_prefetch=`echo $s | grep -oP '\[ongoing_prefetch=\K[0-9]+'`
+
+    prefetch_chunks=32
+    ps -ef | grep direct_read_prefetch_chunks
+
+    if [[ $? -eq 0 ]]; then
+        process_str=`ps -ef | grep direct_read_prefetch_chunks | grep -v grep`
+        prefetch_chunks=`echo $process_str | grep -oP '\-o direct_read_prefetch_chunks=\K[0-9]+'`
+    fi
+
+    if [[ $ongoing_prefetch -gt $prefetch_chunks ]]; then
+        echo "sequential read: Ongoing prefetch task number: $ongoing_prefetch, exceeds the limit $prefetch_chunks"
+        return 1
+    fi
+    
+    # set the download bandwidth limit
+    IFACE="eth0" ../../transmission_control.sh 
+    python3 ../../random_read.py "${FILE_NAME}" &
+
+    for i in {1..20}; do
+      sleep 2s
+      s=`grep -n "ongoing_prefetch=" ${LOGFILE} | tail -1`
+      ongoing_prefetch=`echo $s | grep -oP '\[ongoing_prefetch=\K[0-9]+'`
+      echo "random read. round $i. Ongoing prefetch task number: $ongoing_prefetch"
+
+      if [[ $ongoing_prefetch -gt $prefetch_chunks ]]; then
+          echo "random read: Ongoing prefetch task number: $ongoing_prefetch, exceeds the limit $prefetch_chunks"
+          return 1
+      fi
+    done
+
+    ps -ef | grep "random_read.py" | grep -v grep | awk '{print $2}' | xargs kill -9
+    # recover the download bandwidth limit
+    tc qdisc del dev $IFACE ingress 2>/dev/null
+    tc qdisc del dev ifb0 root 2>/dev/null
+
+    wait
+}
+
 function test_check_cache_sigusr1 {
     describe "Testing check cache sigusr1 ..."
 
@@ -2940,7 +2995,72 @@ function test_object_ending_with_slash {
     rm -rf "${DIR_NAME}"
 }
 
+# REQUIRE: -ologfile=${LOGFILE} -odbglevel=dbg -oauto_cache -osimulate_mtime_ns_with_crc64
+function test_auto_cache {
+    describe "Testing auto_cache option"
+
+    # 1. upload a file sized of 1MB
+    FILE_NAME="test_auto_cache_1MB"
+    rm -f "${TEMP_DIR}/${FILE_NAME}"
+    dd if=/dev/urandom of="${TEMP_DIR}/${FILE_NAME}" bs=1M count=1
+    local_md1=`md5sum ${TEMP_DIR}/${FILE_NAME} | awk '{print $1}'`
+    local cloud_path="$(basename "${PWD}")/${FILE_NAME}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${cloud_path}" --body "${TEMP_DIR}/${FILE_NAME}"
+
+    # 2. read this file
+    echo "reading for the first time"
+    remote_md1=`md5sum ${FILE_NAME} | awk '{print $1}'` 
+    if [[ "${local_md1}" != "${remote_md1}" ]]; then
+        echo "reading for the first time: md5sum mismatch"
+        return 1
+    fi
+
+    # 3. read again
+    echo "reading for the second time"
+    echo "" > ${LOGFILE}
+    remote_md2=`md5sum ${FILE_NAME} | awk '{print $1}'`
+    if [[ "${local_md1}" != "${remote_md2}" ]]; then
+        echo "reading again: md5sum mismatch"
+        return 1
+    fi
+
+    # there should not be s3fs_read log
+    grep "s3fs_read" "${LOGFILE}"
+    if [ $? -eq 0 ]; then
+        echo "There should not be s3fs_read log"
+        return 1
+    fi
+
+    # 4. re-uploading the file with different mtime
+    dd if=/dev/urandom of="${TEMP_DIR}/${FILE_NAME}" bs=1M count=1
+    local_md2=`md5sum ${TEMP_DIR}/${FILE_NAME} | awk '{print $1}'`
+
+    local cloud_path="$(basename "${PWD}")/${FILE_NAME}"
+    aws_cli s3api put-object --content-type="text/plain" --bucket "${TEST_BUCKET_1}" --key "${cloud_path}" --body "${TEMP_DIR}/${FILE_NAME}"
+
+    # 5. read for the third time
+    echo "reading for the third time"
+    echo "" > ${LOGFILE}
+    remote_md3=`md5sum ${FILE_NAME} | awk '{print $1}'`
+
+    if [[ "${local_md2}" != "${remote_md3}" ]]; then
+        echo "reading for the third time: md5sum mismatch"
+        return 1
+    fi
+    # there should be s3fs_read log
+    grep "s3fs_read" "${LOGFILE}"
+    if [ $? -ne 0 ]; then
+        echo "read with mtime changed, there should be s3fs_read log"
+        return 1
+    fi
+}
+
 function add_all_tests {
+    if ps u -p "${OSSFS_PID}" | grep -q auto_cache; then
+        add_tests test_auto_cache
+        return 0
+    fi
+
     # shellcheck disable=SC2009
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
         add_tests test_cache_file_stat
@@ -3066,6 +3186,7 @@ function add_all_tests {
         add_tests test_direct_read_with_truncate
         add_tests test_concurrent_direct_read
         add_tests test_mix_direct_read_with_skip
+        add_tests test_direct_read_ongoing_prefetch
     fi
 
     if ps u -p "${OSSFS_PID}" | grep -q parallel_count && ps u -p "${OSSFS_PID}" | grep -q fake_diskfree; then

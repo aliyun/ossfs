@@ -38,6 +38,7 @@ ${OSSFS_SOURCE_DIR}/src/test_page_list
 ${OSSFS_SOURCE_DIR}/src/test_curl_util
 ${OSSFS_SOURCE_DIR}/src/test_string_util
 ${OSSFS_SOURCE_DIR}/src/test_mempool
+${OSSFS_SOURCE_DIR}/src/test_threadpool
 
 gcovr -r ${OSSFS_SOURCE_DIR}/src --html-details -o ${OSSFS_SOURCE_DIR}/coverage_html/coverage.html
 

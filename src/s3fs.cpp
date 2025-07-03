@@ -3589,13 +3589,6 @@ static void* s3fs_init(struct fuse_conn_info* conn)
         S3FS_PRN_DBG("Could not initialize cache directory.");
     }
 
-    // check loading IAM role name
-    if(!ps3fscred->LoadIAMRoleFromMetaData()){
-        S3FS_PRN_CRIT("could not load IAM role name from meta data.");
-        s3fs_exit_fuseloop(EXIT_FAILURE);
-        return NULL;
-    }
-
     // Check Bucket
     {
         int result;
@@ -3742,6 +3735,13 @@ static bool check_error_message(const char* pbody, size_t len, std::string& mess
 static int s3fs_check_service()
 {
     S3FS_PRN_INFO("check services.");
+
+    // check loading IAM role name
+    if(!ps3fscred->LoadIAMRoleFromMetaData()){
+        S3FS_PRN_CRIT("could not load IAM role name from meta data.");
+        s3fs_exit_fuseloop(EXIT_FAILURE);
+        return NULL;
+    }
 
     // At first time for access OSS, we check IAM role if it sets.
     if(!ps3fscred->CheckIAMCredentialUpdate()){
@@ -4754,6 +4754,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             is_specified_region = true;
             return 0;
         }
+        if (strcmp(arg, "simulate_mtime_ns_with_crc64") == 0) {
+          set_simulate_mtime_ns_with_crc64(true);
+          return 0;
+        }
         // [NOTE]
         // following option will be discarding, because these are not for fuse.
         // (Referenced sshfs.c)
@@ -4815,8 +4819,6 @@ int main(int argc, char* argv[])
         delete ps3fscred;
         exit(EXIT_FAILURE);
     }
-
-    printf("[NOTICE] OSS signature V1 service will not be available for new uids since March 1st, 2025. It is recommended to mount with OSS signature V4:\n\t ossfs [oss-bucket] [mount-path] [options] -osigv4 -oregion=[your-region-id]\n");
 
     while((ch = getopt_long(argc, argv, "dho:fsu", long_opts, &option_index)) != -1){
         switch(ch){
@@ -4944,6 +4946,10 @@ int main(int argc, char* argv[])
         destroy_parser_xml_lock();
         delete ps3fscred;
         exit(EXIT_FAILURE);
+    }
+
+    if (S3fsCurl::GetSignatureType() != V4_ONLY) {
+      printf("[NOTICE] OSS signature V1 service will not be available in the near future. It is recommended to mount with OSS signature V4:\n\t ossfs [oss-bucket] [mount-path] [options] -osigv4 -oregion=[your-region-id]\n");
     }
 
     // init mime types for curl
