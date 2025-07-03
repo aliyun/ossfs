@@ -103,7 +103,7 @@ void* ThreadPoolMan::Worker(void* arg)
         if(pparam){
             void* retval     = pparam->pfunc(pparam->args);
             if(NULL != retval){
-                S3FS_PRN_WARN("The instruction function returned with somthign error code(%ld).", reinterpret_cast<long>(retval));
+                S3FS_PRN_WARN("The instruction function returned with error code(%ld).", reinterpret_cast<long>(retval));
             }
             if(pparam->psem){
                 pparam->psem->post();

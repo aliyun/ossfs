@@ -93,7 +93,7 @@ bool DirectReader::SetBackwardChunks(int chunk_num) {
 //-------------------------------------------------------------------
 DirectReader::DirectReader(const std::string& path, off_t size) : 
     filepath(path), filesize(size), prefetched_sem(0), instruct_count(0), completed_count(0),
-    is_direct_read_lock_init(false)
+    is_direct_read_lock_init(false), need_abort(false)
 {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -184,17 +184,15 @@ void DirectReader::WaitAllPrefetchThreadsExit()
 void DirectReader::CancelAllPrefetchThreads()
 {   
     S3FS_PRN_DBG("Cancel All Threads[instruct_count:%d]", instruct_count);
-    bool need_cancel = false;
     {
         AutoLock auto_lock(&direct_read_lock);
         if(0 < instruct_count){
             S3FS_PRN_WARN("The prefetch thread is running, so cancel them and wait for the end.");
-            need_cancel = true;
+            need_abort = true;
         }
     }
-    if(need_cancel){
-        WaitAllPrefetchThreadsExit();
-    }
+
+    WaitAllPrefetchThreadsExit();
 
     return;
 }
@@ -234,6 +232,15 @@ void DirectReader::ReleaseChunks()
     chunks.clear();
 }
 
+// with lock held outside
+bool DirectReader::CanGenerateTask(uint32_t chunkid) {
+  return !need_abort &&
+         ongoing_prefetches.size() < DirectReader::prefetch_chunk_count &&
+         ongoing_prefetches.count(chunkid) == 0 && 
+         chunks.count(chunkid) == 0 &&
+         Chunk::cache_usage_check();
+}
+
 void* direct_read_worker(void* arg) 
 {
     DirectReadParam* direct_read_param = static_cast<DirectReadParam*>(arg);
@@ -249,8 +256,7 @@ void* direct_read_worker(void* arg)
     off_t start = direct_read_param->start;
     off_t len   = direct_read_param->len;
     bool  is_sync_download = direct_read_param->is_sync_download;
-    
-    
+
     S3FS_PRN_DBG("prefetch worker[pid=%lu][path=%s][start=%ld][len=%ld]", pthread_self(), direct_reader->filepath.c_str(), start, len);
     
     S3fsCurl s3fscurl;

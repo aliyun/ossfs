@@ -1,5 +1,13 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.7 (01/07/2025)
+ - Release ossfs of RockyLinux 9.
+ - Release ossfs of Ubuntu 24.04.
+ - Optimize the mounting prompt about signature v4.
+ - Set the limit of ongoing tasks under direct-read mode.
+ - Add support to get credentials via ramrole on Aliyun ECS of imdsv2 mode.
+ - Simulate nsec of mtime using crc64 which can be used along with the libfuse option auto_cache.
+
 ## v1.91.6 (17/03/2025)
  - Print information to suggest users to mount with OSS V4 signature.
  - Optimized the prefetch-task generation logic under direct-read mode to better performance.

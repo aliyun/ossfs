@@ -59,7 +59,7 @@ class S3fsCred
 
         std::string         passwd_file;
 
-        bool                load_ramrole;
+        bool                load_ramrole;        // true: LoadIAMRoleFromMetaData
 
         std::string         AccessKeyId;         // Protect exclusively
         std::string         AccessKeySecret;     // Protect exclusively
@@ -74,6 +74,8 @@ class S3fsCred
         std::string         RAM_expiry_field;
         std::string         RAM_role;               // Protect exclusively
 
+        bool                imds_v2 = true;
+
         bool                set_builtin_cred_opts;  // true if options other than "credlib" is set
         std::string         credlib;                // credlib(name or path)
         std::string         credlib_opts;           // options for credlib
@@ -84,7 +86,7 @@ class S3fsCred
         fp_FreeS3fsCredential    pFuncCredFree;
         fp_UpdateS3fsCredential  pFuncCredUpdate;
     public:
-
+        static std::string       RAMv2_token_hdr;
 
     private:
         static bool ParseRAMRoleFromMetaDataResponse(const char* response, std::string& rolename);
@@ -121,6 +123,7 @@ class S3fsCred
         bool LoadRAMCredentials(AutoLock::Type type);
         bool SetRAMCredentials(const char* response, AutoLock::Type type);
         bool SetRAMRoleFromMetaData(const char* response, AutoLock::Type type);
+        bool GetTokenIMDSV2(std::string &token);
 
         bool SetExtCredLib(const char* arg);
         bool IsSetExtCredLib() const;

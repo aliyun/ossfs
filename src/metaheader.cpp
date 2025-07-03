@@ -29,6 +29,12 @@
 #include "string_util.h"
 
 static const struct timespec DEFAULT_TIMESPEC = {-1, 0};
+static bool simulate_mtime_ns_with_crc64 = false;
+
+void set_simulate_mtime_ns_with_crc64(bool simulate)
+{
+    simulate_mtime_ns_with_crc64 = simulate;
+}
 
 //-------------------------------------------------------------------
 // Utility functions for convert
@@ -64,23 +70,46 @@ static struct timespec get_time(const headers_t& meta, const char *header)
     return cvt_string_to_time((*iter).second.c_str());
 }
 
+// There is an option auto_cache in LibFuse, which decides whether to keep the pagecache
+// according to the mtime (both sec and nsec). It is recommended to turn on 
+// simulate_mtime_ns_with_crc64 when using auto_cache.
+// We don't control whether to keep pagecache by ossfs rather than LibFuse with Etag,
+// because Etag is stored in the StatCache, whose lifecycle is not consistent with
+// the file. We might not be able to get the local ETag when open(). 
 struct timespec get_mtime(const headers_t& meta, bool overcheck, bool noextendedmeta)
 {
+    #define SET_TV_NSEC_IF_NEEDED(t) do { \
+        if (simulate_mtime_ns_with_crc64 && 0 == t.tv_nsec) { \
+            const unsigned long long MAX_NSEC = 1000000000; \
+            unsigned long long crc64 = get_crc64(meta); \
+            if (crc64 >= MAX_NSEC) { \
+                crc64 = crc64 % MAX_NSEC; \
+            } \
+            t.tv_nsec = crc64; \
+        } \
+    } while (0)
+
     if (!noextendedmeta) {
         struct timespec t = get_time(meta, "x-oss-meta-mtime");
         if(0 < t.tv_sec){
+            SET_TV_NSEC_IF_NEEDED(t);
             return t;
         }
         t = get_time(meta, "x-oss-meta-goog-reserved-file-mtime");
         if(0 < t.tv_sec){
+            SET_TV_NSEC_IF_NEEDED(t);
             return t;
         }
     }
     if(overcheck){
         struct timespec ts = {get_lastmodified(meta), 0};
+        SET_TV_NSEC_IF_NEEDED(ts);
         return ts;
     }
-    return DEFAULT_TIMESPEC;
+
+    struct timespec t = DEFAULT_TIMESPEC;
+    SET_TV_NSEC_IF_NEEDED(t);
+    return t;
 }
 
 struct timespec get_ctime(const headers_t& meta, bool overcheck, bool noextendedmeta)
@@ -112,6 +141,16 @@ struct timespec get_atime(const headers_t& meta, bool overcheck, bool noextended
     }
     return DEFAULT_TIMESPEC;
 }
+
+unsigned long long get_crc64(const headers_t& meta)
+{
+    headers_t::const_iterator iter = meta.find("x-oss-hash-crc64ecma");
+    if(meta.end() == iter){
+        return 0;
+    }
+    return cvt_strtoull((*iter).second.c_str(), /*base=*/ 10);
+}
+
 
 off_t get_size(const char *s)
 {

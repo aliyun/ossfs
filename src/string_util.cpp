@@ -117,6 +117,38 @@ off_t cvt_strtoofft(const char* str, int base)
     return result;
 }
 
+bool s3fs_strtoull(unsigned long long int* value, const char* str, int base)
+{
+    if(value == NULL || str == NULL){
+        return false;
+    }
+
+    errno = 0;
+    char *temp;
+    unsigned long long int result = strtoull(str, &temp, base);
+    if(temp == str || *temp != '\0'){
+        return false;
+    }
+
+    if(result == ULLONG_MAX && errno == ERANGE){
+        return false;
+    }
+
+    *value = result;
+    return true;
+}
+
+unsigned long long int cvt_strtoull(const char* str, int base)
+{
+    unsigned long long int result = 0;
+    if(!s3fs_strtoull(&result, str, base)){
+        S3FS_PRN_WARN("something error is occurred in convert std::string(%s) to ull, thus return 0 as default.", (str ? str : "null"));
+        return 0;
+    }
+    
+    return result;
+}
+
 std::string lower(std::string s)
 {
     // change each character of the std::string to lower case
