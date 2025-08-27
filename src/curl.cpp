@@ -4310,7 +4310,7 @@ void S3fsCurl::insertOSSV1Headers(const std::string& access_key_id, const std::s
 }
 
 // more detail info: https://help.aliyun.com/zh/oss/developer-reference/recommend-to-use-signature-version-4?spm=a2c4g.11186623.0.0.7cfa19c22p3CtK
-std::string S3fsCurl::CalcSignatureOSSV4(const std::string& method, const std::string& canonical_url, const std::string& canonical_query_string, const std::string& canonical_headers, const std::string& additional_headers, const std::string& hash_payload, const std::string& secret_access_key)
+std::string S3fsCurl::CalcSignatureOSSV4(const std::string& method, const std::string& canonical_url, const std::string& canonical_query_string, const std::string& canonical_headers, const std::string& additional_headers, const std::string& hash_payload, const std::string& secret_access_key, time_t signingTime)
 {
     std::string canonicalRequest;
     std::string stringToSign;   
@@ -4336,9 +4336,9 @@ std::string S3fsCurl::CalcSignatureOSSV4(const std::string& method, const std::s
     delete[] md;
 
     std::string hashCode = "OSS4-HMAC-SHA256";
-    std::string timeStamp = get_date_iso8601(time(NULL));
+    std::string timeStamp = get_date_iso8601(signingTime);
     
-    std::string signingDate = get_date_string(time(NULL));
+    std::string signingDate = get_date_string(signingTime);
     std::string signingRegion = region;
     std::string signingProduct;
     std::string signingRequest = "aliyun_v4_request";
@@ -4423,9 +4423,10 @@ void S3fsCurl::insertOSSV4Headers(const std::string& access_key_id, const std::s
         canonical_query_string = result.str();
     }
 
+    time_t signingTime = time(NULL);
     std::string hash_payload = "UNSIGNED-PAYLOAD";
     requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-content-sha256", hash_payload.c_str());
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-date", get_date_iso8601(time(NULL)).c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-date", get_date_iso8601(signingTime).c_str());
 
     if(!access_token.empty()){
         requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-security-token", access_token.c_str());
@@ -4440,7 +4441,7 @@ void S3fsCurl::insertOSSV4Headers(const std::string& access_key_id, const std::s
         S3FS_PRN_INFO3("Now Requester Pays buckets");
     }
 
-    std::string signingDate = get_date_string(time(NULL));
+    std::string signingDate = get_date_string(signingTime);
     std::string signingRegion = region;
     std::string signingProduct;
     std::string signingRequest = "aliyun_v4_request";
@@ -4454,7 +4455,7 @@ void S3fsCurl::insertOSSV4Headers(const std::string& access_key_id, const std::s
 
     scope = signingDate + "/" + signingRegion + "/" + signingProduct + "/" + signingRequest;
     // The additional headers are empty in ossfs
-    signature = CalcSignatureOSSV4(op, canonical_url, canonical_query_string, get_canonical_headers_ossv4(requestHeaders), "", hash_payload, secret_access_key);
+    signature = CalcSignatureOSSV4(op, canonical_url, canonical_query_string, get_canonical_headers_ossv4(requestHeaders), "", hash_payload, secret_access_key, signingTime);
     
     if(!S3fsCurl::IsPublicBucket()){
         std::string authorization = std::string("OSS4-HMAC-SHA256 ") + \

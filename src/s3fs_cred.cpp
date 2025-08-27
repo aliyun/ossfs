@@ -910,7 +910,7 @@ bool S3fsCred::InitialCredentials()
         return true;
     }
 
-    S3FS_PRN_EXIT("could not determine how to establish security credentials.");
+    S3FS_PRN_EXIT("Could not determine how to establish security credentials. Please check your password file, ram_role, or environment variables.");
     return false;
 }
 

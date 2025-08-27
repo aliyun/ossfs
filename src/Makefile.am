@@ -75,7 +75,7 @@ ossfs_LDADD = $(DEPS_LIBS)
 noinst_PROGRAMS = \
     test_curl_util \
     test_page_list \
-    test_string_util \ 
+    test_string_util \
     test_mempool \
     test_threadpool
 
@@ -112,7 +112,7 @@ TESTS = \
     test_curl_util \
     test_page_list \
     test_string_util \
-    test_mempool \ 
+    test_mempool \
     test_threadpool
 
 clang-tidy:

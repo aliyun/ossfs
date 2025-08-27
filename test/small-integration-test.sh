@@ -29,7 +29,7 @@ set -o pipefail
 source integration-test-common.sh
 
 CACHE_DIR="/tmp/ossfs-cache"
-LOGFILE="/tmp/ossfs.log"
+LOGFILE="/root/ossfs.log"
 CHECK_CACHE_FILE="/tmp/ossfs-cache-check.log"
 rm -rf "${CACHE_DIR}"
 mkdir "${CACHE_DIR}"

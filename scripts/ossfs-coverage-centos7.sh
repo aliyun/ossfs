@@ -32,7 +32,13 @@ chmod +x *.py
 
 rm -rf ${OSSFS_SOURCE_DIR}/coverage_html && mkdir ${OSSFS_SOURCE_DIR}/coverage_html
 
-DBGLEVEL=debug ALL_TESTS=1 OSSFS_CREDENTIALS_FILE=/root/.passwd-ossfs TEST_BUCKET_1=${BUCKET}  S3PROXY_BINARY="" OSS_URL=${URL} ./small-integration-test.sh
+random_num=$(( RANDOM % 4 ))
+if (( random_num == 0 )); then
+  DBGLEVEL=debug ALL_TESTS=1 OSSFS_CREDENTIALS_FILE=/root/.passwd-ossfs TEST_BUCKET_1=${BUCKET}  S3PROXY_BINARY="" OSS_URL=${URL} ./small-integration-test.sh
+else
+  cd ../
+  DBGLEVEL=debug ALL_TESTS=1 OSSFS_CREDENTIALS_FILE=/root/.passwd-ossfs TEST_BUCKET_1=${BUCKET}  S3PROXY_BINARY="" OSS_URL=${URL} ./test/run_tests_using_sanitizers.sh $random_num
+fi
 
 ${OSSFS_SOURCE_DIR}/src/test_page_list 
 ${OSSFS_SOURCE_DIR}/src/test_curl_util

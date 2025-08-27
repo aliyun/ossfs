@@ -112,6 +112,28 @@ function test_truncate_shrink_file {
     rm_test_file "${BIG_TRUNCATE_TEST_FILE}"
 }
 
+function test_truncate_shrink_read_file {
+    describe "Testing truncate(shrink) and read file ..."
+
+    # Initiate file size is 1024, and shrink file size is 512
+    local init_size=1024
+    local shrink_size=512
+
+    # create file
+    dd if=/dev/urandom of="${TEST_TEXT_FILE}" bs="${init_size}" count=1
+
+    # truncate(shrink) file and read it before flushing
+    ../../truncate_read_file "${TEST_TEXT_FILE}" "${shrink_size}"
+
+    # check file size
+    check_file_size "${TEST_TEXT_FILE}" "${shrink_size}"
+
+    # Truncate the file to 1024 length
+    local t_size=1024
+
+    rm_test_file
+}
+
 function test_mv_file {
     describe "Testing mv file function ..."
     # if the rename file exists, delete it
@@ -1873,6 +1895,76 @@ function test_ensurespace_move_file() {
     rm -rf "${CACHE_DIR}/.ossfs_test_tmpdir"
 }
 
+function test_not_existed_dir_obj() {
+    describe "Test not existed directory object..."
+
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
+
+    #
+    # Create files under not existed directory by aws command
+    #
+    local OBJECT_NAME_1; OBJECT_NAME_1="${DIR_NAME}/not_existed_dir_single/${TEST_TEXT_FILE}"
+    local OBJECT_NAME_2; OBJECT_NAME_2="${DIR_NAME}/not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}"
+    echo data1 | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME_1}"
+    echo data2 | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME_2}"
+
+    # Top directory
+    # shellcheck disable=SC2010
+    if ! ls -1 | grep -q '^not_existed_dir_single$'; then
+        echo "Expect to find \"not_existed_dir_single\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 | grep -q '^not_existed_dir_parent$'; then
+        echo "Expect to find \"not_existed_dir_parent\" directory, but it is not found"
+        return 1
+    fi
+
+    # Single nest directory
+    if ! stat not_existed_dir_single; then
+        echo "Expect to find \"not_existed_dir_single\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 not_existed_dir_single | grep -q "^${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_single/${TEST_TEXT_FILE}\" file, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 "not_existed_dir_single/${TEST_TEXT_FILE}" | grep -q "^not_existed_dir_single/${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_single/${TEST_TEXT_FILE}\" file, but it is not found"
+        return 1
+    fi
+
+    # Double nest directory
+    if ! stat not_existed_dir_parent; then
+        echo "Expect to find \"not_existed_dir_parent\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 not_existed_dir_parent | grep -q '^not_existed_dir_child'; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child\" directory, but it is not found"
+        return 1
+    fi
+    if ! stat not_existed_dir_parent/not_existed_dir_child; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 not_existed_dir_parent/not_existed_dir_child | grep -q "^${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 "not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}" | grep -q "^not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}\" directory, but it is not found"
+        return 1
+    fi
+
+    rm -rf not_existed_dir_single
+    rm -rf not_existed_dir_parent
+}
+
 function test_ut_ossfs {
     describe "Testing ossfs python ut..."
 
@@ -2019,6 +2111,96 @@ function test_write_data_with_skip() {
     #
     rm_test_file "${_SKIPWRITE_FILE}"
     rm_test_file "${_TMP_SKIPWRITE_FILE}"
+}
+
+function test_not_boundary_writes {
+    describe "Test non-boundary write ..."
+
+    # [MEMO]
+    # Files used in this test, multipart related sizes, etc.
+    #
+    #    Test file size:                25MB(25 * 1024 * 1024)
+    #    Multipart size:                10MB
+    #    Multipart minimum upload size:  5MB
+    #
+    # The multipart upload part that should be executed here is as follows:
+    #    Part number 1:             0 - 10,485,759 (size = 10MB)
+    #    Part number 2:    10,485,760 - 20,971,519 (size = 10MB)
+    #    Part number 3:    20,971,520 - 26,214,399 (size =  5MB)
+    #
+    local BOUNDARY_TEST_FILE_SIZE; BOUNDARY_TEST_FILE_SIZE=$((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT))
+
+    ../../junk_data "${BOUNDARY_TEST_FILE_SIZE}" > "${TEST_TEXT_FILE}"
+
+    #
+    # Write in First boundary
+    #
+    # Write 0 - 3,145,727(3MB) : less than the multipart minimum size from the beginning
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=0 count=3072 bs=1024 conv=notrunc
+
+    # Write 0 - 7,340,031(7MB) : multipart exceeding the minimum size from the beginning
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=0 count=7168 bs=1024 conv=notrunc
+
+    # Write 0 - 12,582,911(12MB) : beyond the multipart size boundary from the beginning
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=0 count=12288 bs=1024 conv=notrunc
+
+    #
+    # Write in First and second boundary
+    #
+    # Write 3,145,728 - 4,194,303(1MB) : less than the minimum multipart size from the middle of the first multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=3072 count=1024 bs=1024 conv=notrunc
+
+    # Write 3,145,728 - 9,437,183(6MB) : exceeding the minimum multipart size from the middle of the first multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=3072 count=6144 bs=1024 conv=notrunc
+
+    # Write 3,145,728 - 12,582,911(9MB) : beyond the multipart boundary from the middle of the first multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=3072 count=9216 bs=1024 conv=notrunc
+
+    #
+    # Write in Second boundary
+    #
+    # Write 12,582,912 - 14,680,063(2MB) : below the minimum multipart size from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=2048 bs=1024 conv=notrunc
+
+    # Write 12,582,912 - 18,874,367(6MB) : data exceeding the minimum multipart size from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=6144 bs=1024 conv=notrunc
+
+    # Write 12,582,912 - 23,068,671(10MB) : beyond the multipart boundary from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=10240 bs=1024 conv=notrunc
+
+    # Write 12,582,912 - 26,214,399(13MB) : beyond the multipart boundary(last) from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=13312 bs=1024 conv=notrunc
+
+    #
+    # Write in Last boundary
+    #
+    # Write 23,068,672 - 24,117,247(1MB) : below the minimum multipart size from the middle of the final multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=22528 count=1024 bs=1024 conv=notrunc
+
+    # Write 23,068,672 - 26,214,399(3MB) : beyond the multipart boundary(last) from the middle of the final multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=22528 count=3072 bs=1024 conv=notrunc
+
+    rm_test_file
+}
+
+function test_file_names_longer_than_posix() {
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
+    a256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    #a256="aaaa"
+
+    if ! touch "${a256}"; then
+        echo "could not create long file name"
+        return 1
+    fi
+    rm -f "${a256}"
+
+    echo data | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${DIR_NAME}/${a256}"
+    files=(*)
+    if [ "${#files[@]}" = 0 ]; then
+        echo "failed to list long file name"
+        return 1
+    fi
+    rm -f "${a256}"
 }
 
 function test_symlink_in_meta {
@@ -2810,6 +2992,7 @@ function test_check_cache_sigusr1 {
     
     # clean up
     rm_test_file
+    rm -f "${CHECK_CACHE_FILE}"
 }
 
 function test_reopen_log_with_sighup {
@@ -3065,6 +3248,8 @@ function add_all_tests {
     if ps u -p "${OSSFS_PID}" | grep -q use_cache; then
         add_tests test_cache_file_stat
         add_tests test_zero_cache_file_stat
+    else
+        add_tests test_file_names_longer_than_posix
     fi
     # shellcheck disable=SC2009
     if ! ps u -p "${OSSFS_PID}" | grep -q ensure_diskfree && ! uname | grep -q Darwin; then
@@ -3076,6 +3261,7 @@ function add_all_tests {
     add_tests test_truncate_upload
     add_tests test_truncate_empty_file
     add_tests test_truncate_shrink_file
+    add_tests test_truncate_shrink_read_file
     add_tests test_mv_file
     add_tests test_mv_to_exist_file
     add_tests test_mv_empty_directory
@@ -3128,12 +3314,16 @@ function add_all_tests {
     add_tests test_truncate_cache
     add_tests test_upload_sparsefile
     add_tests test_mix_upload_entities
+    if ! ps u -p "${OSSFS_PID}" | grep -q notsup_compat_dir; then
+        add_tests test_not_existed_dir_obj
+    fi
     add_tests test_ut_ossfs
     # shellcheck disable=SC2009
     if ! ps u -p "${OSSFS_PID}" | grep -q ensure_diskfree && ! uname | grep -q Darwin; then
         add_tests test_ensurespace_move_file
     fi
     add_tests test_write_data_with_skip
+    add_tests test_not_boundary_writes
     if ps u -p "${OSSFS_PID}" | grep -q symlink_in_meta; then
         add_tests test_symlink_in_meta
     fi

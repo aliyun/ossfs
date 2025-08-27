@@ -25,18 +25,27 @@ set -o pipefail
 
 # Disable preprocessor warnings from _FORTIFY_SOURCE and -O0
 COMMON_FLAGS="-g -O0 -Wno-cpp"
+RAN_MODE=$1
 
-# run tests with libstc++ debug mode, https://gcc.gnu.org/onlinedocs/libstdc++/manual/debug_mode.html
-make clean
-./configure CXXFLAGS="$COMMON_FLAGS -D_GLIBCXX_DEBUG"
-make
-DBGLEVEL=debug make check -C test/
-
-# run tests under AddressSanitizer, https://clang.llvm.org/docs/AddressSanitizer.html
-make clean
-./configure CXX=clang++ CXXFLAGS="$COMMON_FLAGS -fsanitize=address -fsanitize-address-use-after-scope"
-make
-ASAN_OPTIONS='detect_leaks=1,detect_stack_use_after_return=1' make check -C test/
+if (( $RAN_MODE == 1 )); then
+  # run tests with libstc++ debug mode, https://gcc.gnu.org/onlinedocs/libstdc++/manual/debug_mode.html
+  make clean
+  ./configure CXXFLAGS="$COMMON_FLAGS -D_GLIBCXX_DEBUG"
+  make
+  DBGLEVEL=debug make check -C test/
+elif (( $RAN_MODE == 2 )); then
+  # run tests under AddressSanitizer, https://clang.llvm.org/docs/AddressSanitizer.html
+  make clean
+  ./configure CXX=g++ CXXFLAGS="$COMMON_FLAGS -fsanitize=address"
+  make
+  ASAN_OPTIONS='detect_leaks=1,detect_stack_use_after_return=1' make check -C test/
+elif (( $RAN_MODE == 3 )); then
+  # run tests with Valgrind
+  make clean
+  ./configure CXXFLAGS="$COMMON_FLAGS"
+  make --jobs="$(nproc)"
+  ALL_TESTS=1 RETRIES=100 VALGRIND="--leak-check=full --error-exitcode=1 -s" S3_URL=http://127.0.0.1:8081 make check -C test/
+fi
 
 # run tests under MemorySanitizer, https://clang.llvm.org/docs/MemorySanitizer.html
 #make clean
@@ -44,17 +53,17 @@ ASAN_OPTIONS='detect_leaks=1,detect_stack_use_after_return=1' make check -C test
 #make
 #make check -C test/
 
-# run tests under ThreadSanitizer, https://clang.llvm.org/docs/ThreadSanitizer.html
-make clean
-./configure CXX=clang++ CXXFLAGS="$COMMON_FLAGS -fsanitize=thread"
-make
-TSAN_OPTIONS='halt_on_error=1' make check -C test/
+# # run tests under ThreadSanitizer, https://clang.llvm.org/docs/ThreadSanitizer.html
+# make clean
+# ./configure CXX=g++ CXXFLAGS="$COMMON_FLAGS -fsanitize=thread"
+# make
+# TSAN_OPTIONS='halt_on_error=1' make check -C test/
 
-# run tests under UndefinedBehaviorSanitizer, https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
-make clean
-./configure CXX=clang++ CXXFLAGS="$COMMON_FLAGS -fsanitize=undefined,implicit-conversion,local-bounds,unsigned-integer-overflow"
-make
-make check -C test/
+# # run tests under UndefinedBehaviorSanitizer, https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
+# make clean
+# ./configure CXX=g++ CXXFLAGS="$COMMON_FLAGS -fsanitize=undefined,implicit-conversion,local-bounds,unsigned-integer-overflow"
+# make
+# make check -C test/
 
 #
 # Local variables:

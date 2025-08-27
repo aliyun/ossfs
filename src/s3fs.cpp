@@ -3611,12 +3611,12 @@ static void* s3fs_init(struct fuse_conn_info* conn)
 
     if(direct_read) {
         if (!ThreadPoolMan::Initialize(direct_read_max_prefetch_thread_count)) {
-            S3FS_PRN_CRIT("Could not create thread pool(%d)", direct_read_max_prefetch_thread_count);
+            S3FS_PRN_EXIT("Could not create thread pool(%d)", direct_read_max_prefetch_thread_count);
             s3fs_exit_fuseloop(EXIT_FAILURE);
         }
         uint64_t mem_capacity = DirectReader::GetPrefetchCacheLimits() / DirectReader::GetChunkSize();
         if(!MemoryPool::Initialize(mem_capacity, DirectReader::GetChunkSize())) {
-            S3FS_PRN_CRIT("Could not initialize DirectReader memory pool.");
+            S3FS_PRN_EXIT("Could not initialize DirectReader memory pool.");
             s3fs_exit_fuseloop(EXIT_FAILURE);
         }
     }
@@ -3738,14 +3738,13 @@ static int s3fs_check_service()
 
     // check loading IAM role name
     if(!ps3fscred->LoadIAMRoleFromMetaData()){
-        S3FS_PRN_CRIT("could not load IAM role name from meta data.");
-        s3fs_exit_fuseloop(EXIT_FAILURE);
-        return NULL;
+        S3FS_PRN_EXIT("could not load RAM role name from instance meta data.");
+        return EXIT_FAILURE;
     }
 
     // At first time for access OSS, we check IAM role if it sets.
     if(!ps3fscred->CheckIAMCredentialUpdate()){
-        S3FS_PRN_CRIT("Failed to initialize IAM credential.");
+        S3FS_PRN_EXIT("Failed to initialize RAM credential.");
         return EXIT_FAILURE;
     }
 
@@ -3844,20 +3843,20 @@ static int s3fs_check_service()
             check_error_message(body->c_str(), body->size(), errMessage);
             bool is_failure = true;
             if(responseCode == 400){
-                S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Bad Request(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+                S3FS_PRN_EXIT("Failed to check bucket and directory for mount point : Bad Request(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }else if(responseCode == 403){
-                 S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Invalid Credentials(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+                 S3FS_PRN_EXIT("Failed to check bucket and directory for mount point : Invalid Credentials(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }else if (responseCode == 404) {
                 std::string value;
                 if(simple_parse_xml(body->c_str(), body->size(), "Code", value)) {
                     if(value == "NoSuchBucket") {
-                        S3FS_PRN_CRIT("Failed to check bucket : Bucket not found(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+                        S3FS_PRN_EXIT("Failed to check bucket : Bucket not found(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
                     } else {
                         is_failure = false;
                     }
                 }
             }else{
-                S3FS_PRN_CRIT("Failed to check bucket and directory for mount point : Unable to connect(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+                S3FS_PRN_EXIT("Failed to check bucket and directory for mount point : Unable to connect(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
             }
             if (is_failure) {
                 return EXIT_FAILURE;
@@ -4932,6 +4931,7 @@ int main(int argc, char* argv[])
     // should have been set
     struct fuse_args custom_args = FUSE_ARGS_INIT(argc, argv);
     if(0 != fuse_opt_parse(&custom_args, NULL, NULL, my_fuse_opt_proc)){
+        S3FS_PRN_EXIT("Fail to parse options, please check your options.");
         S3fsCurl::DestroyS3fsCurl();
         s3fs_destroy_global_ssl();
         destroy_parser_xml_lock();

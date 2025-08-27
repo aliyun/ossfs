@@ -266,7 +266,7 @@ class S3fsCurl
         int MapPutErrorResponse(int result);
 
         std::string CalcSignatureOSSV1(const std::string& method, const std::string& strMD5, const std::string& content_type, const std::string& date, const std::string& resource, const std::string& secret_access_key, const std::string& access_token);
-        std::string CalcSignatureOSSV4(const std::string& method, const std::string& canonical_url, const std::string& canonical_query_string, const std::string& canonical_headers, const std::string& additional_headers, const std::string& hash_payload, const std::string& secret_access_key);
+        std::string CalcSignatureOSSV4(const std::string& method, const std::string& canonical_url, const std::string& canonical_query_string, const std::string& canonical_headers, const std::string& additional_headers, const std::string& hash_payload, const std::string& secret_access_key, time_t signingTime);
         void insertOSSV1Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token);
         void insertOSSV4Headers(const std::string& access_key_id, const std::string& secret_access_key, const std::string& access_token);
 
