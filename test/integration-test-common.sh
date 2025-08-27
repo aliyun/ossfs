@@ -68,7 +68,7 @@ OSSFS=../src/ossfs
 : "${OSS_REGION:="cn-zhangjiakou"}"
 : "${OSSFS_CREDENTIALS_FILE:="passwd-ossfs"}"
 : "${TEST_BUCKET_1:="ossfs-integration-test"}"
-: "${OSS_SIGNATURE_VERSION:="sigv1"}"
+: "${OSS_SIGNATURE_VERSION:="sigv4"}"
 
 export TEST_BUCKET_1
 export OSS_URL
@@ -204,7 +204,7 @@ function start_ossfs {
     # eg: VALGRIND="--tool=memcheck --leak-check=full" ./small-integration-test.sh
     # Start valgrind-listener (default port is 1500)
     if [ -n "${VALGRIND}" ]; then
-        VALGRIND_EXEC="valgrind ${VALGRIND} --log-socket=127.0.1.1"
+        VALGRIND_EXEC="valgrind ${VALGRIND} --log-file=valgrind.%p.log"
     fi
 
     # On OSX only, we need to specify the direct_io and auto_cache flag.

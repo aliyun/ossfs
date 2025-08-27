@@ -1,5 +1,9 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.8 (27/08/2025)
+ - Print some prompts when mounting fails.
+ - Fixed a bug that the signature might be mis-calculated when mounting with sigv4.
+
 ## v1.91.7 (01/07/2025)
  - Release ossfs of RockyLinux 9.
  - Release ossfs of Ubuntu 24.04.

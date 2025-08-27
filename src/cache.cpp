@@ -886,6 +886,12 @@ bool StatCache::ConvertMetaToStat(const std::string& strpath, const headers_t& m
 
 bool StatCache::ToTimeStat(const headers_t& meta, struct stat* pst)
 {
+    if (!pst) {
+        return false;
+    }
+
+    memset(pst, 0, sizeof(struct stat));
+    
     // mtime
     struct timespec mtime = get_mtime(meta);
     if(pst->st_mtime < 0){
