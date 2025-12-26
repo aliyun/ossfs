@@ -1,5 +1,14 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.9 (24/12/2025)
+ - Release ossfs of Alibaba Cloud Linux 4.
+ - Optimize max-keys to 2 when checking bucket.
+ - Optimize the behavior when ossfs receives null path.
+ - Fix a bug that the request may hang when trying to get api token with imdsv2 is turned on.
+ - Fill a non-zero value of inodes number for statfs.
+ - Adjust the default log level to error.
+ - Fix a bug that reading the same file (updated on the cloud within 1s) gets invalid contents.
+
 ## v1.91.8 (27/08/2025)
  - Print some prompts when mounting fails.
  - Fixed a bug that the signature might be mis-calculated when mounting with sigv4.

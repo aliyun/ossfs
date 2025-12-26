@@ -85,6 +85,8 @@ class S3fsCred
         fp_InitS3fsCredential    pFuncCredInit;
         fp_FreeS3fsCredential    pFuncCredFree;
         fp_UpdateS3fsCredential  pFuncCredUpdate;
+
+        std::string         credential_process;
     public:
         static std::string       RAMv2_token_hdr;
 
@@ -121,7 +123,7 @@ class S3fsCred
 
         bool GetRAMCredentialsURL(std::string& url, bool check_ram_role, AutoLock::Type type);
         bool LoadRAMCredentials(AutoLock::Type type);
-        bool SetRAMCredentials(const char* response, AutoLock::Type type);
+        bool SetRAMCredentials(const char* response,  AutoLock::Type type, bool check_field_cnt = true);
         bool SetRAMRoleFromMetaData(const char* response, AutoLock::Type type);
         bool GetTokenIMDSV2(std::string &token);
 
@@ -136,6 +138,10 @@ class S3fsCred
         bool UpdateExtCredentials(AutoLock::Type type);
 
         bool CheckForbiddenBucketParams();
+
+        bool SetCredProcess(const char* arg);
+        bool IsSetCredProcess() const;
+        bool UpdateCredFromProc(AutoLock::Type type);
 
     public:
         static bool SetBucket(const char* bucket);

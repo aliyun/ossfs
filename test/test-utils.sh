@@ -255,7 +255,7 @@ function describe {
 # made after the test run.  
 function run_suite {
    orig_dir="${PWD}"
-   key_prefix="testrun-${RANDOM}"
+   key_prefix="testrun-${TEST_NUMBER}"
    cd_run_dir "${key_prefix}"
    for t in "${TEST_LIST[@]}"; do
        # Ensure test input name differs every iteration

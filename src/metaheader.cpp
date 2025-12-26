@@ -323,8 +323,8 @@ time_t cvtIAMExpireStringToTime(const char* s)
         return 0L;
     }
     memset(&tm, 0, sizeof(struct tm));
-    strptime(s, "%Y-%m-%dT%H:%M:%S", &tm);
-    return timegm(&tm); // GMT
+    char *r = strptime(s, "%Y-%m-%dT%H:%M:%S", &tm);
+    return r ? timegm(&tm) : 0L; // GMT
 }
 
 time_t get_lastmodified(const char* s)

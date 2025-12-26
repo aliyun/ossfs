@@ -29,18 +29,21 @@ RAN_MODE=$1
 
 if (( $RAN_MODE == 1 )); then
   # run tests with libstc++ debug mode, https://gcc.gnu.org/onlinedocs/libstdc++/manual/debug_mode.html
+  echo "run tests with libstc++ debug mode"
   make clean
   ./configure CXXFLAGS="$COMMON_FLAGS -D_GLIBCXX_DEBUG"
   make
   DBGLEVEL=debug make check -C test/
 elif (( $RAN_MODE == 2 )); then
   # run tests under AddressSanitizer, https://clang.llvm.org/docs/AddressSanitizer.html
+  echo "run tests under AddressSanitizer"
   make clean
   ./configure CXX=g++ CXXFLAGS="$COMMON_FLAGS -fsanitize=address"
   make
   ASAN_OPTIONS='detect_leaks=1,detect_stack_use_after_return=1' make check -C test/
 elif (( $RAN_MODE == 3 )); then
   # run tests with Valgrind
+  echo "run tests with Valgrind"
   make clean
   ./configure CXXFLAGS="$COMMON_FLAGS"
   make --jobs="$(nproc)"

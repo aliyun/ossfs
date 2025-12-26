@@ -43,6 +43,7 @@ BACKWARD_CHUNKS=1
 DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB=2048
 AHBE_CONFIG="./sample_ahbe.conf"
 
+export TEST_NUMBER=1
 export CACHE_DIR
 export LOGFILE
 export CHECK_CACHE_FILE
@@ -103,6 +104,8 @@ for flag in "${FLAGS[@]}"; do
 
     ./integration-test-main.sh
 
+    TEST_NUMBER=$((TEST_NUMBER + 1))
+    
     stop_ossfs
 done
 

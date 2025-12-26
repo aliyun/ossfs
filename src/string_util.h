@@ -51,6 +51,13 @@ template <class T> std::string str(T value);
             ARG = ARG##_buf.c_str(); \
         }
 
+#define CHECKPATH(path)              \
+  do {                               \
+    if (!path) {                     \
+      S3FS_PRN_ERR("path is null!"); \
+      return -ESTALE;                \
+    }                                \
+  } while (0)
 //-------------------------------------------------------------------
 // Utilities
 //-------------------------------------------------------------------

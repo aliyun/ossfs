@@ -885,7 +885,7 @@ bool PageList::Serialize(CacheFileStat& file, bool is_output, ino_t inode)
             }
         }
         // check inode number
-        if(0 != cache_inode && cache_inode != inode){
+        if(0 != cache_inode && inode != 0 && cache_inode != inode){
             S3FS_PRN_ERR("differ inode and inode number in parsed cache stats.");
             delete[] ptmp;
             return false;
