@@ -2,6 +2,7 @@
 
 ECS_KEY=$1
 ECS_HOST=$2
+RAMROLE=$3
 LOGFILE=/root/log
 REMOTE_RESULT_FILE=/root/ossfs-result
 
@@ -48,6 +49,8 @@ ssh -i ${ECS_KEY} root@${ECS_HOST} "
 cd /root/longterm-stability-test
 chmod 777 longterm-stability-test.sh
 ./longterm-stability-test.sh /mnt ${LOGFILE} ${REMOTE_RESULT_FILE}
+chmod 777 credential-test.sh
+./credential-test.sh /mnt ${RAMROLE} ${LOGFILE} >> ${REMOTE_RESULT_FILE}
 "
 
 ssh -i ${ECS_KEY} root@${ECS_HOST} "cat ${REMOTE_RESULT_FILE}" > ${LOCAL_RESULT_FILE}

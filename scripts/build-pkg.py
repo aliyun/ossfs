@@ -23,8 +23,6 @@ docker_images = {
     'centos7.0:test':'ossfs-centos7.0:test',
     'centos8.0:dev':'ossfs-centos8.0:dev',
     'centos8.0:test':'ossfs-centos8.0:test',
-    'ubuntu18.04:dev':'ossfs-ubuntu18.04:dev',
-    'ubuntu18.04:test':'ossfs-ubuntu18.04:test',
     'ubuntu20.04:dev':'ossfs-ubuntu20.04:dev',
     'ubuntu20.04:test':'ossfs-ubuntu20.04:test',
     'ubuntu22.04:dev':'ossfs-ubuntu22.04:dev',
@@ -39,11 +37,13 @@ docker_images = {
     'alinux2:test':'ossfs-alinux2:test',
     'alinux3:dev':'ossfs-alinux3:dev',
     'alinux3:test':'ossfs-alinux3:test',
+    'alinux4:dev':'ossfs-alinux4:dev',
+    'alinux4:test':'ossfs-alinux4:test',
     'rockylinux9:dev':'ossfs-rockylinux9:dev',
     'rockylinux9:test':'ossfs-rockylinux9:test',
 }
 
-os_list = ['ubuntu18.04', 'ubuntu20.04', 'ubuntu22.04', 'ubuntu24.04', 'centos7.0', 'centos8.0', 'alinux2', 'alinux3', 'rockylinux9']
+os_list = ['ubuntu20.04', 'ubuntu22.04', 'ubuntu24.04', 'centos7.0', 'centos8.0', 'alinux2', 'alinux3', 'alinux4', 'rockylinux9']
 working_dir = '/tmp/ossfs'
 dest_dir = '/var/ossfs'
 ossfs_source_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -352,6 +352,11 @@ def build_docker_image():
     exec_cmd('docker pull alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest')
     exec_cmd('docker tag alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest ossfs-alinux3:test')
     exec_cmd('docker build -t ossfs-alinux3:dev %s/scripts/docker-file/alinux/3'%ossfs_source_dir)
+
+    #alibaba cloud linux 4
+    exec_cmd('docker pull alibaba-cloud-linux-4-registry.cn-hangzhou.cr.aliyuncs.com/alinux4/alinux4:latest')
+    exec_cmd('docker tag alibaba-cloud-linux-4-registry.cn-hangzhou.cr.aliyuncs.com/alinux4/alinux4:latest ossfs-alinux4:test')
+    exec_cmd('docker build -t ossfs-alinux4:dev %s/scripts/docker-file/alinux/4'%ossfs_source_dir)
     
     #rocky Linux 9
     exec_cmd('docker pull rockylinux:9')

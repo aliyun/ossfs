@@ -2690,9 +2690,8 @@ int S3fsCurl::GetIAMv2ApiToken(const char* token_url, int token_ttl, const char*
     // and aws responds with a 417 Expectation Failed. This ensures the 
     // Expect header is empty before the request is sent.
     // requestHeaders = curl_slist_sort_insert(requestHeaders, "Expect", "");
-
-    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_PUT, true)){
-        return -EIO;
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){
+      return -EIO;
     }
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
         return -EIO;
@@ -2701,6 +2700,9 @@ int S3fsCurl::GetIAMv2ApiToken(const char* token_url, int token_ttl, const char*
         return -EIO;
     }
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0)){
         return -EIO;
     }
     if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
@@ -3443,11 +3445,12 @@ int S3fsCurl::CheckBucket(const char* check_path)
     if(!CreateCurlHandle()){
         return -EIO;
     }
-    std::string urlargs;
     if(S3fsCurl::IsListObjectsV2()){
-        query_string = "list-type=2";
-        urlargs = "?" + query_string;
+        query_string = "list-type=2&max-keys=2";
+    } else {
+        query_string = "max-keys=2";
     }
+    std::string urlargs = "?" + query_string;
     std::string resource;
     std::string turl;
     MakeUrlResource(check_path, resource, turl);

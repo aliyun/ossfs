@@ -34,7 +34,7 @@ const char* const       S3fsLog::nest_spaces[S3fsLog::NEST_MAX] = {"", "  ", "  
 const char              S3fsLog::LOGFILEENV[]     = "OSSFS_LOGFILE";
 const char              S3fsLog::MSGTIMESTAMP[]   = "OSSFS_MSGTIMESTAMP";
 S3fsLog*                S3fsLog::pSingleton       = NULL;
-S3fsLog::s3fs_log_level S3fsLog::debug_level      = S3fsLog::LEVEL_CRIT;
+S3fsLog::s3fs_log_level S3fsLog::debug_level      = S3fsLog::LEVEL_ERR;
 FILE*                   S3fsLog::logfp            = NULL;
 std::string*            S3fsLog::plogfile         = NULL;
 bool                    S3fsLog::time_stamp       = true;
@@ -148,7 +148,7 @@ S3fsLog::~S3fsLog()
             S3fsLog::plogfile = NULL;
         }
         S3fsLog::pSingleton  = NULL;
-        S3fsLog::debug_level = S3fsLog::LEVEL_CRIT;
+        S3fsLog::debug_level = S3fsLog::LEVEL_ERR;
 
         closelog();
     }else{

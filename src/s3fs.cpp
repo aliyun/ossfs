@@ -762,6 +762,7 @@ int put_headers(const char* path, headers_t& meta, bool is_copy, bool use_st_siz
 
 static int s3fs_getattr(const char* _path, struct stat* stbuf)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
 
@@ -901,6 +902,7 @@ static int create_file_object(const char* path, mode_t mode, uid_t uid, gid_t gi
 
 static int s3fs_mknod(const char *_path, mode_t mode, dev_t rdev)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int       result;
     struct fuse_context* pcxt;
@@ -923,6 +925,7 @@ static int s3fs_mknod(const char *_path, mode_t mode, dev_t rdev)
 
 static int s3fs_create(const char* _path, mode_t mode, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     struct fuse_context* pcxt;
@@ -1008,6 +1011,7 @@ static int create_directory_object(const char* path, mode_t mode, time_t atime, 
 
 static int s3fs_mkdir(const char* _path, mode_t mode)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     struct fuse_context* pcxt;
@@ -1039,6 +1043,7 @@ static int s3fs_mkdir(const char* _path, mode_t mode)
 
 static int s3fs_unlink(const char* _path)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
 
@@ -1074,6 +1079,7 @@ static int directory_empty(const char* path)
 
 static int s3fs_rmdir(const char* _path)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     std::string strpath;
@@ -1131,6 +1137,8 @@ static int s3fs_rmdir(const char* _path)
 
 static int s3fs_symlink(const char* _from, const char* _to)
 {
+    CHECKPATH(_from);
+    CHECKPATH(_to);
     WTF8_ENCODE(from)
     WTF8_ENCODE(to)
     int result;
@@ -1547,6 +1555,8 @@ static int rename_directory(const char* from, const char* to)
 
 static int s3fs_rename(const char* _from, const char* _to)
 {
+    CHECKPATH(_from);
+    CHECKPATH(_to);
     WTF8_ENCODE(from)
     WTF8_ENCODE(to)
     struct stat buf;
@@ -1609,6 +1619,7 @@ static int s3fs_link(const char* _from, const char* _to)
 
 static int s3fs_chmod(const char* _path, mode_t mode)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     std::string strpath;
@@ -1706,6 +1717,7 @@ static int s3fs_chmod(const char* _path, mode_t mode)
 
 static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int         result;
     std::string strpath;
@@ -1788,6 +1800,7 @@ static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
 
 static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     std::string strpath;
@@ -1891,6 +1904,7 @@ static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
 
 static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int         result;
     std::string strpath;
@@ -1992,6 +2006,7 @@ static timespec handle_utimens_special_values(timespec ts, timespec now, timespe
 
 static int s3fs_utimens(const char* _path, const struct timespec ts[2])
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     std::string strpath;
@@ -2119,6 +2134,7 @@ static int s3fs_utimens(const char* _path, const struct timespec ts[2])
 
 static int s3fs_utimens_nocopy(const char* _path, const struct timespec ts[2])
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int         result;
     std::string strpath;
@@ -2217,6 +2233,7 @@ static int s3fs_utimens_nocopy(const char* _path, const struct timespec ts[2])
 
 static int s3fs_truncate(const char* _path, off_t size)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int          result;
     headers_t    meta;
@@ -2319,6 +2336,7 @@ static int s3fs_truncate(const char* _path, off_t size)
 
 static int s3fs_open(const char* _path, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     struct stat st;
@@ -2396,6 +2414,7 @@ static int s3fs_open(const char* _path, struct fuse_file_info* fi)
 
 static int s3fs_read(const char* _path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     ssize_t res;
 
@@ -2424,6 +2443,7 @@ static int s3fs_read(const char* _path, char* buf, size_t size, off_t offset, st
 
 static int s3fs_write(const char* _path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     ssize_t res;
 
@@ -2460,9 +2480,9 @@ static int s3fs_write(const char* _path, const char* buf, size_t size, off_t off
 
 static int s3fs_statfs(const char* _path, struct statvfs* stbuf)
 {
-    // WTF8_ENCODE(path)
+    memset(stbuf, 0, sizeof(struct statvfs));
     stbuf->f_bsize  = 16 * 1024 * 1024;
-    stbuf->f_namemax = NAME_MAX;
+
 #ifdef __MSYS__
     // WinFsp resolves the free space from f_bfree * f_frsize, and the total space from f_blocks * f_frsize (in bytes).
     stbuf->f_frsize = stbuf->f_bsize;
@@ -2474,11 +2494,18 @@ static int s3fs_statfs(const char* _path, struct statvfs* stbuf)
 #endif
     stbuf->f_bavail = stbuf->f_blocks;
 
+    stbuf->f_files = std::numeric_limits<uint64_t>::max() / 1024;
+    stbuf->f_ffree = stbuf->f_files;
+    stbuf->f_favail = stbuf->f_ffree;
+
+    stbuf->f_namemax = NAME_MAX;
+
     return 0;
 }
 
 static int s3fs_flush(const char* _path, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
 
@@ -2515,6 +2542,7 @@ static int s3fs_flush(const char* _path, struct fuse_file_info* fi)
 //
 static int s3fs_fsync(const char* _path, int datasync, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result = 0;
 
@@ -2539,6 +2567,7 @@ static int s3fs_fsync(const char* _path, int datasync, struct fuse_file_info* fi
 
 static int s3fs_release(const char* _path, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     S3FS_PRN_INFO("[path=%s][pseudo_fd=%llu]", path, (unsigned long long)(fi->fh));
 
@@ -2583,6 +2612,7 @@ static int s3fs_release(const char* _path, struct fuse_file_info* fi)
 
 static int s3fs_opendir(const char* _path, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     int result;
     int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK);
@@ -2858,6 +2888,7 @@ static int readdir_multi_head_optimize(const char* path, const S3ObjList& head, 
 
 static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi)
 {
+    CHECKPATH(_path);
     WTF8_ENCODE(path)
     S3ObjList head;
     int result;
@@ -3171,6 +3202,7 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
 static int s3fs_setxattr(const char* path, const char* name, const char* value, size_t size, int flags)
 #endif
 {
+    CHECKPATH(path);
     S3FS_PRN_INFO("[path=%s][name=%s][value=%p][size=%zu][flags=0x%x]", path, name, value, size, flags);
 
     if((value && 0 == size) || (!value && 0 < size)){
@@ -3649,6 +3681,7 @@ static void s3fs_destroy(void*)
 
 static int s3fs_access(const char* path, int mask)
 {
+    CHECKPATH(path);
     S3FS_PRN_INFO("[path=%s][mask=%s%s%s%s]", path,
             ((mask & R_OK) == R_OK) ? "R_OK " : "",
             ((mask & W_OK) == W_OK) ? "W_OK " : "",

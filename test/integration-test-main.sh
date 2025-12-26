@@ -3074,6 +3074,19 @@ function test_statvfs {
         echo "The result of df <mount point> command is wrong: Total=${TOTAL_SIZE}, Used=${USED_SIZE}, Available=${AVAIL_SIZE}"
         return 1
     fi
+
+    local Inodes; Inodes=`df -i ${MOUNTPOINT_DIR} | grep ossfs | awk '{print $2}'`
+    # 2^54 - 1
+    if [[ $Inodes -ne 18014398509481983 ]]; then
+        echo "Inodes is not 18014398509481983: $Inodes"
+        return 1
+    fi
+
+    local IFree; IFree=`df -i ${MOUNTPOINT_DIR} | grep ossfs | awk '{print $4}'`
+    if [[ $IFree -ne $Inodes ]]; then
+        echo "IFree is not 18014398509481983: $IFree"
+        return 1
+    fi
 }
 
 function test_umask {
@@ -3238,6 +3251,35 @@ function test_auto_cache {
     fi
 }
 
+function test_read_in_1s {
+  describe "Testing read_in_1s option"
+
+  local BASENAME=$(basename "${PWD}")
+  local TEST_FILE_NAME="test_read_in_1s.txt"
+  for i in {1..10}; do 
+    echo "append_${i}" >> ${TEMP_DIR}/${TEST_FILE_NAME}
+    
+    aws_cli s3 cp "${TEMP_DIR}/${TEST_FILE_NAME}" "s3://${TEST_BUCKET_1}/${BASENAME}/${SYMLINK_TARGET_FILE}" --no-progress 
+    if ! cmp "${TEMP_DIR}/${TEST_FILE_NAME}" "${TEST_FILE_NAME}"; then
+      echo "round ${i} failed" 
+      return 1
+    fi
+  done
+
+  for i in {1..10}; do
+    dd if=/dev/urandom of=${TEMP_DIR}/${TEST_FILE_NAME} bs=1 count=$((11-$i))
+    
+    aws_cli s3 cp "${TEMP_DIR}/${TEST_FILE_NAME}" "s3://${TEST_BUCKET_1}/${BASENAME}/${SYMLINK_TARGET_FILE}" --no-progress 
+    if ! cmp "${TEMP_DIR}/${TEST_FILE_NAME}" "${TEST_FILE_NAME}"; then
+      echo "round ${i} failed" 
+      return 1
+    fi
+  done
+
+  rm -f "${TEMP_DIR}/${TEST_FILE_NAME}"
+  rm -f "${TEST_FILE_NAME}"
+}
+
 function add_all_tests {
     if ps u -p "${OSSFS_PID}" | grep -q auto_cache; then
         add_tests test_auto_cache
@@ -3255,6 +3297,7 @@ function add_all_tests {
     if ! ps u -p "${OSSFS_PID}" | grep -q ensure_diskfree && ! uname | grep -q Darwin; then
         add_tests test_clean_up_cache
     fi
+    add_tests test_read_in_1s
     add_tests test_create_empty_file
     add_tests test_append_file
     add_tests test_truncate_file

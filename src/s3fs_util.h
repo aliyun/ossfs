@@ -53,6 +53,7 @@ bool delete_files_in_dir(const char* dir, bool is_remove_own);
 bool compare_sysname(const char* target);
 
 void print_launch_message(int argc, char** argv);
+int s3fs_run_command(const std::string& script, std::string &output, bool capture_stderr = false);
 
 #endif // S3FS_S3FS_UTIL_H_
 

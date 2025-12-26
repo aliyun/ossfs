@@ -457,6 +457,9 @@ int FdEntity::Open(const headers_t* pmeta, off_t size, time_t time, int flags, A
 
         if(!cachepath.empty()){
             // using cache
+            // open cache and cache stat file, load page info.
+            CacheFileStat cfstat(path.c_str());
+
             struct stat st;
             if(stat(cachepath.c_str(), &st) == 0){
                 if(st.st_mtime < time){
@@ -464,11 +467,18 @@ int FdEntity::Open(const headers_t* pmeta, off_t size, time_t time, int flags, A
                     if(unlink(cachepath.c_str()) != 0){
                         return (0 == errno ? -EIO : -errno);
                     }
+                } else if (size != -1 && size != st.st_size && 
+                    pagelist.Serialize(cfstat, false, 0) && 
+                    !pagelist.IsModified()) {
+                    S3FS_PRN_DBG("cache file size mismatch: remote size=%ld, cache file size=%ld, removing: %s", 
+                                size, st.st_size, cachepath.c_str());
+                    if(unlink(cachepath.c_str()) != 0){
+                        return (0 == errno ? -EIO : -errno);
+                    }
+
+                    pagelist.Clear();
                 }
             }
-
-            // open cache and cache stat file, load page info.
-            CacheFileStat cfstat(path.c_str());
 
             // try to open cache file
             if( -1 != (physical_fd = open(cachepath.c_str(), O_RDWR)) &&

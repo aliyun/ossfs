@@ -31,6 +31,7 @@
 #include "curl.h"
 #include "string_util.h"
 #include "metaheader.h"
+#include "s3fs_util.h"
 
 //-------------------------------------------------------------------
 // Symbols
@@ -187,7 +188,8 @@ S3fsCred::S3fsCred() :
     pFuncCredVersion(VersionS3fsCredential),
     pFuncCredInit(InitS3fsCredential),
     pFuncCredFree(FreeS3fsCredential),
-    pFuncCredUpdate(UpdateS3fsCredential)
+    pFuncCredUpdate(UpdateS3fsCredential),
+    credential_process("")
 {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -450,7 +452,7 @@ bool S3fsCred::LoadIAMRoleFromMetaData()
     return true;
 }
 
-bool S3fsCred::SetRAMCredentials(const char* response, AutoLock::Type type)
+bool S3fsCred::SetRAMCredentials(const char* response, AutoLock::Type type, bool check_field_cnt)
 {
     S3FS_PRN_INFO3("RAM credential response = \"%s\"", response);
 
@@ -460,17 +462,26 @@ bool S3fsCred::SetRAMCredentials(const char* response, AutoLock::Type type)
         return false;
     }
 
-    if(RAM_field_count != keyval.size()){
+    if(check_field_cnt && RAM_field_count != keyval.size()){
         return false;
     }
 
     AutoLock auto_lock(&token_lock, type);
 
+    // Empty string if RAM_token_field is not found.
     SecurityToken = keyval[RAM_token_field];
 
     AccessKeyId       = keyval[std::string(S3fsCred::RAMCRED_ACCESSKEYID)];
     AccessKeySecret   = keyval[std::string(S3fsCred::RAMCRED_SECRETACCESSKEY)];
-    SecurityTokenExpire = cvtIAMExpireStringToTime(keyval[RAM_expiry_field].c_str());
+
+    auto exp_iter = keyval.find(RAM_expiry_field);
+    if (exp_iter == keyval.end()) {
+      // If the expiry time's format is not set, take the AK/SK as never expired.
+      SecurityTokenExpire = LONG_MAX;
+    } else {
+      // If the expiry time's format is invalid, set it to 0.
+      SecurityTokenExpire = cvtIAMExpireStringToTime(exp_iter->second.c_str());
+    }
 
     return true;
 }
@@ -817,7 +828,7 @@ bool S3fsCred::InitialCredentials()
     }
 
     // access key loading is deferred
-    if(load_ramrole || IsSetExtCredLib()){
+    if(load_ramrole || IsSetExtCredLib() || IsSetCredProcess()){
         return true;
     }
 
@@ -925,6 +936,7 @@ bool S3fsCred::ParseRAMCredentialResponse(const char* response, ramcredmap_t& ke
     std::istringstream sscred(response);
     std::string        oneline;
     keyval.clear();
+
     while(getline(sscred, oneline, ',')){
         std::string::size_type pos;
         std::string            key;
@@ -961,28 +973,36 @@ bool S3fsCred::ParseRAMCredentialResponse(const char* response, ramcredmap_t& ke
 
         keyval[key] = val;
     }
-    return true;
+
+    // At least AK and SK are required in the response.
+    return keyval.count(S3fsCred::RAMCRED_ACCESSKEYID) && 
+           keyval.count(S3fsCred::RAMCRED_SECRETACCESSKEY);
 }
 
 bool S3fsCred::CheckIAMCredentialUpdate(std::string* access_key_id, std::string* secret_access_key, std::string* access_token)
 {
     AutoLock auto_lock(&token_lock);
 
-    if(IsSetExtCredLib() || IsSetRAMRole(AutoLock::ALREADY_LOCKED)){
+    if(IsSetExtCredLib() || IsSetCredProcess() || IsSetRAMRole(AutoLock::ALREADY_LOCKED)){
         if(SecurityTokenExpire < (time(NULL) + S3fsCred::RAM_EXPIRE_MERGIN)){
             S3FS_PRN_INFO("Security Token refreshing...");
 
             // update
-            if(!IsSetExtCredLib()){
-                if(!LoadRAMCredentials(AutoLock::ALREADY_LOCKED)){
-                    S3FS_PRN_ERR("Security Token refresh failed");
-                    return false;
-                }
-            }else{
-                if(!UpdateExtCredentials(AutoLock::ALREADY_LOCKED)){
-                    S3FS_PRN_ERR("Access Token refresh by %s(external credential library) failed", credlib.c_str());
-                    return false;
-                }
+            if (IsSetExtCredLib()) {
+              if (!UpdateExtCredentials(AutoLock::ALREADY_LOCKED)) {
+                S3FS_PRN_ERR("Access Token refresh by %s(external credential library) failed", credlib.c_str());
+                return false;
+              }
+            } else if (IsSetCredProcess()) {
+              if (!UpdateCredFromProc(AutoLock::ALREADY_LOCKED)) {
+                S3FS_PRN_ERR("Access Token refresh by %s(credential process) failed", credential_process.c_str());
+                return false;
+              }
+            } else {
+              if (!LoadRAMCredentials(AutoLock::ALREADY_LOCKED)) {
+                S3FS_PRN_ERR("Security Token refresh failed");
+                return false;
+              }
             }
             S3FS_PRN_INFO("Security Token refreshed");
         }
@@ -996,7 +1016,7 @@ bool S3fsCred::CheckIAMCredentialUpdate(std::string* access_key_id, std::string*
         *secret_access_key = AccessKeySecret;
     }
     if(access_token){
-        if(IsSetRAMRole(AutoLock::ALREADY_LOCKED) || IsSetExtCredLib() || is_use_session_token){
+        if(IsSetRAMRole(AutoLock::ALREADY_LOCKED) || IsSetExtCredLib() || is_use_session_token || IsSetCredProcess()){
             *access_token = SecurityToken;
         }else{
             access_token->erase();
@@ -1004,16 +1024,6 @@ bool S3fsCred::CheckIAMCredentialUpdate(std::string* access_key_id, std::string*
     }
 
     return true;
-}
-
-const char* S3fsCred::GetCredFuncVersion(bool detail) const
-{
-    static const char errVersion[] = "unknown";
-
-    if(!pFuncCredVersion){
-        return errVersion;
-    }
-    return (*pFuncCredVersion)(detail);
 }
 
 //-------------------------------------------------------------------
@@ -1171,25 +1181,25 @@ bool S3fsCred::UpdateExtCredentials(AutoLock::Type type)
     AutoLock auto_lock(&token_lock, type);
 
     char* paccess_key_id     = nullptr;
-    char* pserect_access_key = nullptr;
+    char* psecret_access_key = nullptr;
     char* paccess_token      = nullptr;
     char* perrstr            = nullptr;
     long long token_expire   = 0;
-    bool result = (*pFuncCredUpdate)(&paccess_key_id, &pserect_access_key, &paccess_token, &token_expire, &perrstr);
+    bool result = (*pFuncCredUpdate)(&paccess_key_id, &psecret_access_key, &paccess_token, &token_expire, &perrstr);
     if(!result){
         // error occurred
         S3FS_PRN_ERR("Could not update credential by \"UpdateS3fsCredential\" function : %s", perrstr ? perrstr : "unknown");
 
     // cppcheck-suppress unmatchedSuppression
     // cppcheck-suppress knownConditionTrueFalse
-    }else if(!paccess_key_id || !pserect_access_key || !paccess_token || token_expire <= 0){
+    }else if(!paccess_key_id || !psecret_access_key || !paccess_token || token_expire <= 0){
         // some variables are wrong
-        S3FS_PRN_ERR("After updating credential by \"UpdateS3fsCredential\" function, but some variables are wrong : paccess_key_id=%p, pserect_access_key=%p, paccess_token=%p, token_expire=%lld", paccess_key_id, pserect_access_key, paccess_token, token_expire);
+        S3FS_PRN_ERR("After updating credential by \"UpdateS3fsCredential\" function, but some variables are wrong : paccess_key_id=%p, psecret_access_key=%p, paccess_token=%p, token_expire=%lld", paccess_key_id, psecret_access_key, paccess_token, token_expire);
         result = false;
     }else{
         // succeed updating
         AccessKeyId       = paccess_key_id;
-        AccessKeySecret   = pserect_access_key;
+        AccessKeySecret   = psecret_access_key;
         SecurityToken       = paccess_token;
         SecurityTokenExpire = token_expire;
     }
@@ -1202,8 +1212,8 @@ bool S3fsCred::UpdateExtCredentials(AutoLock::Type type)
     }
     // cppcheck-suppress unmatchedSuppression
     // cppcheck-suppress knownConditionTrueFalse
-    if(pserect_access_key){
-        free(pserect_access_key);
+    if(psecret_access_key){
+        free(psecret_access_key);
     }
     // cppcheck-suppress unmatchedSuppression
     // cppcheck-suppress knownConditionTrueFalse
@@ -1217,6 +1227,57 @@ bool S3fsCred::UpdateExtCredentials(AutoLock::Type type)
     }
 
     return result;
+}
+
+const char* S3fsCred::GetCredFuncVersion(bool detail) const
+{
+    static const char errVersion[] = "unknown";
+
+    if(!pFuncCredVersion){
+        return errVersion;
+    }
+    return (*pFuncCredVersion)(detail);
+}
+
+//-------------------------------------------------------------------
+// Methods: External Credential Process
+//-------------------------------------------------------------------
+bool S3fsCred::SetCredProcess(const char* arg) {
+    // Consult https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sourcing-external.html
+    // Do not include any environment variables in the strings. For example, you can't include $HOME.
+    if(!arg || strlen(arg) == 0 || arg[0] != '/' || strchr(arg, '$')){
+        return false;
+    }
+    credential_process = arg;
+
+    return true;
+}
+
+bool S3fsCred::IsSetCredProcess() const {
+  return !credential_process.empty();
+}
+
+bool S3fsCred::UpdateCredFromProc(AutoLock::Type type) {
+  AutoLock auto_lock(&token_lock, type);
+  char* paccess_key_id     = nullptr;
+  char* psecret_access_key = nullptr;
+  char* paccess_token      = nullptr;
+  long long token_expire   = 0;
+
+  std::string output;
+  int r = s3fs_run_command(credential_process, output);
+  if (r != 0) {
+    S3FS_PRN_CRIT("Could not run external credential process commandline : %s", credential_process.c_str());
+    return false;
+  }
+
+  // The output MUST be of the same format as that returned by ramrole metadata.
+  if(!SetRAMCredentials(output.c_str(), AutoLock::ALREADY_LOCKED, false)){
+    S3FS_PRN_ERR("Something error occurred, could not set STS credentials.");
+    return false;
+  }
+
+	return true;
 }
 
 //-------------------------------------------------------------------
@@ -1268,6 +1329,14 @@ int S3fsCred::DetectParam(const char* arg)
     if (0 == strcmp(arg, "disable_imdsv2")) {
         imds_v2 = false;
         return 0;
+    }
+
+    if(is_prefix(arg, "credential_process=")) {
+      if(!SetCredProcess(strchr(arg, '=') + sizeof(char))){
+          S3FS_PRN_EXIT("failed to set credential process : %s", (strchr(arg, '=') + sizeof(char)));
+          return -1;
+      }
+      return 0;
     }
 
     if(is_prefix(arg, "credlib=")){
@@ -1342,7 +1411,7 @@ bool S3fsCred::CheckAllParams()
         return false;
     }
 
-    if(!S3fsCurl::IsPublicBucket() && !load_ramrole && !IsSetExtCredLib()){
+    if(!S3fsCurl::IsPublicBucket() && !load_ramrole && !IsSetExtCredLib() && !IsSetCredProcess()){
         if(!InitialCredentials()){
             return false;
         }
@@ -1360,7 +1429,7 @@ bool S3fsCred::CheckAllParams()
     // If credlib(_opts) option (for External Credential Library) is specified,
     // no other Credential related options can be specified. It is exclusive.
     //
-    if(set_builtin_cred_opts && (IsSetExtCredLib() || IsSetExtCredLibOpts())){
+    if(set_builtin_cred_opts && (IsSetExtCredLib() || IsSetExtCredLibOpts() || IsSetCredProcess())){
         S3FS_PRN_EXIT("The \"credlib\" or \"credlib_opts\" option and other credential-related options(passwd_file, iam_role, profile, use_session_token, ecs, imdsv1only, ibm_iam_auth, ibm_iam_endpoint, etc) cannot be specified together.");
         return false;
     }
@@ -1377,6 +1446,11 @@ bool S3fsCred::CheckAllParams()
              return false;
         }
         S3FS_PRN_INFO("Loaded External Credential Library:\n%s", GetCredFuncVersion(true));
+    }
+
+    if (IsSetCredProcess()) {
+      // If credential_process is a script path, please make sure that its mode is safe!!!
+      S3FS_PRN_INFO("Loaded Credential Process:\n%s", credential_process.c_str());
     }
 
     return true;

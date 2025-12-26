@@ -392,6 +392,48 @@ void print_launch_message(int argc, char** argv)
     S3FS_PRN_LAUNCH_INFO("%s", message.c_str());
 }
 
+//-------------------------------------------------------------------
+// Utility for running a script / cmd
+//-------------------------------------------------------------------
+int s3fs_run_command(const std::string& cmd, std::string &output, bool capture_stderr) {
+  std::string fullcmd = cmd;
+  if (capture_stderr) {
+    fullcmd += " 2>&1";
+  } else {
+    fullcmd += " 2>/dev/null";
+  }
+
+  FILE* pipe = popen(fullcmd.c_str(), "r");
+  if (!pipe) {
+    S3FS_PRN_ERR("popen failed: %s", std::strerror(errno));
+    return -1;
+  }
+
+  constexpr std::size_t BUFSIZE = 4096;
+  char buffer[BUFSIZE] = {0};
+  while (true) {
+    size_t n = fread(buffer, 1, BUFSIZE, pipe);
+    if (n > 0) output.append(buffer, buffer + n);
+    if (n < BUFSIZE) {
+      if (feof(pipe)) break;
+      if (ferror(pipe)) {
+        int saved_errno = errno;
+        pclose(pipe);
+        S3FS_PRN_ERR("fread failed: %s", std::strerror(saved_errno));
+        return -1;
+      }
+    }
+  }
+
+  int rc = pclose(pipe);
+  if (rc != 0) {
+    S3FS_PRN_ERR("pclose failed: %s", std::strerror(errno));
+    return -1;
+  }
+
+  return 0;
+}
+
 /*
 * Local variables:
 * tab-width: 4
