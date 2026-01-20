@@ -82,7 +82,7 @@ sudo yum install automake gcc-c++ git libcurl-devel libxml2-devel \
 然后您可以在github上下载源码并编译安装：
 
 ```
-git clone https://github.com/aliyun/ossfs.git
+git clone -b main-v1 https://github.com/aliyun/ossfs.git
 cd ossfs
 ./autogen.sh
 ./configure

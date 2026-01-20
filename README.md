@@ -80,7 +80,7 @@ sudo yum install automake gcc-c++ git libcurl-devel libxml2-devel \
 Then you can download the source code from GitHub and compile the code for installing the tool: 
 
 ```
-git clone https://github.com/aliyun/ossfs.git
+git clone -b main-v1 https://github.com/aliyun/ossfs.git
 cd ossfs
 ./autogen.sh
 ./configure
