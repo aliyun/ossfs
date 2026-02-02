@@ -1,0 +1,46 @@
+name: Cmake build check x86_64
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        gcc-version: [9, 10, 11, 12, 13]
+        cmake-options:
+          - ""
+          - "-DCMAKE_BUILD_TYPE=Debug -DENABLE_TESTING=ON -DSEPARATE_DEBUG_SYMBOLS=ON"
+      fail-fast: false 
+
+    container:
+      image: ubuntu:24.04
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            g++-${{ matrix.gcc-version }} \
+            cmake \
+            make \
+            perl \
+            patch
+
+      - name: Set default GCC version
+        run: |
+          update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ matrix.gcc-version }} 100
+          update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${{ matrix.gcc-version }} 100
+
+      - name: Create build dir
+        run: mkdir build
+      - name: cmake
+        run: cmake ${{ matrix.cmake-options }} ..
+        working-directory: build
+      - name: make
+        run: make -j2
+        working-directory: build

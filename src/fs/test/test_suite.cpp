@@ -239,7 +239,7 @@ void Ossfs2TestSuite::remount() {
 std::string Ossfs2TestSuite::exec(const char *cmd) {
   std::array<char, 512> buffer;
   std::string result;
-  std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+  std::unique_ptr<FILE, int (*)(FILE *)> pipe(popen(cmd, "r"), pclose);
   if (!pipe) {
     throw std::runtime_error("popen() failed!");
   }
