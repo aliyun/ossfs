@@ -50,10 +50,6 @@ void set_fuse_ll_options(const FuseLLOptions &opts) {
   fuse_options = opts;
 }
 
-static inline IFileHandleFuseLL *get_file_handle(struct fuse_file_info *fi) {
-  return reinterpret_cast<IFileHandleFuseLL *>(fi->fh);
-}
-
 static inline pid_t get_pid(fuse_req_t req) {
   return fuse_req_ctx(req)->pid;
 }
@@ -335,49 +331,26 @@ static void ossfs2_open(fuse_req_t req, fuse_ino_t ino,
 static void ossfs2_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                         struct fuse_file_info *fi) {
   auto time_before_req = std::chrono::steady_clock::now();
-  struct fuse_bufvec bufv = FUSE_BUFVEC_INIT(size);
-  void *mem;
-  ssize_t r = 0;
-
-  auto fh = get_file_handle(fi);
-  r = fh->pin(off, size, &mem);
-  if (r > 0) {
-    bufv.buf[0].mem = mem;
-    bufv.buf[0].size = r;
+  auto read_cb = [&req](void *buf, size_t read) {
+    struct fuse_bufvec bufv = FUSE_BUFVEC_INIT(read);
+    bufv.buf[0].mem = buf;
     fuse_reply_data(req, &bufv, FUSE_BUF_SPLICE_MOVE);
-    fh->unpin(off);
-    REPORT_ALL_METRIC_SUCCESSFUL(read, MetricsType::kIoMetrics, time_before_req,
-                                 r);
-    return;
-  }
+  };
 
-  int ret = posix_memalign(&mem, 4096, size);
-  if (ret != 0) {
-    fuse_reply_err(req, ENOMEM);
-    REPORT_ALL_METRIC_FAILED(read, MetricsType::kIoMetrics, time_before_req);
-    return;
-  }
-
-  bufv.buf[0].mem = mem;
-  r = fh->pread(mem, size, off);
+  ssize_t r = fuse_ll_fs->read(ino, (void *)fi->fh, size, off, read_cb);
   if (r >= 0) {
-    bufv.buf[0].size = r;
-    fuse_reply_data(req, &bufv, FUSE_BUF_SPLICE_MOVE);
     REPORT_ALL_METRIC_SUCCESSFUL(read, MetricsType::kIoMetrics, time_before_req,
                                  r);
   } else {
     fuse_reply_err(req, -r);
     REPORT_ALL_METRIC_FAILED(read, MetricsType::kIoMetrics, time_before_req);
   }
-
-  // cleanup
-  free(mem);
 }
 
 static void ossfs2_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
                          size_t size, off_t off, struct fuse_file_info *fi) {
   auto time_before_req = std::chrono::steady_clock::now();
-  ssize_t r = get_file_handle(fi)->pwrite(buf, size, off);
+  ssize_t r = fuse_ll_fs->write(ino, (void *)fi->fh, buf, size, off);
   if (r >= 0) {
     fuse_reply_write(req, r);
     REPORT_ALL_METRIC_SUCCESSFUL(write, MetricsType::kIoMetrics,
@@ -392,7 +365,8 @@ static void ossfs2_write_buf(fuse_req_t req, fuse_ino_t ino,
                              struct fuse_bufvec *bufv, off_t off,
                              struct fuse_file_info *fi) {
   auto time_before_req = std::chrono::steady_clock::now();
-  ssize_t r = get_file_handle(fi)->write_buf(bufv, off);
+
+  auto r = fuse_ll_fs->write_buf(ino, (void *)fi->fh, bufv, off);
   if (r >= 0) {
     fuse_reply_write(req, r);
     REPORT_ALL_METRIC_SUCCESSFUL(write, MetricsType::kIoMetrics,
@@ -413,7 +387,7 @@ static void ossfs2_flush(fuse_req_t req, fuse_ino_t ino,
     return;
   }
 
-  int r = get_file_handle(fi)->fsync();
+  int r = fuse_ll_fs->flush(ino, (void *)fi->fh);
   if (r == 0) {
     fuse_reply_err(req, 0);
   } else {
@@ -427,7 +401,7 @@ static void ossfs2_release(fuse_req_t req, fuse_ino_t ino,
 
   DECLARE_METRIC_LATENCY(release, MetricsType::kFsMetrics);
 
-  int r = fuse_ll_fs->release(ino, get_file_handle(fi));
+  int r = fuse_ll_fs->release(ino, (void *)fi->fh);
   if (r == 0) {
     fuse_reply_err(req, 0);
   } else {
@@ -443,8 +417,7 @@ static void ossfs2_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
     return;
   }
 
-  auto fh = get_file_handle(fi);
-  int r = datasync ? fh->fdatasync() : fh->fsync();
+  int r = fuse_ll_fs->fsync(ino, (void *)fi->fh, datasync);
   if (r == 0) {
     fuse_reply_err(req, 0);
   } else {
@@ -457,14 +430,12 @@ static void ossfs2_opendir(fuse_req_t req, fuse_ino_t ino,
   LOG_DEBUG("OPENDIR. pid: `, ino: `", get_pid(req), ino);
 
   DECLARE_METRIC_LATENCY(opendir, MetricsType::kFsMetrics);
-  void *dh = nullptr;
-  int r = fuse_ll_fs->opendir(ino, &dh);
+  int r = fuse_ll_fs->opendir(ino, fi);
   if (r != 0) {
     fuse_reply_err(req, -r);
     return;
   }
 
-  fi->fh = reinterpret_cast<uint64_t>(dh);
   if (fuse_reply_open(req, fi) == -ENOENT) {
     // -ENOENT means that the request was interrupted.
     LOG_ERROR("Fail to reply open request with ino: `", ino);

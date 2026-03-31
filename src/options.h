@@ -121,6 +121,7 @@ DECLARE_uint64(attr_timeout);
 DECLARE_uint64(negative_timeout);
 DECLARE_int64(fuse_attr_timeout);
 DECLARE_int64(fuse_entry_timeout);
+DECLARE_int64(kernel_readdir_cache_timeout);
 DECLARE_bool(close_to_open);
 DECLARE_uint64(inode_cache_eviction_threshold);
 DECLARE_uint64(inode_cache_eviction_interval_ms);

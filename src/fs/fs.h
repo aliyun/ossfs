@@ -107,6 +107,7 @@ struct OssFsOptions {
   uint64_t appendable_object_autoswitch_threshold = 128 * 1024 * 1024;
 
   uint32_t readdir_remember_count = 100;
+  int64_t kernel_readdir_cache_timeout = 0;
 
   bool allow_rename_dir = true;
   uint64_t rename_dir_limit = 2000000;
@@ -135,6 +136,8 @@ struct OssFsOptions {
 
   bool enable_admin_server = true;
   bool enable_symlink = false;
+
+  uint64_t mempool_purge_interval_ms = 5000;
 };
 
 struct LockQueueElement;
@@ -160,9 +163,17 @@ class OssFs : public IFileSystemFuseLL {
   int creat(uint64_t parent, std::string_view name, int flags, mode_t mode,
             uid_t uid, gid_t gid, mode_t umask, uint64_t *nodeid,
             struct stat *stbuf, void **fh) override;
+  ssize_t read(uint64_t nodeid, void *fh, size_t size, off_t off,
+               std::function<void(void *buf, size_t size)> read_cb) override;
+  ssize_t write(uint64_t nodeid, void *fh, const char *buf, size_t size,
+                off_t off) override;
+  ssize_t write_buf(uint64_t nodeid, void *fh, struct fuse_bufvec *bufv,
+                    off_t off) override;
+  int fsync(uint64_t nodeid, void *fh, bool datasync) override;
+  int flush(uint64_t nodeid, void *fh) override;
   int release(uint64_t nodeid, void *fh) override;
 
-  int opendir(uint64_t nodeid, void **dh) override;
+  int opendir(uint64_t nodeid, struct fuse_file_info *fi) override;
   int readdir(uint64_t nodeid, off_t off, void *dh,
               int (*filler)(void *ctx, uint64_t nodeid, const char *name,
                             const struct stat *stbuf, off_t off),
@@ -414,8 +425,8 @@ class OssFs : public IFileSystemFuseLL {
   // for renaming directory
   std::unique_ptr<photon::semaphore> rename_sem_;
 
-  FixedBlockMemoryPool *upload_buffers_ = nullptr;
-  FixedBlockMemoryPool *download_buffers_ = nullptr;
+  std::unique_ptr<FixedBlockMemoryPool> upload_buffers_;
+  std::unique_ptr<FixedBlockMemoryPool> download_buffers_;
 
   // tracking all the dirty inodes
   std::unordered_set<uint64_t> dirty_nodeids_;

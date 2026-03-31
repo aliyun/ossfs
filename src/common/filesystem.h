@@ -19,6 +19,7 @@
 #include <photon/fs/filesystem.h>
 #include <stdint.h>
 
+#include <functional>
 #include <string_view>
 
 struct fuse_bufvec;
@@ -80,9 +81,17 @@ class IFileSystemFuseLL {
   virtual int creat(uint64_t parent, std::string_view name, int flags,
                     mode_t mode, uid_t uid, gid_t gid, mode_t umask,
                     uint64_t *nodeid, struct stat *stbuf, void **fh) = 0;
+  virtual ssize_t read(uint64_t nodeid, void *fh, size_t size, off_t off,
+                       std::function<void(void *buf, size_t size)> read_cb) = 0;
+  virtual ssize_t write(uint64_t nodeid, void *fh, const char *buf, size_t size,
+                        off_t off) = 0;
+  virtual ssize_t write_buf(uint64_t nodeid, void *fh, struct fuse_bufvec *bufv,
+                            off_t off) = 0;
+  virtual int fsync(uint64_t nodeid, void *fh, bool datasync) = 0;
+  virtual int flush(uint64_t nodeid, void *fh) = 0;
   virtual int release(uint64_t nodeid, void *fh) = 0;
 
-  virtual int opendir(uint64_t nodeid, void **dh) = 0;
+  virtual int opendir(uint64_t nodeid, struct fuse_file_info *fi) = 0;
   virtual int readdir(uint64_t nodeid, off_t off, void *dh,
                       int (*filler)(void *ctx, uint64_t nodeid,
                                     const char *name, const struct stat *stbuf,

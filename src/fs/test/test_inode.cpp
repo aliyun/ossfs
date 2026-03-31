@@ -17,9 +17,9 @@
 #include "test_suite.h"
 
 DEFINE_uint64(test_mem_usage_file_num, 1000000,
-              "Create this many sub-FileInodes under a DirInode.");
-DEFINE_bool(test_mem_usage_lru, false,
-            "Enable metadata usage test with LRU cache.");
+              "Create this many sub-inodes under a DirInode.");
+DEFINE_bool(test_mem_usage_staged, false,
+            "Enable metadata usage test with staged inode cache.");
 DEFINE_bool(test_mem_usage_dir, false, "Create subdir instead of subfile");
 
 // Ossfs2InodeTest contains basic inode tests for lookup, forget,
@@ -1409,8 +1409,8 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     LOG_INFO("Create 1 DirInode and ` sub- ` whose names are sized of 50.",
              file_num, FLAGS_test_mem_usage_dir ? "dirs" : "files");
-    bool enable_lru = FLAGS_test_mem_usage_lru;
-    LOG_INFO("Test LRU mem usage: `", enable_lru);
+    bool enable_staged_inode = FLAGS_test_mem_usage_staged;
+    LOG_INFO("Test staged cache mem usage: `", enable_staged_inode);
 
     DirInode *root = new DirInode(1, "/", {0, 0}, 0, nullptr);
     std::map<uint64_t, Inode *> glb_map;
@@ -1418,8 +1418,9 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
         "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij";
     std::string etag = "7D3EBDBD61A735B60D8F930C57D7BB73";
 
-    auto staged_cache =
-        enable_lru ? std::make_unique<StagedInodeCache>(3600) : nullptr;
+    auto staged_cache = enable_staged_inode
+                            ? std::make_unique<StagedInodeCache>(3600)
+                            : nullptr;
 
     for (uint64_t i = 0; i < file_num; ++i) {
       std::string index_str = std::to_string(i);
@@ -1437,9 +1438,14 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
       root->add_child_node(inode);
       glb_map[i + 2] = inode;
 
-      if (enable_lru) {
-        staged_cache->insert(root->nodeid, name, 0, {0, 0}, etag, i + 2,
-                             InodeType::kFile, 0);
+      if (enable_staged_inode) {
+        if (FLAGS_test_mem_usage_dir) {
+          staged_cache->insert(root->nodeid, name, 0, {0, 0}, "", i + 2,
+                               InodeType::kDir, 0);
+        } else {
+          staged_cache->insert(root->nodeid, name, 0, {0, 0}, etag, i + 2,
+                               InodeType::kFile, 0);
+        }
         root->erase_child_node(name, i + 2);
         glb_map.erase(i + 2);
         delete inode;
@@ -1450,7 +1456,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     std::this_thread::sleep_for(std::chrono::seconds(5));
     LOG_INFO("Physical memory usage: ` KiB.", get_physical_memory_KiB());
 
-    if (enable_lru)
+    if (enable_staged_inode)
       ASSERT_SIZE_EQ(glb_map.size(), 0);
     else
       ASSERT_SIZE_EQ(glb_map.size(), file_num);

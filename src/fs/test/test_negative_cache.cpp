@@ -200,9 +200,10 @@ class Ossfs2NegativeCacheTest : public Ossfs2TestSuite {
                     FLAGS_oss_bucket_prefix);
     ASSERT_EQ(r, 0);
 
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
     std::vector<TestInode> childs;
     r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true, nullptr);
     ASSERT_EQ(r, 0);

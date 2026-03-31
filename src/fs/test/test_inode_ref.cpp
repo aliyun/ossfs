@@ -162,7 +162,7 @@ class Ossfs2InodeRefTest : public Ossfs2TestSuite {
     //
     // case : one is holding file/dir unique path
     // file/dir shared path could not be acquired
-    // ancestors/descendants shared path could not be acuqred
+    // ancestors/descendants shared path could not be acquired
     // file/dir unique path could not be acquired
     // ancestors/descendants unique path could not be acquired
     // each path in path2 case follows the same rule

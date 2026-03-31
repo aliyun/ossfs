@@ -104,7 +104,7 @@ class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
     ASSERT_EQ("1048576", meta["Content-Length"]);
 
     // flush data to oss
-    r = write_file->fsync();
+    r = fsync_file_handle((void *)write_file);
     ASSERT_EQ(r, 0);
 
     meta = get_file_meta(filepath, FLAGS_oss_bucket_prefix);
@@ -130,7 +130,7 @@ class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
     file_size += r;
 
     // flush and append 4097 bytes again
-    r = write_file->fsync();
+    r = fsync_file_handle((void *)write_file);
     ASSERT_EQ(r, 0);
 
     write_offset += 555555;
@@ -301,7 +301,7 @@ class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
         const_cast<void *>(static_cast<const void *>(random_data.c_str()));
     crc64 = cal_crc64(0, buf, random_data.size());
 
-    r = file->fsync();
+    r = fsync_file_handle((void *)file);
     ASSERT_EQ(r, 0);
 
     meta = get_file_meta(filepath, FLAGS_oss_bucket_prefix);
@@ -521,7 +521,7 @@ class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
     int write_size = buffer_size + rand() % (buffer_size / 4) + 1;
     r = write_fh(write_size);
     ASSERT_EQ(r, write_size);
-    r = file->fdatasync();
+    r = fsync_file_handle((void *)file, true);
     ASSERT_EQ(r, 0);
 
     // Second write, the data will remains in the write buffer.
@@ -693,11 +693,22 @@ class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
               r = file_read->pread(buf, read_size, total_read);
               if (r != read_size) {
                 // If read fails, retry until the correct amount of data is read
+                uint64_t retry_interval = 1;
                 while (r != read_size) {
+                  if (retry_interval > 128) {
+                    success = false;
+                    LOG_ERROR(
+                        "failed to read ` bytes from file, r is `, offset is `",
+                        read_size, r, total_read);
+                    break;
+                  }
+                  // clang-format off
                   LOG_INFO(
-                      "retry to read ` bytes from file, r is `, offset is `",
-                      read_size, r, total_read);
-                  photon::thread_usleep(1000000);  // Sleep 1s for each retry
+                      "retry to read ` bytes from file, r is `, offset is `, sleep `s",
+                      read_size, r, total_read, retry_interval);
+                  // clang-format on
+                  photon::thread_sleep(retry_interval);
+                  retry_interval *= 2;
                   r = file_read->pread(buf, read_size, total_read);
                 }
               }
@@ -843,7 +854,7 @@ class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
     r = fs_->unlink(parent, path.c_str());
     ASSERT_EQ(r, 0);
 
-    r = file->fsync();
+    r = fsync_file_handle((void *)file);
     ASSERT_EQ(r, 0);
 
     r = file->pwrite(random_data.c_str(), random_data.size(), offset);

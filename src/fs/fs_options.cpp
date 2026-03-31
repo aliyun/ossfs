@@ -35,12 +35,12 @@ static int apply_mem_limit_with_memory_cache(OssFsOptions *fs_options,
     return -EINVAL;
   }
 
-  int expeceted_prefetch_chunks =
+  int expected_prefetch_chunks =
       fs_options->memory_data_cache_size / fs_options->prefetch_chunk_size;
-  if (expeceted_prefetch_chunks != fs_options->prefetch_chunks) {
+  if (expected_prefetch_chunks != fs_options->prefetch_chunks) {
     LOG_INFO("prefetch_chunks changed from ` to `", fs_options->prefetch_chunks,
-             expeceted_prefetch_chunks);
-    fs_options->prefetch_chunks = expeceted_prefetch_chunks;
+             expected_prefetch_chunks);
+    fs_options->prefetch_chunks = expected_prefetch_chunks;
   }
 
   const uint64_t GiBytes = 1ULL << 30;

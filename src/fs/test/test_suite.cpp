@@ -280,9 +280,10 @@ std::string Ossfs2TestSuite::nodeid_to_path(uint64_t nodeid) {
 }
 
 int Ossfs2TestSuite::read_dir(uint64_t parent, std::vector<TestInode> &childs) {
-  void *dirp = nullptr;
-  int r = fs_->opendir(parent, &dirp);
+  struct fuse_file_info fi;
+  int r = fs_->opendir(parent, &fi);
   if (r < 0) return r;
+  void *dirp = reinterpret_cast<void *>(fi.fh);
 
   // fill all the nodes one time
   r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true, nullptr);
@@ -516,17 +517,25 @@ uint64_t Ossfs2TestSuite::write_file_intervally(uint64_t nodeid,
 }
 
 ssize_t Ossfs2TestSuite::read_from_handle(void *fh, char *buf, size_t size,
-                                          off_t offset) {
-  auto file = get_file_from_handle(fh);
-  void *pin_buffer = nullptr;
-  ssize_t r = file->pin(offset, size, &pin_buffer);
-  if (r > 0) {
-    memcpy(buf, pin_buffer, r);
-    file->unpin(offset);
-    return r;
+                                          off_t offset,
+                                          bool direct_call_file_api) {
+  if (direct_call_file_api) {
+    auto file = get_file_from_handle(fh);
+    void *pin_buffer = nullptr;
+    ssize_t r = file->pin(offset, size, &pin_buffer);
+    if (r > 0) {
+      memcpy(buf, pin_buffer, r);
+      file->unpin(offset);
+      return r;
+    }
+    return file->pread(buf, size, offset);
   }
 
-  return file->pread(buf, size, offset);
+  auto read_cb = [&](void *read_buf, size_t read_size) {
+    memcpy(buf, read_buf, read_size);
+  };
+
+  return fs_->read(get_nodeid_from_handle(fh), fh, size, offset, read_cb);
 }
 
 ssize_t Ossfs2TestSuite::read_file_in_folder(uint64_t parent,
@@ -569,7 +578,6 @@ ssize_t Ossfs2TestSuite::read_file_in_folder(uint64_t parent,
 ssize_t Ossfs2TestSuite::write_to_file_handle(void *fh, const char *buf,
                                               size_t size, off_t offset) {
   ssize_t r = 0;
-  auto file = get_file_from_handle(fh);
   if (FLAGS_write_with_fuse_bufvec) {
     int retry_cnt = 0, max_retry_cnt = 100;
   retry:
@@ -584,7 +592,7 @@ ssize_t Ossfs2TestSuite::write_to_file_handle(void *fh, const char *buf,
       return -1;
     }
   } else {
-    r = file->pwrite(buf, size, offset);
+    r = fs_->write(get_nodeid_from_handle(fh), fh, buf, size, offset);
   }
 
   return r;
@@ -592,7 +600,6 @@ ssize_t Ossfs2TestSuite::write_to_file_handle(void *fh, const char *buf,
 
 ssize_t Ossfs2TestSuite::write_with_fuse_bufvec(void *fh, const char *buf,
                                                 size_t size, off_t offset) {
-  auto file = get_file_from_handle(fh);
   int pipe_fd[2] = {0};
   if (pipe(pipe_fd) < 0) {
     LOG_ERROR("pipe failed");
@@ -620,7 +627,7 @@ ssize_t Ossfs2TestSuite::write_with_fuse_bufvec(void *fh, const char *buf,
     return r;
   });
 
-  ssize_t r1 = file->write_buf(&buf_vec, offset);
+  ssize_t r1 = fs_->write_buf(get_nodeid_from_handle(fh), fh, &buf_vec, offset);
   if (r1 < 0) {
     close(pipe_fd[0]);
     close(pipe_fd[1]);
@@ -639,7 +646,6 @@ ssize_t Ossfs2TestSuite::write_with_fuse_bufvec(void *fh, const char *buf,
 ssize_t Ossfs2TestSuite::write_with_fuse_bufvec_with_err(
     void *fh, const char *buf, size_t size, off_t offset,
     size_t partial_write_size) {
-  auto file = get_file_from_handle(fh);
   int pipe_fd[2] = {0};
   if (pipe(pipe_fd) < 0) {
     LOG_ERROR("pipe failed");
@@ -672,7 +678,7 @@ ssize_t Ossfs2TestSuite::write_with_fuse_bufvec_with_err(
     return r;
   });
 
-  ssize_t r1 = file->write_buf(&buf_vec, offset);
+  ssize_t r1 = fs_->write_buf(get_nodeid_from_handle(fh), fh, &buf_vec, offset);
   writer.get();
   return r1;
 }
@@ -690,7 +696,7 @@ int Ossfs2TestSuite::create_and_flush(uint64_t parent, const char *name,
   }
 
   LOG_INFO("do flush after create (`, `)", parent, name);
-  return get_file_from_handle(*fh)->fsync();
+  return fs_->flush(*nodeid, *fh);
 }
 
 std::string Ossfs2TestSuite::lookup_ossutil() {

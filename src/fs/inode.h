@@ -227,6 +227,7 @@ struct FileInode final : public Inode {
 
 struct DirInode final : public Inode {
   std::unordered_map<std::string_view, Inode *> children;
+  std::chrono::steady_clock::time_point kernel_readdir_cache_time = {};
 
   DirInode(uint64_t file_ino, std::string_view file_name,
            struct timespec file_mtime, uint64_t parent_id, Inode *parent_node)
@@ -239,6 +240,22 @@ struct DirInode final : public Inode {
   void add_child_node_directly(Inode *inode);
   Inode *find_child_node(std::string_view name) const;
   void erase_child_node(std::string_view name, const uint64_t noid);
+
+  void invalidate_kernel_readdir_cache() {
+    kernel_readdir_cache_time = {};
+  }
+
+  bool is_kernel_readdir_cache_valid(int64_t timeout) const {
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - kernel_readdir_cache_time)
+            .count();
+    return elapsed < timeout;
+  }
+
+  void update_kernel_readdir_cache_status() {
+    kernel_readdir_cache_time = std::chrono::steady_clock::now();
+  }
 
   bool is_children_empty() const {
     return children.empty();

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/ssl_probe.h"
 #include "test_suite.h"
 #include "test_util.h"
 
@@ -349,6 +350,10 @@ int main(int argc, char **arg) {
   if (sigaction(SIGPIPE, &sa, NULL) == -1) {
     perror("sigaction");
     exit(EXIT_FAILURE);
+  }
+
+  if (!SSLProbe::setup_ssl_env()) {
+    LOG_WARN("Failed to get SSL certificate file");
   }
 
   ::testing::InitGoogleTest(&argc, arg);
