@@ -16,6 +16,7 @@
 
 #include "mem_pool.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -25,11 +26,30 @@
 namespace OssFileSystem {
 FixedBlockMemoryPool::FixedBlockMemoryPool(size_t block_size,
                                            size_t pool_capacity,
-                                           size_t max_cached_blocks)
+                                           size_t max_cached_blocks,
+                                           uint64_t purge_interval_ms)
     : block_size_(block_size),
       pool_capacity_(pool_capacity),
-      max_cached_blocks_(max_cached_blocks) {}
+      max_cached_blocks_(max_cached_blocks),
+      purge_interval_ms_(purge_interval_ms) {
+  if (purge_interval_ms_ > 0) {
+    purger_ =
+        std::make_unique<std::thread>([this]() { this->purge_thread_entry(); });
+  }
+  cached_block_list_.reserve(max_cached_blocks);
+}
+
 FixedBlockMemoryPool::~FixedBlockMemoryPool() {
+  if (purger_) {
+    {
+      std::unique_lock<std::mutex> lk(purger_lock_);
+      purger_stop_ = true;
+      purger_cv_.notify_all();
+    }
+
+    purger_->join();
+  }
+
   for (char *block : cached_block_list_) {
     free(block);
   }
@@ -46,6 +66,7 @@ std::vector<char *> FixedBlockMemoryPool::try_allocate(size_t count,
   SCOPED_LOCK(lock_);
 
   std::vector<char *> addresses;
+  addresses.reserve(count);
   for (size_t i = 0; i < count; ++i) {
     if (used_ >= limit) break;
     ++used_;
@@ -94,6 +115,53 @@ char *FixedBlockMemoryPool::expand_one() {
   int r = posix_memalign(reinterpret_cast<void **>(&ptr), 4096, block_size_);
   RELEASE_ASSERT(r == 0);
   return ptr;
+}
+
+void FixedBlockMemoryPool::purge_thread_entry() {
+  const size_t batch_size = 32;
+  std::vector<char *> blocks_to_free;
+  blocks_to_free.reserve(batch_size);
+
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lk(purger_lock_);
+      if (purger_cv_.wait_for(lk, std::chrono::milliseconds(purge_interval_ms_),
+                              [this] { return purger_stop_; })) {
+        return;
+      }
+    }
+
+    size_t max_free_count = 0;
+    {
+      SCOPED_LOCK(lock_);
+      max_free_count = cached_block_list_.size();
+    }
+
+    if (max_free_count == 0) continue;
+
+    size_t total_freed_count = 0;
+    while (total_freed_count < max_free_count) {
+      {
+        SCOPED_LOCK(lock_);
+        if (cached_block_list_.empty()) break;
+
+        size_t to_free =
+            std::min({batch_size, max_free_count - total_freed_count,
+                      cached_block_list_.size()});
+
+        auto start_it = cached_block_list_.end() - to_free;
+        blocks_to_free.insert(blocks_to_free.end(), start_it,
+                              cached_block_list_.end());
+        cached_block_list_.erase(start_it, cached_block_list_.end());
+      }
+
+      total_freed_count += blocks_to_free.size();
+      for (char *block : blocks_to_free) {
+        free(block);
+      }
+      blocks_to_free.clear();
+    }
+  }
 }
 
 };  // namespace OssFileSystem

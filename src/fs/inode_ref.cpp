@@ -283,7 +283,7 @@ void OssFs::return_inode_ref(const InodeRef &ref) {
   if (should_try_invalidate) try_invalidate_inode(nodeid, 0, true);
 }
 
-// Lock file/dir 'name' with wlock if it exits.
+// Lock file/dir 'name' with wlock if it exists.
 // Lock parent and all ancestors with read lock.
 // Increase inode reference for parent and inode if it exists.
 const ParentRef OssFs::get_inode_ref(uint64_t parent, std::string_view name) {
