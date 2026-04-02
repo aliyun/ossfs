@@ -34,6 +34,7 @@
 #include "common/utils.h"
 #include "error_codes.h"
 #include "file.h"
+#include "metric/metrics.h"
 
 #define GET_INODE_REF_ONLY_WITH_RET(id)                            \
   auto ref = get_inode_ref((id), InodeRefPathType::kPathTypeNone); \
@@ -93,9 +94,9 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
   Attribute::set_default_mode(options_.dir_mode, options_.file_mode);
 
   init_prefetch_options();
-  upload_buffers_ = new FixedBlockMemoryPool(options_.upload_buffer_size,
-                                             options_.upload_concurrency + 4,
-                                             options_.upload_concurrency + 4);
+  upload_buffers_ = std::make_unique<FixedBlockMemoryPool>(
+      options_.upload_buffer_size, options_.upload_concurrency + 4,
+      options_.upload_concurrency + 4, options_.mempool_purge_interval_ms);
   if (options_.cache_type == CacheType::kFhCache && enable_prefetching()) {
     size_t blocks_per_prefetch_chunk =
         (options_.prefetch_chunk_size + options_.cache_block_size - 1) /
@@ -103,6 +104,7 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
     size_t cached_block_count =
         blocks_per_prefetch_chunk * options_.prefetch_concurrency * 3;
     size_t pool_capcacity = cached_block_count;
+    uint64_t purge_interval_ms = options_.mempool_purge_interval_ms;
 
     // Override if user specified.
     if (options_.prefetch_chunks > 0) {
@@ -113,8 +115,13 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
       pool_capcacity = std::numeric_limits<size_t>::max();
     }
 
-    download_buffers_ = new FixedBlockMemoryPool(
-        options_.cache_block_size, pool_capcacity, cached_block_count);
+    if (options_.memory_data_cache_size > 0) {
+      purge_interval_ms = 0;
+    }
+
+    download_buffers_ = std::make_unique<FixedBlockMemoryPool>(
+        options_.cache_block_size, pool_capcacity, cached_block_count,
+        purge_interval_ms);
   }
 
   if (enable_staged_cache()) {
@@ -162,11 +169,6 @@ OssFs::~OssFs() {
     }
     global_inodes_map_.clear();
   }
-
-  if (options_.cache_type == CacheType::kFhCache) {
-    DELETE_VAR(download_buffers_);
-  }
-  DELETE_VAR(upload_buffers_);
 
 #undef JOIN_AND_DELETE_THREAD
 #undef DELETE_VAR
@@ -223,9 +225,9 @@ int OssFs::lookup(uint64_t parent, std::string_view name, uint64_t *nodeid,
 int OssFs::forget(uint64_t nodeid, uint64_t nlookup) {
   if (nodeid == kMountPointNodeId) return 0;
 
-  if (IS_FAULT_INJECTION_ENABLED(FI_Forget_Delay)) {
+  FAULT_INJECTION(FI_Forget_Delay, []() {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  }
+  });
 
   if (!enable_staged_cache()) {
     try_invalidate_inode(nodeid, nlookup, true);
@@ -741,21 +743,33 @@ int OssFs::release(uint64_t nodeid, void *fh) {
 
 // ********************* dir related apis *********************
 // dir's wlock
-int OssFs::opendir(uint64_t nodeid, void **dh) {
+int OssFs::opendir(uint64_t nodeid, struct fuse_file_info *fi) {
   GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
-  Inode *dir_inode = ref.inode;
+  RELEASE_ASSERT(ref.inode->is_dir());
+  DirInode *dir_inode = static_cast<DirInode *>(ref.inode);
   {
     std::unique_lock<std::shared_mutex> wl(dir_inode->inode_lock);
-    if (dir_inode->is_stale) return -ESTALE;
+    if (dir_inode->is_stale) {
+      return -ESTALE;
+    }
+
+    if (options_.kernel_readdir_cache_timeout > 0) {
+      fi->cache_readdir = 1;
+      if (dir_inode->is_kernel_readdir_cache_valid(
+              options_.kernel_readdir_cache_timeout)) {
+        fi->keep_cache = 1;
+      } else {
+        dir_inode->update_kernel_readdir_cache_status();
+      }
+    }
     dir_inode->open_ref_cnt++;
   }
 
-  *dh = new OssDirHandle(this, static_cast<DirInode *>(dir_inode),
-                         ref.inode_path, options_.readdir_remember_count);
+  auto dh = new OssDirHandle(this, static_cast<DirInode *>(dir_inode),
+                             ref.inode_path, options_.readdir_remember_count);
   LOG_INFO("open dir: ` nodeid: `", ref.inode_path, nodeid);
-  if (*dh == nullptr) {
-    return -ENOSPC;
-  }
+
+  fi->fh = reinterpret_cast<uint64_t>(dh);
 
   return 0;
 }
@@ -877,9 +891,9 @@ int OssFs::readdir(uint64_t nodeid, off_t off, void *dh,
     r = seek_dir(parent_inode, odh, start, is_interrupted, interrupted_ctx);
     if (r != 0) return r;
 
-    if (IS_FAULT_INJECTION_ENABLED(FI_Readdir_Delay_Noplus)) {
+    FAULT_INJECTION(FI_Readdir_Delay_Noplus, []() {
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
+    });
 
     r = readdir_fill(parent_inode, odh, filler, filler_ctx);
   }
@@ -1017,6 +1031,66 @@ ssize_t OssFs::readlink(uint64_t nodeid, char *buf, size_t size) {
   return write_size;
 }
 
+ssize_t OssFs::read(uint64_t nodeid, void *fh, size_t size, off_t off,
+                    std::function<void(void *buf, size_t size)> read_cb) {
+  auto file_handle = static_cast<IFileHandleFuseLL *>(fh);
+  void *mem = nullptr;
+  auto r = file_handle->pin(off, size, &mem);
+  if (r > 0) {
+    read_cb(mem, r);
+    file_handle->unpin(off);
+    return r;
+  }
+
+  DECLARE_METRIC_LATENCY(pread, Metric::MetricsType::kInternalMetrics);
+  bool from_pool = false;
+  if (size <= options_.cache_block_size && download_buffers_ != nullptr) {
+    mem = static_cast<void *>(download_buffers_->allocate(1).front());
+    from_pool = true;
+  } else {
+    r = posix_memalign(&mem, 4096, size);
+    if (r != 0) {
+      return -ENOMEM;
+    }
+  }
+
+  r = file_handle->pread(mem, size, off);
+  if (r >= 0) {
+    read_cb(mem, r);
+  }
+
+  if (from_pool) {
+    std::vector<char *> ptr_vec{static_cast<char *>(mem)};
+    download_buffers_->deallocate(ptr_vec);
+  } else {
+    free(mem);
+  }
+  return r;
+}
+
+ssize_t OssFs::write(uint64_t nodeid, void *fh, const char *buf, size_t size,
+                     off_t off) {
+  auto file_handle = static_cast<IFileHandleFuseLL *>(fh);
+  return file_handle->pwrite(buf, size, off);
+}
+
+ssize_t OssFs::write_buf(uint64_t nodeid, void *fh, struct fuse_bufvec *bufv,
+                         off_t off) {
+  auto file_handle = static_cast<IFileHandleFuseLL *>(fh);
+  return file_handle->write_buf(bufv, off);
+}
+
+int OssFs::fsync(uint64_t nodeid, void *fh, bool datasync) {
+  auto file_handle = static_cast<IFileHandleFuseLL *>(fh);
+  int result = datasync ? file_handle->fdatasync() : file_handle->fsync();
+  return result;
+}
+
+int OssFs::flush(uint64_t nodeid, void *fh) {
+  auto file_handle = static_cast<IFileHandleFuseLL *>(fh);
+  return file_handle->fsync();
+}
+
 // ********************* internal functions *********************
 int OssFs::lookup_try_local_attr_cache(
     DirInode *parent_inode, std::string_view name, const std::string &full_path,
@@ -1058,9 +1132,8 @@ int OssFs::lookup_get_remote_attr(DirInode *parent_inode, std::string_view name,
                                           remote_etag, attr_time)) {
     r = -E_LOOKUP_FROM_STAGED_CACHE;
   } else {
-    if (IS_FAULT_INJECTION_ENABLED(FI_Lookup_Oss_Failure)) {
-      return -EIO;
-    }
+    FAULT_INJECTION(FI_Lookup_Oss_Failure, [&]() { r = -EIO; });
+    if (r < 0) return r;
 
     FAULT_INJECTION(FI_Lookup_Delay_Before_Getting_OSS_Response, []() {
       std::this_thread::sleep_for(std::chrono::milliseconds(2 * 1000));
@@ -1071,9 +1144,9 @@ int OssFs::lookup_get_remote_attr(DirInode *parent_inode, std::string_view name,
     *attr_time = time(0);
   }
 
-  if (IS_FAULT_INJECTION_ENABLED(FI_Lookup_Delay_After_Getting_Remote_attr)) {
+  FAULT_INJECTION(FI_Lookup_Delay_After_Getting_Remote_attr, []() {
     std::this_thread::sleep_for(std::chrono::milliseconds(2 * 1000));
-  }
+  });
   return r;
 }
 
@@ -1596,9 +1669,9 @@ int OssFs::refresh_dir_plus(DirInode *parent_inode, OssDirHandle *odh) {
   // refresh_dir will trigger listobj
   construct_inodes_if_needed(parent_inode, odh);
 
-  if (IS_FAULT_INJECTION_ENABLED(FI_Readdir_Delay_After_Construct_Inodes)) {
+  FAULT_INJECTION(FI_Readdir_Delay_After_Construct_Inodes, []() {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  }
+  });
 
   return 0;
 }
@@ -1757,9 +1830,9 @@ int OssFs::readdir_fill_plus(DirInode *parent_inode, OssDirHandle *odh,
     if (need_construct_inodes) {
       construct_inodes_if_needed(parent_inode, odh);
 
-      if (IS_FAULT_INJECTION_ENABLED(FI_Readdir_Delay_After_Construct_Inodes)) {
+      FAULT_INJECTION(FI_Readdir_Delay_After_Construct_Inodes, []() {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      }
+      });
     }
 
     dent = odh->get();
@@ -1899,7 +1972,7 @@ int OssFs::try_invalidate_inode(uint64_t nodeid, uint64_t nlookup,
       RELEASE_ASSERT_WITH_MSG(parent_inode->is_dir(),
                               "try_invalidate_inode: parent ` should be a dir",
                               parent_inode->nodeid);
-      // The nodeid below is neccessary: in case this inode was stale, and a new
+      // The nodeid below is necessary: in case this inode was stale, and a new
       // file with the same name was created, and the parent_inode mis-erased
       // the new child.
       static_cast<DirInode *>(parent_inode)
@@ -2703,10 +2776,14 @@ int OssFs::reverse_invalidate_kernel_entry(const DentryView &dentry) {
 void OssFs::run_reverse_invalidate() {
   INIT_PHOTON();
 
+  bool reverse_invalidate_forcefully = false;
+
   auto thread_func = [&]() {
     uint64_t interval = options_.inode_cache_eviction_interval_ms * 1000;
 
-    if (!IS_FAULT_INJECTION_ENABLED(FI_Reverse_Invalidate_Inode_Forcefully)) {
+    FAULT_INJECTION(FI_Reverse_Invalidate_Inode_Forcefully,
+                    [&]() { reverse_invalidate_forcefully = true; });
+    if (!reverse_invalidate_forcefully) {
       if (fuse_se_ == nullptr) return interval;
     }
 

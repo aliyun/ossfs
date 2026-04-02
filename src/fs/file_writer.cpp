@@ -235,9 +235,7 @@ OssWriter::~OssWriter() {
 
 int OssWriter::flush() {
   int r = complete_upload();
-  if (IS_FAULT_INJECTION_ENABLED(FI_Data_Sync_Failed)) {
-    r = -EIO;
-  }
+  FAULT_INJECTION(FI_Data_Sync_Failed, [&]() { r = -EIO; });
   if (r < 0) {
     LOG_ERROR("Failed to fdatasync file: `, nodeid: `, r: `", upload_path_,
               inode_->nodeid, r);
@@ -354,9 +352,8 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
       r = dirty_file->fdatasync_lock_held();
       if (r < 0) return r;
     }
-    if (IS_FAULT_INJECTION_ENABLED(FI_Force_Flush_Dirty_Handle_Delay)) {
-      AUTO_USLEEP(2'000'000);
-    }
+    FAULT_INJECTION(FI_Force_Flush_Dirty_Handle_Delay,
+                    []() { AUTO_USLEEP(2'000'000); });
   }
 
   r = check_writing_permission();
@@ -448,7 +445,7 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
       expected_crc64_ = crc64ecma(buffer_ + buffer_off, r, expected_crc64_);
     }
 
-    if (IS_FAULT_INJECTION_ENABLED(FI_Modify_Write_Buffer)) {
+    FAULT_INJECTION(FI_Modify_Write_Buffer, [&]() {
       int index = 0;
       if (appendable_status_.is_appendable_object)
         index = appendable_status_.valid_buffer_offset;
@@ -457,7 +454,7 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
         old = buffer_[index];
         buffer_[index] = (buffer_[index] + 1) % 256;
       } while (buffer_[index] == old);
-    }
+    });
 
     buffer_off += r;
     written += r;
@@ -655,10 +652,9 @@ void *OssWriter::do_multipart_upload(void *args) {
     ctx->writer->immutable_ = true;
   }
 
+  ctx->writer->free_buffer(ctx->buf);
   ctx->writer->fs_->upload_sem_->signal(1);
   ctx->writer->running_upload_tasks_.fetch_sub(1);
-
-  ctx->writer->free_buffer(ctx->buf);
 
   delete ctx;
   return nullptr;
@@ -781,10 +777,10 @@ int OssWriter::merge_remote_data(off_t offset, size_t count) {
 
     has_crc64_ = obj_meta.has_crc64();
     expected_crc64_ = obj_meta.crc64;
-    if (IS_FAULT_INJECTION_ENABLED(FI_OssError_No_Crc64)) {
+    FAULT_INJECTION(FI_OssError_No_Crc64, [&]() {
       has_crc64_ = false;
       expected_crc64_ = 0;
-    }
+    });
     if (!has_crc64_) {
       LOG_WARN("File: `, nodeid: `, has no crc64, will not check crc64",
                upload_path_, inode_->nodeid);
@@ -875,9 +871,8 @@ int OssWriter::merge_remote_data_of_normal_object() {
   int r =
       DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_get_object_range, upload_path_,
                                      bufv.iovec(), bufv.iovcnt(), offset);
-  if (IS_FAULT_INJECTION_ENABLED(FI_Download_Failed_During_Merge_Remote_Data)) {
-    r = -EIO;
-  }
+  FAULT_INJECTION(FI_Download_Failed_During_Merge_Remote_Data,
+                  [&]() { r = -EIO; });
 
   if (r < 0) {
     LOG_ERROR(

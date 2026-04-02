@@ -129,9 +129,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       return 0;
     };
 
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     // fill 25 nodes one time
     std::vector<TestInode> childs;
@@ -173,9 +174,9 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     // fill 25 nodes one more time
     // to check there are no inodes for the remained entries
     childs.clear();
-    dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    dirp = reinterpret_cast<void *>(fi.fh);
     r = fs_->readdir(parent, 0, dirp, filler_25_files, &childs, nullptr, true,
                      nullptr);
     r = fs_->releasedir(parent, dirp);
@@ -238,9 +239,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
           }
         };
 
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     // Fill 5 nodes once.
     std::unordered_map<std::string, uint64_t> childs;
@@ -261,8 +263,9 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     forget_children(childs);
 
     // offset: 1
-    r = fs_->opendir(parent, &dirp);
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    dirp = reinterpret_cast<void *>(fi.fh);
 
     std::unordered_map<std::string, uint64_t> childs_2;
     r = fs_->readdir(parent, 1, dirp, filler_5_files, &childs_2, nullptr,
@@ -282,8 +285,9 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     forget_children(childs_2);
 
     // offset: 2
-    r = fs_->opendir(parent, &dirp);
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    dirp = reinterpret_cast<void *>(fi.fh);
 
     std::unordered_map<std::string, uint64_t> childs_3, childs_4, childs_5,
         childs_6;
@@ -416,9 +420,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     };
 
     bool check_pass = false;
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     // 1. Readdir from offset 0, and we will get 5 results from oss.
     std::unordered_map<std::string, uint64_t> childs, childs_1, childs_2,
@@ -560,9 +565,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
                     FLAGS_oss_bucket_prefix);
     ASSERT_EQ(r, 0);
 
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     std::unordered_map<std::string, uint64_t> childs;
     // 1. readdir from offset 0. cur_list_res: empty
@@ -657,9 +663,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       ASSERT_EQ(r, 0);
     }
 
-    void *dirp = nullptr;
-    int r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    int r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     std::vector<TestInode> childs;
     r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, false, nullptr);
@@ -716,9 +723,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       ASSERT_EQ(r, 0);
     }
 
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     auto is_interrupted = [](void *ctx) -> int {
       auto *tp =
@@ -787,9 +795,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     auto file = (OssFileHandle *)(file_handle);
     ASSERT_TRUE(file->get_is_dirty());
 
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     std::vector<TestInode> childs;
     r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true, nullptr);
@@ -843,9 +852,9 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       return 0;
     };
 
-    dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    dirp = reinterpret_cast<void *>(fi.fh);
 
     std::vector<Entry> childs_2;
     r = fs_->readdir(parent, 0, dirp, filler_with_stat, &childs_2, nullptr,
@@ -904,9 +913,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     ASSERT_EQ(r, 0);
 
     // verify readdir
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     std::vector<TestInode> childs;
     r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true, nullptr);
@@ -960,9 +970,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     };
 
     // 1. opendir
-    void *dirp = nullptr;
-    r = fs_->opendir(dir_id, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(dir_id, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     // 2. readdir for the 1st time
     std::unordered_map<std::string, uint64_t> childs_1, childs_2;
@@ -1018,9 +1029,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       return 0;
     };
 
-    void *dirp = nullptr, *dirp2 = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi, fi2;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     g_fault_injector->set_injection(FaultInjectionId::FI_Readdir_Delay_Noplus);
     DEFER(g_fault_injector->clear_injection(
@@ -1058,8 +1070,9 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     // so the readdir in the 2 threads will both refresh and get the whole
     // result .
     std::vector<TestInode> childs1, childs2;
-    r = fs_->opendir(parent, &dirp2);
+    r = fs_->opendir(parent, &fi2);
     ASSERT_EQ(r, 0);
+    void *dirp2 = reinterpret_cast<void *>(fi2.fh);
     auto readdircb2 = [&](std::vector<TestInode> &childs) {
       int rr = fs_->readdir(parent, 0, dirp2, filler, &childs, nullptr, false,
                             nullptr);
@@ -1096,9 +1109,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       ASSERT_EQ(r, 0);
     }
 
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
     std::vector<TestInode> childs1, childs2;
     r = fs_->readdir(parent, 0, dirp, filler, &childs1, nullptr, true, nullptr);
@@ -1166,35 +1180,15 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       return 0;
     };
 
-    auto readdir = [&](OssFs *fs, uint64_t parent, void *dirp,
-                       std::vector<TestInode> *childs) -> int {
-      std::vector<TestInode> childs_tmp;
-      int rr = fs->readdir(parent, 0, dirp, filler_6_files, &childs_tmp,
-                           nullptr, true, nullptr);
-      if (rr != 0 && rr != -ENOSPC) return rr;
-      childs->insert(childs->end(), childs_tmp.begin(), childs_tmp.end());
-      childs_tmp.clear();
-
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-      rr = fs->readdir(parent, 2 + childs->size(), dirp, filler_6_files,
-                       &childs_tmp, nullptr, true, nullptr);
-      if (rr != 0 && rr != -ENOSPC) return rr;
-      childs->insert(childs->end(), childs_tmp.begin(), childs_tmp.end());
-      return rr;
-    };
-
-    void *dirp = nullptr;
-    r = fs_->opendir(parent, &dirp);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
-    std::vector<TestInode> childs1, childs2;
+    void *dirp = reinterpret_cast<void *>(fi.fh);
 
-    std::thread readdir_thread([&]() {
-      INIT_PHOTON();
-      int rr = readdir(fs_, parent, dirp, &childs1);
-      ASSERT_EQ(rr, 0);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::vector<TestInode> children, childs1, childs2;
+    r = fs_->readdir(parent, 0, dirp, filler_6_files, &childs1, nullptr, true,
+                     nullptr);
+    ASSERT_EQ(r, -ENOSPC);
 
     // testfile_2 is in the readdir result but is stale with the right
     // lookup_cnt.
@@ -1204,7 +1198,11 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     r = fs_->unlink(parent, "testfile_7");
     ASSERT_EQ(r, 0);
 
-    readdir_thread.join();
+    r = fs_->readdir(parent, 2 + childs1.size(), dirp, filler_6_files,
+                     &children, nullptr, true, nullptr);
+    ASSERT_EQ(r, 0);
+
+    childs1.insert(childs1.end(), children.begin(), children.end());
     ASSERT_SIZE_EQ(childs1.size(), 9);  // skip testfile_7
     for (size_t i = 0; i < childs1.size(); ++i) {
       ASSERT_NE(childs1[i].name, "testfile_7");
@@ -1217,17 +1215,19 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
 
     r = fs_->lookup(parent, "testfile_8", &nodeid, &st);
     ASSERT_EQ(r, 0);
-    std::thread readdir_thread_2([&]() {
-      INIT_PHOTON();
-      int rr = readdir(fs_, parent, dirp, &childs2);
-      ASSERT_EQ(rr, 0);
-    });
 
+    r = fs_->readdir(parent, 0, dirp, filler_6_files, &childs2, nullptr, true,
+                     nullptr);
+    ASSERT_EQ(r, -ENOSPC);
     r = fs_->unlink(parent, "testfile_8");
     ASSERT_EQ(r, 0);
     fs_->forget(nodeid, 2);  // this inode should be destroyed
 
-    readdir_thread_2.join();
+    children.clear();
+    r = fs_->readdir(parent, 2 + childs2.size(), dirp, filler_6_files,
+                     &children, nullptr, true, nullptr);
+    ASSERT_EQ(r, 0);
+    childs2.insert(childs2.end(), children.begin(), children.end());
     ASSERT_SIZE_EQ(childs2.size(), 7);
 
     for (size_t i = 0; i < childs1.size(); ++i) {

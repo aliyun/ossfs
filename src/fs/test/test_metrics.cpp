@@ -57,7 +57,7 @@ class Ossfs2MetricsTest : public Ossfs2TestSuite {
       ssize_t r =
           write_to_file_handle(handle, data.c_str(), append_size, file_size);
       ASSERT_EQ(r, static_cast<ssize_t>(append_size));
-      r = get_file_from_handle(handle)->fsync();
+      r = fsync_file_handle(handle);
       ASSERT_EQ(r, 0);
       file_size += append_size;
       std::this_thread::sleep_for(std::chrono::seconds(1));

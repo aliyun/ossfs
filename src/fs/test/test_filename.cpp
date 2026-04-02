@@ -265,7 +265,7 @@ class Ossfs2FilenameTest : public Ossfs2TestSuite {
     // the 4th subdir should fail
     auto subdir = random_string(255);
     r = fs_->mkdir(nodeids[3], subdir.c_str(), 0777, 0, 0, 0, &nodeids[4], &st);
-    ASSERT_EQ(r, -EOPNOTSUPP);
+    ASSERT_EQ(r, -EINVAL);
 
     // create a file with 256 length filename in the 4th level dir
     uint64_t nodeid1 = 0;
@@ -282,7 +282,7 @@ class Ossfs2FilenameTest : public Ossfs2TestSuite {
     auto valid_name = random_string(255);
     r = create_and_flush(nodeids[3], valid_name.c_str(), CREATE_BASE_FLAGS,
                          0777, 0, 0, 0, &nodeid2, &st, &handle2);
-    ASSERT_EQ(r, -EOPNOTSUPP);
+    ASSERT_EQ(r, -EINVAL);
     DEFER(fs_->forget(nodeid2, 1));
 
     // create a file with short name in the 4th level dir
@@ -298,7 +298,7 @@ class Ossfs2FilenameTest : public Ossfs2TestSuite {
 
     r = fs_->rename(nodeids[3], short_file.c_str(), nodeids[3],
                     valid_name.c_str(), 0);
-    ASSERT_EQ(r, -EOPNOTSUPP);
+    ASSERT_EQ(r, -EINVAL);
 
     r = fs_->rename(nodeids[3], short_file.c_str(), nodeids[3],
                     invalid_name.c_str(), 0);
@@ -323,7 +323,7 @@ class Ossfs2FilenameTest : public Ossfs2TestSuite {
     auto valid_dir = random_string(255);
     r = fs_->rename(nodeids[3], short_dir2.c_str(), nodeids[3],
                     valid_dir.c_str(), 0);
-    ASSERT_EQ(r, -EOPNOTSUPP);
+    ASSERT_EQ(r, -EINVAL);
 
     auto invalid_dir = random_string(256);
     r = fs_->rename(nodeids[3], valid_dir.c_str(), nodeids[3],

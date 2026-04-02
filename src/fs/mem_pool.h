@@ -18,7 +18,12 @@
 
 #include <photon/thread/thread.h>
 
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <vector>
+
+class FixedMemoryPoolTest;
 
 namespace OssFileSystem {
 // A memory pool for fixed-size memory blocks.
@@ -28,7 +33,7 @@ namespace OssFileSystem {
 class FixedBlockMemoryPool {
  public:
   FixedBlockMemoryPool(size_t block_size, size_t pool_capacity,
-                       size_t max_cached_blocks);
+                       size_t max_cached_blocks, uint64_t purge_interval_ms);
   ~FixedBlockMemoryPool();
 
   // Allocates a specified number of memory blocks, ignoring pool capacity
@@ -49,6 +54,8 @@ class FixedBlockMemoryPool {
  private:
   char *expand_one();
 
+  void purge_thread_entry();
+
   const size_t block_size_ = 0;
 
   // Maximum number of blocks in the pool. Set to
@@ -59,9 +66,18 @@ class FixedBlockMemoryPool {
   // Excess blocks are returned to the OS during deallocation.
   const size_t max_cached_blocks_ = 0;
 
+  const uint64_t purge_interval_ms_ = 0;
+
   photon::spinlock lock_;
   std::vector<char *> cached_block_list_;
   size_t used_ = 0;
+
+  std::mutex purger_lock_;
+  bool purger_stop_ = {false};
+  std::condition_variable purger_cv_;
+  std::unique_ptr<std::thread> purger_;
+
+  friend class ::FixedMemoryPoolTest;
 };
 
 };  // namespace OssFileSystem

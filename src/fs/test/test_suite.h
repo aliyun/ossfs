@@ -126,7 +126,6 @@ class Ossfs2TestSuite : public ::testing::Test {
           (flags & O_APPEND) > 0);
       return OssFs::open(nodeid, flags, fh, keep_page_cache);
     }
-
     virtual int release(uint64_t nodeid, void *fp) override {
       LOG_DEBUG("RELEASE. nodeid `", nodeid);
       return OssFs::release(nodeid, fp);
@@ -193,7 +192,7 @@ class Ossfs2TestSuite : public ::testing::Test {
                                  uint64_t size_MB, uint64_t &nodeid,
                                  int drift = 0);
 
-  // when create one file from fuse mountpoint, we will recieve fuse_create
+  // when create one file from fuse mountpoint, we will receive fuse_create
   // and fuse_flush
   int create_and_flush(uint64_t parent, const char *name, int flags,
                        mode_t mode, uid_t uid, gid_t gid, mode_t umask,
@@ -216,7 +215,16 @@ class Ossfs2TestSuite : public ::testing::Test {
     return (IFileHandleFuseLL *)fh;
   }
 
-  ssize_t read_from_handle(void *fh, char *buf, size_t size, off_t offset);
+  inline uint64_t get_nodeid_from_handle(void *fh) {
+    return static_cast<OssFileHandle *>(fh)->get_inode()->nodeid;
+  }
+
+  inline int fsync_file_handle(void *fh, bool datasync = false) {
+    return fs_->fsync(get_nodeid_from_handle(fh), fh, datasync);
+  }
+
+  ssize_t read_from_handle(void *fh, char *buf, size_t size, off_t offset,
+                           bool direct_call_file_api = false);
 
   ssize_t read_file_in_folder(uint64_t parent, const std::string &filename,
                               uint64_t *out_crc64 = nullptr);

@@ -18,15 +18,6 @@
 
 #include "test_suite.h"
 
-DEFINE_bool(get_object_meta_has_type_field, false,
-            "will be removed after GetObjectMeta is fixed");
-
-#define CHECK_GET_OBJECT_META()                                              \
-  if (!FLAGS_get_object_meta_has_type_field) {                               \
-    LOG_INFO("Skip test because get object meta does not have type field."); \
-    return;                                                                  \
-  }
-
 class Ossfs2SymlinkTest : public Ossfs2TestSuite {
  protected:
   void verify_oss_symlink() {
@@ -390,6 +381,7 @@ class Ossfs2SymlinkTest : public Ossfs2TestSuite {
     DEFER(fs_->forget(parent, 1));
 
     auto parent_path = nodeid_to_path(parent);
+    parent_path = parent_path.substr(1);
 
     std::vector<std::string> targets = {"test_file", "test_dir/test_file",
                                         "test_dir/"};
@@ -454,9 +446,10 @@ class Ossfs2SymlinkTest : public Ossfs2TestSuite {
                             uint64_t &nodeid) {
     nodeid = 0;
     std::vector<TestInode> children;
-    void *dh = nullptr;
-    int r = fs_->opendir(parent, &dh);
+    struct fuse_file_info fi;
+    int r = fs_->opendir(parent, &fi);
     if (r != 0) return r;
+    void *dh = reinterpret_cast<void *>(fi.fh);
 
     r = fs_->readdir(parent, 0, dh, filler, &children, nullptr, true, nullptr);
     if (r != 0) return r;
@@ -498,8 +491,6 @@ TEST_F(Ossfs2SymlinkTest, verify_oss_symlink) {
 }
 
 TEST_F(Ossfs2SymlinkTest, verify_symlink_and_readlink) {
-  CHECK_GET_OBJECT_META();
-
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -509,8 +500,6 @@ TEST_F(Ossfs2SymlinkTest, verify_symlink_and_readlink) {
 }
 
 TEST_F(Ossfs2SymlinkTest, verify_readdirplus) {
-  CHECK_GET_OBJECT_META();
-
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -521,8 +510,6 @@ TEST_F(Ossfs2SymlinkTest, verify_readdirplus) {
 }
 
 TEST_F(Ossfs2SymlinkTest, verify_lookup_and_getattr) {
-  CHECK_GET_OBJECT_META();
-
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -530,10 +517,6 @@ TEST_F(Ossfs2SymlinkTest, verify_lookup_and_getattr) {
   opts.enable_symlink = true;
   init(opts);
   verify_lookup_and_getattr();
-}
-
-TEST_F(Ossfs2SymlinkTest, DISABLED_verify_etag) {
-  // TODO(hongren.lhr): fix this test
 }
 
 TEST_F(Ossfs2SymlinkTest, verify_disable_symlink) {
@@ -546,8 +529,6 @@ TEST_F(Ossfs2SymlinkTest, verify_disable_symlink) {
 }
 
 TEST_F(Ossfs2SymlinkTest, verify_inode_type_change) {
-  CHECK_GET_OBJECT_META();
-
   OssFsOptions opts;
   opts.enable_symlink = true;
   opts.attr_timeout = 1;

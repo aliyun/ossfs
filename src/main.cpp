@@ -33,6 +33,7 @@
 #include "common/fstab.h"
 #include "common/logger.h"
 #include "common/macros.h"
+#include "common/ssl_probe.h"
 #include "common/utils.h"
 #include "fs/fs.h"
 #include "fuse_adapter_ll.h"
@@ -249,6 +250,7 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
       FLAGS_appendable_object_autoswitch_threshold;
 
   fs_options->readdir_remember_count = FLAGS_max_list_ret_count;
+  fs_options->kernel_readdir_cache_timeout = FLAGS_kernel_readdir_cache_timeout;
 
   fs_options->allow_rename_dir = FLAGS_allow_rename_dir;
   fs_options->rename_dir_concurrency = FLAGS_rename_dir_concurrency;
@@ -301,7 +303,7 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
     }
 
     if (fs_options->prefetch_chunks > 0) {
-      LOG_INFO("Memory cache is enabled, prefetch_chunks will be overwritted.");
+      LOG_INFO("Memory cache is enabled, prefetch_chunks will be overwritten.");
     }
 
     uint64_t prefetch_chunks =
@@ -481,6 +483,10 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
   OssFileSystem::OssFs *fs = nullptr;
   std::thread *http_server_thread = nullptr;
   bool is_stopping = false;
+
+  if (!SSLProbe::setup_ssl_env()) {
+    LOG_WARN("Failed to get SSL certificate file");
+  }
 
   err = create_background_oss_clients();
   if (err != 0) {
@@ -733,7 +739,7 @@ static void do_show_mount_help() {
     }
   };
 
-  auto has_visiable_options =
+  auto has_visible_options =
       [](const std::vector<OptionsRegistry::OptionAttribute> &options) {
         for (const auto &option : options) {
           if (!option.hidden && !option.experimental) {
@@ -756,7 +762,7 @@ static void do_show_mount_help() {
   }
 
   for (size_t i = 1; i < all_options.size(); i++) {
-    if (!has_visiable_options(all_options[i])) continue;
+    if (!has_visible_options(all_options[i])) continue;
     printf("\n%s:\n", OptionsRegistry::kCategoryNames[i].data());
     for (const auto &option : all_options[i]) {
       print_one(option);
@@ -808,6 +814,9 @@ int main(int argc, char *argv[]) {
 
   if (is_fstab_args(argc, argv)) {
     printf("Using 'fstab' style options.\n");
+    printf("Command: ");
+    for (int i = 0; i < argc; i++) printf("%s ", argv[i]);
+    printf("\n");
     auto args = parse_fstab(argc, argv);
     // We need to reverse the args for CLI11 parse std::vector<std::string>.
     std::reverse(args.begin(), args.end());
@@ -900,6 +909,8 @@ int main(int argc, char *argv[]) {
     }
 
     fuse_opt_add_arg(&args, "-odefault_permissions");
+    fuse_opt_add_arg(&args, "-osubtype=ossfs2");
+    fuse_opt_add_arg(&args, "-ofsname=ossfs2");
 
     int pipefd[2];
     if (pipe(pipefd)) return -1;

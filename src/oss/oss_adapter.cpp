@@ -75,7 +75,7 @@ OssDirent::OssDirent(std::string_view name, uint64_t size, time_t mtime,
 
 OssAdapter::OssAdapter(const OssAdapterOptions &options, Authenticator *auth)
     : opts_(options), oss_client_(new_oss_client(options, auth)) {
-  // Remove the leading && tailing '/' to make it easier to convert an fs path
+  // Remove the leading && trailing '/' to make it easier to convert an fs path
   // into an object path.
   if (opts_.prefix.size() && opts_.prefix.back() == '/')
     opts_.prefix.pop_back();
@@ -296,9 +296,8 @@ int OssAdapter::oss_list_dir(std::string_view path, ObjectList &results,
       }
     }
 
-    if (IS_FAULT_INJECTION_ENABLED(FI_Readdir_list_Delay)) {
-      photon::thread_usleep(1000 * 300);
-    }
+    FAULT_INJECTION(FI_Readdir_list_Delay,
+                    []() { photon::thread_usleep(1000 * 300); });
 
     return 0;
   };

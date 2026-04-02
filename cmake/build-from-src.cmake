@@ -35,12 +35,12 @@ function(build_from_src [dep])
     ExternalProject_Add(
             openssl
             URL ${OPENSSL_SOURCE}
-            URL_MD5 bad68bb6bd9908da75e2c8dedc536b29
+            URL_MD5 3f76825f195e52d4b10c70040681a275
             UPDATE_DISCONNECTED ON
             BUILD_IN_SOURCE ON
-            CONFIGURE_COMMAND ./config -fPIC --prefix=${BINARY_DIR} --openssldir=${BINARY_DIR} shared
-            BUILD_COMMAND make -j 1  # https://github.com/openssl/openssl/issues/5762#issuecomment-376622684
-            INSTALL_COMMAND make -j 1 install
+            CONFIGURE_COMMAND ./config -fPIC --prefix=${BINARY_DIR} --openssldir=${BINARY_DIR} no-shared
+            BUILD_COMMAND $(MAKE)
+            INSTALL_COMMAND $(MAKE) install
             LOG_CONFIGURE ON
             LOG_BUILD ON
             LOG_INSTALL ON

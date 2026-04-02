@@ -27,7 +27,7 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
     create_random_file(local_file, 3);
 
     // Should exclude the root inode and the parent inode.
-    int lru_size = fs_->get_inode_eviction_threshold() - 2;
+    int lru_size = fs_->get_inode_eviction_threshold() - 3;
     std::vector<uint64_t> nodeids;
     struct stat st;
     uint64_t nodeid = 0;
@@ -51,6 +51,7 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
     for (int i = 0; i < lru_size; i++) {
       file_name = "test_lru_file_" + std::to_string(i);
       r = fs_->lookup(parent, file_name.c_str(), &nodeid, &st);
+      ASSERT_EQ(r, 0);
       ASSERT_EQ(nodeid, nodeids[i]);
       fs_->forget(nodeid, 1);
     }
@@ -58,8 +59,8 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
     g_fault_injector->clear_injection(
         FaultInjectionId::FI_OssError_Call_Failed);
 
-    // create another 3 files
-    for (int i = lru_size; i < lru_size + 3; i++) {
+    // create another 4 files
+    for (int i = lru_size; i < lru_size + 4; i++) {
       file_name = "test_lru_file_" + std::to_string(i);
       r = upload_file(local_file, join_paths(parent_path, file_name),
                       FLAGS_oss_bucket_prefix);
@@ -80,7 +81,7 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
       ASSERT_EQ(r, -EIO);
     }
 
-    for (int i = 3; i < lru_size + 3; i++) {
+    for (int i = 3; i < lru_size + 4; i++) {
       std::string file_name = "test_lru_file_" + std::to_string(i);
       r = fs_->lookup(parent, file_name.c_str(), &nodeid, &st);
       ASSERT_EQ(r, 0);
@@ -266,9 +267,10 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
       fs_->forget(nodeid, 2);
     }
 
-    void *dh = nullptr;
-    r = fs_->opendir(parent, &dh);
+    struct fuse_file_info fi;
+    r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
+    void *dh = reinterpret_cast<void *>(fi.fh);
 
     std::vector<TestInode> children;
     r = fs_->readdir(parent, 0, dh, filler, &children, nullptr, true, nullptr);
@@ -282,9 +284,10 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
     std::thread t([&]() {
       g_fault_injector->set_injection(
           FaultInjectionId::FI_Readdir_Delay_After_Construct_Inodes);
-      void *dirp = nullptr;
-      int r = fs_->opendir(parent, &dirp);
+      struct fuse_file_info fi;
+      int r = fs_->opendir(parent, &fi);
       ASSERT_EQ(r, 0);
+      void *dirp = reinterpret_cast<void *>(fi.fh);
 
       std::vector<TestInode> childs;
       r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true,
@@ -357,9 +360,10 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
 
     auto readdir = [&](uint64_t parent,
                        std::vector<NodeWithST> &childs) -> int {
-      void *dirp = nullptr;
-      int rr = fs_->opendir(parent, &dirp);
+      struct fuse_file_info fi;
+      int rr = fs_->opendir(parent, &fi);
       if (rr < 0) return rr;
+      void *dirp = reinterpret_cast<void *>(fi.fh);
 
       rr = fs_->readdir(parent, 0, dirp, filler_withst, &childs, nullptr, true,
                         nullptr);

@@ -45,7 +45,7 @@ We provide packages for common Linux distributions:
 * Ubuntu 14.04 or later (x86_64)
 * Debian 11 or later (x86_64)
 
-Please select the corresponding package for download and installation from the [release page](https://github.com/aliyun/ossfs/releases).
+Please select the corresponding package for download and installation from the [Releases Page](https://github.com/aliyun/ossfs/releases).
 
 On Ubuntu, execute the following command to install:
 

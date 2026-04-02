@@ -98,7 +98,7 @@ void EnableFilePrefetching<Derived>::reset_prefetch(off_t remote_size,
 }
 
 //
-//  Prefecthing algorithm:
+//  Prefetching algorithm:
 //  +--------------------+---------------------+---------------------+
 //  |        prefetch window(prefetching)      | next prefetch range |
 //  +--------------------+---------------------+---------------------+
@@ -106,7 +106,7 @@ void EnableFilePrefetching<Derived>::reset_prefetch(off_t remote_size,
 //   |
 //  read offset
 //
-//  next prefetch range = min(prefetch chunk size * prefech concurrency,
+//  next prefetch range = min(prefetch chunk size * prefetch concurrency,
 //                            prefetch window / 2)
 //
 //  New prefetching tasks will be generated when we have less data than
@@ -175,9 +175,9 @@ template <typename Derived>
 void *EnableFilePrefetching<Derived>::prefetch_tsk(void *args) {
   auto ctx = (PrefetchContext *)args;
   auto start = ctx->offset;
-  if (IS_FAULT_INJECTION_ENABLED(FI_First_Prefetch_Delay)) {
+  FAULT_INJECTION(FI_First_Prefetch_Delay, [&]() {
     if (start == 0) photon::thread_sleep(1);
-  }
+  });
   for (int i = 0; i < ctx->num; i++) {
     ctx->prefetcher->fs_->prefetch_sem_->wait(1);
     auto sub_ctx = new PrefetchContext;

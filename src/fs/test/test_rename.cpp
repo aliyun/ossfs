@@ -127,9 +127,10 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
                       RENAME_EXCHANGE);
       ASSERT_EQ(r, -ENOTSUP);
 
-      void *dirp = nullptr;
-      r = fs_->opendir(nodeid1, &dirp);
+      struct fuse_file_info fi;
+      r = fs_->opendir(nodeid1, &fi);
       ASSERT_EQ(r, 0);
+      void *dirp = reinterpret_cast<void *>(fi.fh);
 
       r = fs_->releasedir(nodeid1, dirp);
 
@@ -338,11 +339,26 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     for (auto nodeid : nodeids) {
       fs_->forget(nodeid, 1);
     }
-
     LOG_INFO("created ` files in the dir", file_cnt);
 
-    bool has_failure_round = false;
     std::string old_name = "test_dir";
+    // Just skip the request which checks if dest dir is empty.
+    // And the failure happens when we try to list the src dir.
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Call_Timeout,
+                                    {std::numeric_limits<uint32_t>::max(), 1});
+    r = fs_->rename(parent, old_name, parent, "should_fail_anyway", 0);
+    ASSERT_EQ(r, -ETIMEDOUT);
+    g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Timeout);
+    // No copies should have happned.
+    auto tmp_result = get_list_objects(
+        join_paths(parent_path, "should_fail_anyway"), FLAGS_oss_bucket_prefix);
+    ASSERT_SIZE_EQ(tmp_result.size(), 0);
+    tmp_result = get_list_objects(join_paths(parent_path, old_name),
+                                  FLAGS_oss_bucket_prefix);
+    ASSERT_SIZE_EQ(tmp_result.size(), file_cnt);
+
+    bool has_failure_round = false;
     for (int i = 0; i < 10; i++) {
       auto set_invalid_cred_future = std::async(std::launch::async, [&]() {
         INIT_PHOTON();
@@ -383,7 +399,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
       }
     }
 
-    // it's very unlikely that all rounds have been completed sucessfully.
+    // it's very unlikely that all rounds have been completed successfully.
     // assert here to make sure we have experienced failure cases.
     ASSERT_TRUE(has_failure_round);
 
@@ -883,6 +899,57 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     }
   }
 
+  void verify_rename_dir_oss_err_dir_obj() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t dir_nodeid = 0;
+    struct stat st;
+    int r = fs_->mkdir(parent, "src_dir", 0777, 0, 0, 0, &dir_nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_nodeid, 1));
+    auto parent_path = nodeid_to_path(parent);
+
+    int file_cnt = 11;
+    std::vector<uint64_t> nodeids(file_cnt, 0);
+    create_files_under_dir_parallelly(dir_nodeid, file_cnt, nodeids);
+    for (auto nodeid : nodeids) {
+      fs_->forget(nodeid, 1);
+    }
+    LOG_INFO("created ` files in the dir", file_cnt);
+
+    std::string old_name = "src_dir";
+    // Skip two oss requests.
+    // 1. check if the dst dir has children
+    // 2. count the children number of the src dir
+    // And then we will try to copy test_dir/ to dst_dir_obj/
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Call_Timeout,
+                                    {std::numeric_limits<uint32_t>::max(), 2});
+    r = fs_->rename(parent, old_name, parent, "dst_dir", 0);
+    ASSERT_EQ(r, -ETIMEDOUT);
+    g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Timeout);
+    // No copies should have happned. check if dst_dir_obj/ exists.
+    auto tmp_result = get_list_objects(join_paths(parent_path, "dst_dir"),
+                                       FLAGS_oss_bucket_prefix, true);
+    ASSERT_SIZE_EQ(tmp_result.size(), 0);
+
+    // Skip 12 more copy requests + 1 delete request
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Call_Timeout,
+                                    {std::numeric_limits<uint32_t>::max(), 15});
+    r = fs_->rename(parent, old_name, parent, "dst_dir", 0);
+    ASSERT_EQ(r, -ETIMEDOUT);
+    g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Timeout);
+    // only src_dir_obj/ exists
+    tmp_result = get_list_objects(join_paths(parent_path, "dst_dir"),
+                                  FLAGS_oss_bucket_prefix, true);
+    ASSERT_SIZE_EQ(tmp_result.size(), 12);
+    tmp_result = get_list_objects(join_paths(parent_path, "src_dir"),
+                                  FLAGS_oss_bucket_prefix, true);
+    ASSERT_SIZE_EQ(tmp_result.size(), 1);
+  }
+
  private:
   void create_files_under_dir_parallelly(uint64_t dir_nodeid, int file_cnt,
                                          std::vector<uint64_t> &nodeids) {
@@ -1031,4 +1098,11 @@ TEST_F(Ossfs2RenameTest, verify_rename_dir_partial_deletion) {
   OssFsOptions opts;
   init(opts);
   verify_rename_dir_with_partial_deletion();
+}
+
+TEST_F(Ossfs2RenameTest, verify_rename_dir_oss_err_dir_obj) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_rename_dir_oss_err_dir_obj();
 }

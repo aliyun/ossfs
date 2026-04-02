@@ -53,7 +53,7 @@ struct BGVCpuOssClientEnv : public VCpuOssClientEnv {
       auto e = executors[i];
       if (!e) continue;
 
-      if (destory_executor) {
+      if (destroy_executor) {
         e->perform([&]() { delete oss_clients[i]; });
         delete e;
       }
@@ -66,7 +66,7 @@ struct BGVCpuOssClientEnv : public VCpuOssClientEnv {
     photon::vcpu_base *vcpu;
   };
 
-  bool destory_executor = true;
+  bool destroy_executor = true;
   std::vector<photon::Executor *> executors;
   std::vector<photon::vcpu_base *> vcpu_list;
   std::atomic<uint64_t> vcpu_id;

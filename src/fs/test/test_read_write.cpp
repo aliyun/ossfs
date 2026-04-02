@@ -696,7 +696,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       g_fault_injector->set_injection(
           FaultInjectionId::FI_OssError_Call_Timeout);
 
-      r = file->fsync();
+      r = fsync_file_handle((void *)file);
       ASSERT_EQ(r, -ETIMEDOUT);
 
       g_fault_injector->clear_injection(
@@ -705,7 +705,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       r = file->pwrite(random_data.c_str(), random_data.size(), 0);
       ASSERT_EQ(r, -EIO);
 
-      r = file->fsync();
+      r = fsync_file_handle((void *)file);
       ASSERT_EQ(r, -EIO);
     }
 
@@ -731,7 +731,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       g_fault_injector->set_injection(
           FaultInjectionId::FI_OssError_Call_Timeout);
 
-      r = file->fsync();
+      r = fsync_file_handle((void *)file);
       ASSERT_NE(r, 0);
 
       g_fault_injector->clear_injection(
@@ -745,7 +745,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       r = file->pwrite(random_data.c_str(), random_data.size(), offset);
       ASSERT_TRUE(r < 0);
 
-      r = file->fsync();
+      r = fsync_file_handle((void *)file);
       ASSERT_NE(r, 0);
     }
 
@@ -768,7 +768,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       ASSERT_EQ(r, static_cast<ssize_t>(random_data.size()));
       offset += random_data.size();
 
-      r = file->fsync();
+      r = fsync_file_handle((void *)file);
       ASSERT_EQ(r, 0);
 
       r = file->pwrite(random_data.c_str(), random_data.size(), offset);
@@ -778,7 +778,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       g_fault_injector->set_injection(
           FaultInjectionId::FI_OssError_Call_Timeout);
 
-      r = file->fsync();
+      r = fsync_file_handle((void *)file);
       ASSERT_NE(r, 0);
 
       g_fault_injector->clear_injection(
@@ -1403,7 +1403,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
             r = fs_->open(nodeids[j], O_RDWR, &fds[j], &unused);
             ASSERT_EQ(r, 0);
 
-            r = read_file_content(fds[j], st.st_size, file_name);
+            r = read_file_content(fds[j], st.st_size, file_name, nullptr, true);
             ASSERT_EQ(r, 0);
           }
         });
@@ -1805,9 +1805,150 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     }
   }
 
+  void verify_random_read_range() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    srand(time(nullptr));
+
+    auto parent_path = nodeid_to_path(parent);
+    std::string local_file = join_paths(test_path_, "local_file");
+    std::string filepath = "testfile";
+    create_random_file(local_file, 128);
+    int r = upload_file(local_file, join_paths(parent_path, filepath),
+                        FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    bool unused;
+    struct stat st;
+    r = fs_->lookup(parent, filepath.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    r = fs_->open(nodeid, O_RDONLY, &handle, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(handle)));
+    auto read_check = [&](off_t offset, size_t size = 1024 * 1024) {
+      char *buf = new char[size];
+      DEFER(delete[] buf);
+      std::ifstream file_stream(local_file);
+
+      void *read_handle = handle;
+      bool new_handle = rand() % 2;
+      if (new_handle) {
+        int r = fs_->open(nodeid, O_RDONLY, &read_handle, &unused);
+        ASSERT_EQ(r, 0);
+      }
+      DEFER(if (new_handle) {
+        fs_->release(nodeid, get_file_from_handle(read_handle));
+      });
+
+      int r = read_from_handle(read_handle, buf, size, offset);
+      size_t read_size = std::min(size, size_t(st.st_size - offset));
+      ASSERT_EQ(r, (ssize_t)read_size);
+      auto crc1 = cal_crc64(0, (void *)buf, read_size);
+
+      file_stream.seekg(offset);
+      file_stream.read(buf, size);
+      ASSERT_EQ(file_stream.gcount(), (ssize_t)read_size);
+      auto crc2 = cal_crc64(0, (void *)buf, read_size);
+
+      if (crc1 != crc2) {
+        LOG_ERROR("crc1 != crc2 for offset `, size `", offset, size);
+      }
+      ASSERT_EQ(crc1, crc2);
+    };
+
+    const size_t MB = 1024 * 1024;
+    read_check(MB);
+    read_check(MB / 2);
+    read_check(0);
+    read_check(st.st_size - MB / 2);
+    read_check(st.st_size);
+
+    std::vector<std::future<void>> tasks;
+    for (int i = 0; i < 100; i++) {
+      auto task = std::async(std::launch::async, [&]() {
+        INIT_PHOTON();
+        int offset = rand() % 256 * MB / 2;
+        read_check(offset);
+      });
+      tasks.push_back(std::move(task));
+    }
+    for (auto &task : tasks) task.wait();
+  }
+
+  void verify_random_read_write_and_truncate() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    srand(time(nullptr));
+
+    int file_num = 3 + rand() % 3;
+    std::vector<std::string> file_names(file_num);
+    std::vector<uint64_t> file_crcs(file_num, 0);
+    std::vector<uint64_t> file_sizes(file_num, 0);
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    struct stat st;
+    for (int i = 0; i < file_num; i++) {
+      file_names[i] = "testfile-" + std::to_string(i);
+      auto file_size = 10 + rand() % 10;
+      file_sizes[i] = file_size * 1024 * 1024;
+      file_crcs[i] =
+          create_file_in_folder(parent, file_names[i], file_size, nodeid, 0);
+      DEFER(fs_->forget(nodeid, 1));
+      auto meta = get_file_meta(file_names[i], FLAGS_oss_bucket_prefix);
+      ASSERT_EQ(std::to_string(file_crcs[i]), meta["X-Oss-Hash-Crc64ecma"]);
+    }
+
+    for (int i = 0; i < 20; i++) {
+      int index = rand() % file_num;
+      if (rand() % 2 == 0) {
+        // read file
+        uint64_t crc64 = 0;
+        int r = read_file_in_folder(parent, file_names[index], &crc64);
+        ASSERT_EQ(r, (ssize_t)file_sizes[index]);
+        ASSERT_EQ(crc64, file_crcs[index]);
+      } else {
+        // write file
+        int r = fs_->lookup(parent, file_names[index].c_str(), &nodeid, &st);
+        ASSERT_EQ(r, 0);
+        DEFER(fs_->forget(nodeid, 1));
+        bool unused;
+        off_t offset = st.st_size;
+        int open_flags = O_RDWR;
+        if (rand() % 3 == 0) {
+          open_flags |= O_TRUNC;
+          offset = 0;
+          file_crcs[index] = 0;
+          file_sizes[index] = 0;
+        }
+        r = fs_->open(nodeid, open_flags, &handle, &unused);
+        ASSERT_EQ(r, 0);
+
+        std::string data = random_string(IO_SIZE);
+        r = write_to_file_handle(handle, data.c_str(), data.size(), offset);
+        ASSERT_EQ(r, (ssize_t)data.size());
+        file_sizes[index] += r;
+        file_crcs[index] =
+            cal_crc64(file_crcs[index], (void *)data.c_str(), data.size());
+        r = fs_->release(nodeid, get_file_from_handle(handle));
+        ASSERT_EQ(r, 0);
+
+        auto meta = get_file_meta(file_names[index], FLAGS_oss_bucket_prefix);
+        ASSERT_EQ(std::to_string(file_crcs[index]),
+                  meta["X-Oss-Hash-Crc64ecma"]);
+      }
+    }
+  }
+
  private:
   int read_file_content(void *fh, size_t file_size, std::string_view file_name,
-                        std::string *out = nullptr) {
+                        std::string *out = nullptr,
+                        bool direct_call_file_api = false) {
     if (out) out->clear();
 
     char buf[IO_SIZE];
@@ -1815,7 +1956,8 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     uint64_t offset = 0;
     while (offset < file_size) {
       buf_size = std::min(buf_size, file_size - offset);
-      auto read_size = read_from_handle(fh, buf, buf_size, offset);
+      auto read_size =
+          read_from_handle(fh, buf, buf_size, offset, direct_call_file_api);
       if (read_size != static_cast<ssize_t>(buf_size)) {
         LOG_ERROR("Failed to read file content of `, r = `", file_name,
                   read_size);
@@ -2012,7 +2154,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_default_prefetch_chunks) {
   verify_prefetch_chunks(2);
 }
 
-TEST_F(Ossfs2ReadWriteTest, verify_sepcified_prefetch_chunks) {
+TEST_F(Ossfs2ReadWriteTest, verify_specified_prefetch_chunks) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.max_total_reserved_buffer_count = 0;
@@ -2099,4 +2241,20 @@ TEST_F(Ossfs2ReadWriteTest, verify_remote_change_with_existing_fh_parallel) {
   init(opts);
 
   verify_remote_change_with_existing_fh_parallel();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_random_read_range) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+
+  verify_random_read_range();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_random_read_write_and_truncate) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+
+  verify_random_read_write_and_truncate();
 }

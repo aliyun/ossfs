@@ -211,6 +211,10 @@ DEFINE_OPTION(fuse_entry_timeout, int64, -1,
               kCachingOptions, false, true);
 DEFINE_validator(fuse_entry_timeout, &validate_fuse_attr_timeout);
 
+DEFINE_OPTION(kernel_readdir_cache_timeout, int64, 0,
+              "Kernel readdir cache timeout in seconds. 0 means no cache",
+              kCachingOptions, false, false);
+
 DEFINE_OPTION(close_to_open, bool, false, "Enable close-to-open consistency",
               kCachingOptions, false, false);
 
