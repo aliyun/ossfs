@@ -21,22 +21,67 @@
 			"oss:RestoreObjectVersion"
 		],
 		"Principal": [
-			"*"
+			"@USERID"
 		],
 		"Resource": [
-			"acs:oss:*:**************:test-policy-bucket/dir/*"
+			"acs:oss:*:@OWNERID:@BUCKETNAME/@PREFIX/*",
+			"acs:oss:*:@OWNERID:@BUCKETNAME/whatever"
 		]
-	},{
+	}, {
+		"Effect": "Deny",
+		"Action": [
+			"oss:ListObjects",
+			"oss:GetObject"
+		],
+		"Principal": [
+			"@USERID"
+		],
+		"Resource": [
+			"acs:oss:*:@OWNERID:@BUCKETNAME"
+		],
+		"Condition": {
+			"StringLike": {
+        		"oss:Prefix": [
+					"@PREFIX/*"
+				]
+			}
+		}
+	}, {
+		"Effect": "Allow",
+		"Action": [
+			"oss:GetObject",
+			"oss:PutObject",
+			"oss:GetObjectAcl",
+			"oss:PutObjectAcl",
+			"oss:ListObjects",
+			"oss:AbortMultipartUpload",
+			"oss:ListParts",
+			"oss:RestoreObject",
+			"oss:GetVodPlaylist",
+			"oss:PostVodPlaylist",
+			"oss:PublishRtmpStream",
+			"oss:ListObjectVersions",
+			"oss:GetObjectVersion",
+			"oss:GetObjectVersionAcl",
+			"oss:RestoreObjectVersion"
+		],
+		"Principal": [
+			"@USERID"
+		],
+		"Resource": [
+			"acs:oss:*:@OWNERID:@BUCKETNAME/*"
+		]
+	}, {
 		"Effect": "Allow",
 		"Action": [
 			"oss:ListObjects",
 			"oss:GetObject"
 		],
 		"Principal": [
-			"*"
+			"@USERID"
 		],
 		"Resource": [
-			"acs:oss:*:************:test-policy-bucket"
+			"acs:oss:*:@OWNERID:@BUCKETNAME"
 		],
 		"Condition": {
 			"StringLike": {
@@ -45,16 +90,5 @@
 				]
 			}
 		}
-	},{
-    "Effect": "Allow",
-		"Action": [
-			"oss:*"
-		],
-		"Principal": [
-			"*"
-		],
-		"Resource": [
-      "acs:oss:*:************:test-policy-bucket/*"
-		]
-  }]
+	}]
 }

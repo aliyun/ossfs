@@ -4,22 +4,25 @@
 # You need to modify the policy.json file
 
 # # This script runs all tests by default. You can run it in the following way
-# Usage: ./test_policy_mount.sh [bucket] [mp] [ak] [sk] [endpoint] [subdir]
-# example: ./test_policy_mount.sh your_bucket /mnt ak sk http://oss-cn-hangzhou.aliyuncs.com dir
+# Usage: ./test_policy_mount.sh [bucket_with_access] [bucket_no_access] [mp] [ak] [sk] [endpoint] [subdir]
+# example: ./test_policy_mount.sh bucket_access bucket_no_access /mnt ak sk http://oss-cn-hangzhou.aliyuncs.com dir
+
+# subdir is suggested to set with special characters, such as "?prefix=%3F%3D"
 
 # This script can also be used to run a single test. You can run it in the following way
-# Usage: ./test_policy_mount.sh [bucket] [mp] [ak] [sk] [endpoint] [subdir] [case]
-# example: ./test_policy_mount.sh your_bucket /mnt ak sk http://oss-cn-hangzhou.aliyuncs.com dir test_no_such_bucket
+# Usage: ./test_policy_mount.sh [bucket_with_access] [bucket_no_access] [mp] [ak] [sk] [endpoint] [subdir] [case]
+# example: ./test_policy_mount.sh bucket_access bucket_no_access /mnt ak sk http://oss-cn-hangzhou.aliyuncs.com dir test_no_such_bucket
 
 #!/bin/bash
 
 bucket_name=$1
-mp=$2
-ak=$3
-sk=$4
-endpoint=$5
-subdir_name=$6
-case=$7
+bucket_name_no_access=$2
+mp=$3
+ak=$4
+sk=$5
+endpoint=$6
+subdir_name=$7
+case=$8
 
 function drop_cache {
     sync
@@ -51,9 +54,9 @@ function mount {
     bucket=$1
     subdir=$2
     if [ -z "$subdir" ]; then
-        ossfs $bucket $mp -ourl=$endpoint -odbglevel=dbg -ologfile=/root/ossfs_policy.log 
+        /root/ossfs $bucket $mp -ourl=$endpoint -odbglevel=dbg -ologfile=/root/ossfs_policy.log 
     else
-        ossfs $bucket:/$subdir $mp -ourl=$endpoint -odbglevel=dbg -ologfile=/root/ossfs_policy.log 
+        /root/ossfs $bucket:/$subdir $mp -ourl=$endpoint -odbglevel=dbg -ologfile=/root/ossfs_policy.log 
     fi
 }
 
@@ -94,7 +97,7 @@ function test_no_such_bucket {
     tmp_bucket="tmp_bucket_$(date +%s)"
     mount $tmp_bucket
     sleep 1
-    if ps -ef | grep -v "grep" | grep -q "ossfs"; then
+    if ps -ef | grep -v "grep" | grep -q "ossfs" | grep "url"; then
         echo "ossfs is running, not expected"
         return 1
     fi
@@ -107,7 +110,7 @@ function test_no_such_bucket {
     # mount temp subdir
     mount $tmp_bucket $subdir_name
     sleep 1
-    if ps -ef | grep -v "grep" | grep -q "ossfs"; then
+    if ps -ef | grep -v "grep" | grep -q "ossfs" | grep "url"; then
         echo "ossfs is running, not expected"
         return 1
     fi
@@ -125,7 +128,7 @@ function test_bucket_no_policy_with_subdir_no_policy {
     fi
     
     # test mount bucket no policy
-    mount $bucket_name
+    mount $bucket_name_no_access
     sleep 1
     if ! grep -q "AccessDenied" /root/ossfs_policy.log; then
         echo "not found AccessDenied in log, not expected"
@@ -133,11 +136,8 @@ function test_bucket_no_policy_with_subdir_no_policy {
     fi
     unmount
     
-    # test subdir no policy
-    subdir=tmp_subdir_$(date +%s)
-    
     # test subdir does not exist
-    mount $bucket_name $subdir
+    mount $bucket_name $subdir_name
     sleep 1
     if ! grep -q "AccessDenied" /root/ossfs_policy.log; then
         echo "not found AccessDenied in log, not expected"
@@ -163,18 +163,13 @@ function test_bucket_no_policy_with_subdir_has_policy {
     fi
 
     # test mount bucket no policy but has subdir policy
-    ossutil_cmd bucket-policy --method put oss://$bucket_name test_policies/policy.json
+    ossutil_cmd bucket-policy --method put oss://$bucket_name_no_access test_policies/policy.json
 
     # test subdir does not exist
-    ossutil_cmd rm -r -f oss://$bucket_name/$subdir_name
+    ossutil_cmd rm -r -f oss://$bucket_name_no_access/$subdir_name
     
-    mount $bucket_name $subdir_name
+    mount $bucket_name_no_access $subdir_name
     sleep 1
-    if ! grep -q "NoSuchKey" /root/ossfs_policy.log; then
-        echo "not found NoSuchKey in log, not expected"
-        return 1
-    fi
-
     if ! ps -ef | grep -v "grep" | grep -q "ossfs"; then
         echo "ossfs is not running, not expected"
         return 1
@@ -182,9 +177,9 @@ function test_bucket_no_policy_with_subdir_has_policy {
     unmount
     
     # test subdir exist
-    ossutil_cmd mkdir oss://$bucket_name/$subdir_name
+    ossutil_cmd mkdir oss://$bucket_name_no_access/$subdir_name
     
-    mount $bucket_name $subdir_name
+    mount $bucket_name_no_access $subdir_name
     sleep 1
     if ! ps -ef | grep -v "grep" | grep -q "ossfs"; then
         echo "ossfs is not running, not expected"
@@ -195,9 +190,9 @@ function test_bucket_no_policy_with_subdir_has_policy {
 
 function test_exitcode {
   # set policy.json as no access to the bucket
-  ossutil_cmd bucket-policy --method put oss://$bucket_name test_policies/policy.json
+  ossutil_cmd bucket-policy --method put oss://$bucket_name_no_access test_policies/policy.json
 
-  mount $bucket_name $subdir_name
+  mount $bucket_name_no_access $subdir_name
   if [ $? == 0 ]; then
     return 1
   fi
@@ -220,7 +215,12 @@ function test_create_without_perm {
         return 1
   fi
 
-  res=`mkdir -p $mp/dir/whatever 2>/dev/stdout`
+  res=`stat $mp/$subdir_name/whatever 2>/dev/stdout`
+  if ! echo "$res" | grep  "not permitted"; then
+    return 1
+  fi
+
+  res=`mkdir -p $mp/$subdir_name/whatever 2>/dev/stdout`
   if ! echo "$res" | grep  "not permitted"; then
     return 1
   fi

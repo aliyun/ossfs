@@ -223,8 +223,6 @@ bool MakeUrlResource(const char* realpath, std::string& resourcepath, std::strin
 
 std::string prepare_url(const char* url)
 {
-    S3FS_PRN_INFO3("URL is %s", url);
-
     std::string uri;
     std::string hostname;
     std::string path;

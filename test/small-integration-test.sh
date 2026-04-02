@@ -52,6 +52,7 @@ export DIRECT_READ_LOCAL_FILE_CACHE_SIZE_MB
 if [ -n "${ALL_TESTS}" ]; then
     FLAGS=(
         "use_cache=${CACHE_DIR} -o ensure_diskfree=${ENSURE_DISKFREE_SIZE} -o fake_diskfree=${FAKE_FREE_DISK_SIZE} -o del_cache"
+        "use_cache=${CACHE_DIR} -o ensure_diskfree=${ENSURE_DISKFREE_SIZE} -o fake_diskfree=${FAKE_FREE_DISK_SIZE} -o del_cache -o skip_clean_statcache_on_ro_flush"
         enable_content_md5
         disable_noobj_cache
         "max_stat_cache_size=100 -o stat_cache_expire=-1"
@@ -92,8 +93,8 @@ fi
 start_s3proxy
 install_ossutil
 
-if ! aws_cli s3api head-bucket --bucket "${TEST_BUCKET_1}" --region "${OSS_REGION}"; then
-    aws_cli s3 mb "s3://${TEST_BUCKET_1}" --region "${OSS_REGION}"
+if ! ossutil_cmd stat "oss://${TEST_BUCKET_1}"; then
+    ossutil_cmd mb "oss://${TEST_BUCKET_1}"
 fi
 
 for flag in "${FLAGS[@]}"; do

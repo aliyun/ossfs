@@ -83,15 +83,15 @@ def docker_stop(name):
             raise RuntimeError(p.stderr.read())
 
 
-def docker_run(conatiner_name, img, volume_list, cmd):
+def docker_run(container_name, img, volume_list, cmd):
     """Run a specified command with the given image"""
     volume_param = ''
     for volume in volume_list:
         volume_param += (' -v ' + volume)
     if volume_param:
-        cmd = 'docker run --rm=true --name %s %s %s %s' % (conatiner_name, volume_param, img, cmd)
+        cmd = 'docker run --rm=true --name %s %s %s %s' % (container_name, volume_param, img, cmd)
     else:
-        cmd = 'docker run --rm=true --name %s %s %s' % (conatiner_name, img, cmd)
+        cmd = 'docker run --rm=true --name %s %s %s' % (container_name, img, cmd)
 
     print(cmd)
     p = Popen(shlex.split(cmd), stdout=PIPE, stderr=PIPE)
