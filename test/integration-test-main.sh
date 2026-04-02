@@ -3251,6 +3251,10 @@ function test_auto_cache {
     fi
 }
 
+# diff, cmp, and md5sum first send getattr to get the size of the remote file,
+# since we now does not clear the statcache for read-only flush, this getattr
+# could get a stale size when the remote file is changed by ossutil or others,
+# so we could only test this with stat_cache_expire=0.
 function test_read_in_1s {
   describe "Testing read_in_1s option"
 
@@ -3259,9 +3263,9 @@ function test_read_in_1s {
   for i in {1..10}; do 
     echo "append_${i}" >> ${TEMP_DIR}/${TEST_FILE_NAME}
     
-    aws_cli s3 cp "${TEMP_DIR}/${TEST_FILE_NAME}" "s3://${TEST_BUCKET_1}/${BASENAME}/${SYMLINK_TARGET_FILE}" --no-progress 
-    if ! cmp "${TEMP_DIR}/${TEST_FILE_NAME}" "${TEST_FILE_NAME}"; then
-      echo "round ${i} failed" 
+    aws_cli s3 cp "${TEMP_DIR}/${TEST_FILE_NAME}" "s3://${TEST_BUCKET_1}/${BASENAME}/${TEST_FILE_NAME}" --no-progress 
+    if ! diff "${TEMP_DIR}/${TEST_FILE_NAME}" "${TEST_FILE_NAME}"; then
+      echo "append file: round ${i} failed" 
       return 1
     fi
   done
@@ -3269,15 +3273,84 @@ function test_read_in_1s {
   for i in {1..10}; do
     dd if=/dev/urandom of=${TEMP_DIR}/${TEST_FILE_NAME} bs=1 count=$((11-$i))
     
-    aws_cli s3 cp "${TEMP_DIR}/${TEST_FILE_NAME}" "s3://${TEST_BUCKET_1}/${BASENAME}/${SYMLINK_TARGET_FILE}" --no-progress 
-    if ! cmp "${TEMP_DIR}/${TEST_FILE_NAME}" "${TEST_FILE_NAME}"; then
-      echo "round ${i} failed" 
+    aws_cli s3 cp "${TEMP_DIR}/${TEST_FILE_NAME}" "s3://${TEST_BUCKET_1}/${BASENAME}/${TEST_FILE_NAME}" --no-progress 
+    if ! diff "${TEMP_DIR}/${TEST_FILE_NAME}" "${TEST_FILE_NAME}"; then
+      echo "upload random file: round ${i} failed" 
       return 1
     fi
   done
 
   rm -f "${TEMP_DIR}/${TEST_FILE_NAME}"
   rm -f "${TEST_FILE_NAME}"
+}
+
+function test_read_flush_while_write {
+    describe "Testing read_flush_while_write"
+
+    local TEST_FILE="test_read_flush_while_write.txt"
+    local RESULT
+    RESULT=$(python3 - "${TEST_FILE}" <<'EOF'
+import os
+import sys
+import time
+
+def test_concurrent_read_write(file_path):
+    test_data = "Hello, OSSFS! This is a test data. " * 1000
+
+    print("\n[1] open in write mode", flush=True)
+    fd_write = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+
+    print("[2] write data", flush=True)
+    os.write(fd_write, test_data.encode('utf-8'))
+
+    print("[3] open in read mode for the 1st time", flush=True)
+    fd_read = os.open(file_path, os.O_RDONLY)
+    os.read(fd_read, 4096)
+    print("[5] close read handle to trigger flush", flush=True)
+    os.close(fd_read)
+
+    print("[6] open in read mode for the 2nd time", flush=True)
+    reproduced = False
+    try:
+        fd_read2 = os.open(file_path, os.O_RDONLY)
+        print("    \u2713 second read open succeeded", flush=True)
+        os.close(fd_read2)
+    except OSError as e:
+        if e.errno == 2:  # ENOENT
+            print("    \u274c second read open failed: ENOENT", flush=True)
+            reproduced = True
+        else:
+            raise
+
+    print("[7] close write handle", flush=True)
+    os.close(fd_write)
+
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    return reproduced
+
+file_path = sys.argv[1]
+reproduced = False
+for i in range(3):
+    print(f"\n--- {i+1}th try ---", flush=True)
+    if test_concurrent_read_write(file_path):
+        reproduced = True
+        break
+    time.sleep(0.5)
+
+if reproduced:
+    print("REPRODUCED")
+EOF
+)
+
+    if [ -f "${TEST_FILE}" ]; then
+        rm -f "${TEST_FILE}"
+    fi
+
+    echo "${RESULT}"
+    if echo "${RESULT}" | grep -q "REPRODUCED"; then
+        return 1
+    fi
 }
 
 function add_all_tests {
@@ -3297,7 +3370,11 @@ function add_all_tests {
     if ! ps u -p "${OSSFS_PID}" | grep -q ensure_diskfree && ! uname | grep -q Darwin; then
         add_tests test_clean_up_cache
     fi
-    add_tests test_read_in_1s
+
+    if ! ps u -p "${OSSFS_PID}" | grep -q skip_clean_statcache_on_ro_flush; then
+        add_tests test_read_in_1s
+    fi
+    
     add_tests test_create_empty_file
     add_tests test_append_file
     add_tests test_truncate_file
@@ -3409,8 +3486,8 @@ function add_all_tests {
         fi
         add_tests test_update_directory_time_subdir
     fi
-    
-    if ps u -p "${OSSFS_PID}" | grep direct_read | grep -v -q direct_read_local_file_cache_size_mb; then
+
+    if ps u -p "${OSSFS_PID}" | grep direct_read | grep -v direct_read_local_file_cache_size_mb | grep -v -q skip_clean_statcache_on_ro_flush; then
         add_tests test_direct_read
         add_tests test_direct_read_with_out_of_order
         add_tests test_direct_read_with_write
@@ -3458,6 +3535,10 @@ function add_all_tests {
     add_tests test_add_head
     add_tests test_statvfs
     add_tests test_object_ending_with_slash
+    
+    if ps u -p "${OSSFS_PID}" | grep -q "skip_clean_statcache_on_ro_flush"; then
+        add_tests test_read_flush_while_write
+    fi
 }
 
 init_suite

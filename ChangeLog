@@ -1,5 +1,12 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.10 (31/03/2026)
+ - Release ossfs of Alibaba Cloud Linux 3(aarch64).
+ - Switch the main branch to main-v1.
+ - Fix the url error when CheckBucket.
+ - Optimize the error number when trying to HeadObj an access-denied object.
+ - Add an option skip_clean_statcache_on_ro_flush to skip cleanning the stat cache after flushing for read-only fd.
+
 ## v1.91.9 (24/12/2025)
  - Release ossfs of Alibaba Cloud Linux 4.
  - Optimize max-keys to 2 when checking bucket.

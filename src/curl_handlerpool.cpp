@@ -100,7 +100,7 @@ void CurlHandlerPool::ReturnHandler(CURL* hCurl, bool restore_pool)
     if(restore_pool){
         AutoLock lock(&mLock);
 
-        S3FS_PRN_DBG("Return handler to pool");
+        // S3FS_PRN_DBG("Return handler to pool");
         mPool.push_back(hCurl);
 
         while(mMaxHandlers < static_cast<int>(mPool.size())){

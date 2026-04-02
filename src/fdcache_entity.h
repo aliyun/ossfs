@@ -128,8 +128,10 @@ class FdEntity
 
         
         off_t BytesModified();
-        int RowFlush(int fd, const char* tpath, bool force_sync = false);
-        int Flush(int fd, bool force_sync = false) { return RowFlush(fd, NULL, force_sync); }
+        int RowFlush(int fd, const char* tpath, bool force_sync = false, bool *is_ro_fd = nullptr);
+        int Flush(int fd, bool force_sync = false, bool *is_ro_fd = nullptr) { 
+            return RowFlush(fd, NULL, force_sync, is_ro_fd); 
+        }
 
         ssize_t Read(int fd, char* bytes, off_t start, size_t size, bool force_load = false);
         ssize_t Write(int fd, const char* bytes, off_t start, size_t size);
