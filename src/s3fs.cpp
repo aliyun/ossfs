@@ -103,6 +103,7 @@ static bool is_refresh_fakemeta   = false;
 static off_t readdir_check_size   = 0;
 static bool is_new_symlink_format = false;
 static bool is_specified_region   = false;
+static bool skip_clean_statcache_on_ro_flush = false;
 
 //-------------------------------------------------------------------
 // Global functions : prototype
@@ -397,6 +398,9 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
 
     // if not found target path object, do over checking
    if(0 != result){
+        if (result == -EPERM) {
+            return result;
+        }
         if(overcheck){
             // when support_compat_dir is disabled, strpath maybe have "_$folder$".
             if('/' != *strpath.rbegin() && std::string::npos == strpath.find("_$folder$", 0)){
@@ -509,12 +513,10 @@ static int check_object_access(const char* path, int mask, struct stat* pstbuf)
     struct stat* pst = (pstbuf ? pstbuf : &st);
     struct fuse_context* pcxt;
 
-    S3FS_PRN_DBG("[path=%s]", path);
-
     if(NULL == (pcxt = fuse_get_context())){
         return -EIO;
     }
-    S3FS_PRN_DBG("[pid=%u,uid=%u,gid=%u]", (unsigned int)(pcxt->pid), (unsigned int)(pcxt->uid), (unsigned int)(pcxt->gid));
+    S3FS_PRN_DBG("[path=%s][pid=%u,uid=%u,gid=%u]", path, (unsigned int)(pcxt->pid), (unsigned int)(pcxt->uid), (unsigned int)(pcxt->gid));
 
     if(0 != (result = get_object_attribute(path, pst))){
         // If there is not the target file(object), result is -ENOENT.
@@ -2526,11 +2528,16 @@ static int s3fs_flush(const char* _path, struct fuse_file_info* fi)
 
     AutoFdEntity autoent;
     FdEntity*    ent;
+    bool is_readonly_fd = false;
     if(NULL != (ent = autoent.GetExistFdEntity(path, static_cast<int>(fi->fh)))){
         ent->UpdateMtime(true);         // clear the flag not to update mtime.
         ent->UpdateCtime();
-        result = ent->Flush(static_cast<int>(fi->fh), false);
-        StatCache::getStatCacheData()->DelStat(path);
+        result = ent->Flush(static_cast<int>(fi->fh), false, &is_readonly_fd);
+        if (skip_clean_statcache_on_ro_flush && is_readonly_fd) {
+            // Do nothing.
+        } else {
+            StatCache::getStatCacheData()->DelStat(path);
+        }
     }
     S3FS_MALLOCTRIM(0);
 
@@ -4601,6 +4608,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         }
         if(0 == strcmp(arg, "readdir_optimize")){
             is_readdir_optimize = true;
+            return 0;
+        }
+        if(0 == strcmp(arg, "skip_clean_statcache_on_ro_flush")){
+            skip_clean_statcache_on_ro_flush = true;
             return 0;
         }
         if(is_prefix(arg, "readdir_check_size=")){

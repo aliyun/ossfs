@@ -1390,7 +1390,7 @@ off_t FdEntity::BytesModified()
 // Files smaller than the minimum part size will not be multipart uploaded,
 // but will be uploaded as single part(normally).
 //
-int FdEntity::RowFlush(int fd, const char* tpath, bool force_sync)
+int FdEntity::RowFlush(int fd, const char* tpath, bool force_sync, bool *is_ro_fd)
 {
     S3FS_PRN_INFO3("[tpath=%s][path=%s][pseudo_fd=%d][physical_fd=%d]", SAFESTRPTR(tpath), path.c_str(), fd, physical_fd);
 
@@ -1407,6 +1407,9 @@ int FdEntity::RowFlush(int fd, const char* tpath, bool force_sync)
     }
     if(!miter->second->Writable() && !(miter->second->GetFlags() & O_CREAT)){
         // If the entity is opened read-only, it will end normally without updating.
+        if (is_ro_fd) {
+            *is_ro_fd = true;
+        }
         return 0;
     }
     PseudoFdInfo* pseudo_obj = miter->second;
