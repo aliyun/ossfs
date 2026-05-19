@@ -3628,15 +3628,6 @@ static void* s3fs_init(struct fuse_conn_info* conn)
         S3FS_PRN_DBG("Could not initialize cache directory.");
     }
 
-    // Check Bucket
-    {
-        int result;
-        if(EXIT_SUCCESS != (result = s3fs_check_service())){
-            s3fs_exit_fuseloop(result);
-            return NULL;
-        }
-    }
-
     // Investigate system capabilities
     #ifndef __APPLE__
     if((unsigned int)conn->capable & FUSE_CAP_ATOMIC_O_TRUNC){
