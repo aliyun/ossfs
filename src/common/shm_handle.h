@@ -32,11 +32,11 @@ namespace common {
 class ShmHandle {
  public:
   // RAII interface.
-  static int open(const std::string &name, size_t size, int flags,
-                  std::unique_ptr<ShmHandle> &ptr);
-
+  static int open(const std::string &name, int flags,
+                  std::unique_ptr<ShmHandle> &shm_handle);
+  static int create(const std::string &name, size_t trunc_size, int flags,
+                    std::unique_ptr<ShmHandle> &shm_handle);
   static int unlink(const std::string &name);
-
   static std::string escape_shm_name(const std::string &name);
 
   ShmHandle(const ShmHandle &) = delete;
@@ -67,6 +67,9 @@ class ShmHandle {
 
  private:
   static constexpr mode_t kDefaultShmMode = 0644;
+  static int open_internal(const std::string &name, size_t trunc_size,
+                           int flags, std::unique_ptr<ShmHandle> &shm_handle);
+
   ShmHandle(const std::string &name, size_t size, void *ptr)
       : name_(name), size_(size), ptr_(ptr) {}
 

@@ -578,3 +578,288 @@ TEST(LRUMapTest, DISABLED_concurrent_performance) {
   // clang-format on
   ASSERT_SIZE_EQ(lru_map_ptr->size(), 0);
 }
+
+// ============================================================
+// String key (map key = string_view) safety tests
+// ============================================================
+
+// 1. Verify temporary string insert: string_view points to its copy in the
+// list, not the temp string.
+TEST(LRUMapStringKeyTest, string_key_temporary_insert) {
+  LruMap<std::string, int> map;
+
+  for (int i = 0; i < 100; i++) {
+    // The key is a temporary string, which will be destroyed after the function
+    // returns.
+    map.insert("tmp_key_" + std::to_string(i), i);
+  }
+  ASSERT_SIZE_EQ(100, map.size());
+
+  // Verify that the map still works with newly constructed strings.
+  for (int i = 0; i < 100; i++) {
+    ASSERT_TRUE(map.probe("tmp_key_" + std::to_string(i)));
+  }
+
+  int v;
+  for (int i = 0; i < 100; i++) {
+    ASSERT_TRUE(map.find_and_erase("tmp_key_" + std::to_string(i), &v));
+    ASSERT_EQ(v, i);
+  }
+  ASSERT_SIZE_EQ(0, map.size());
+}
+
+// Verify overwrite same key: old list node is deleted, old string_view in map
+// is invalid.
+TEST(LRUMapStringKeyTest, string_key_overwrite_same_key) {
+  LruMap<std::string, int> map;
+
+  for (int round = 0; round < 10; round++) {
+    for (int i = 0; i < 50; i++) {
+      map.insert("ow_" + std::to_string(i), round * 100 + i);
+    }
+    ASSERT_SIZE_EQ(50, map.size());
+
+    // After overwrite, all keys are still accessible.
+    for (int i = 0; i < 50; i++) {
+      ASSERT_TRUE(map.probe("ow_" + std::to_string(i)));
+    }
+  }
+
+  // The final values are the last round of writes.
+  for (int i = 0; i < 50; i++) {
+    int v;
+    ASSERT_TRUE(map.find_and_erase("ow_" + std::to_string(i), &v));
+    ASSERT_EQ(v, 9 * 100 + i);
+  }
+  ASSERT_SIZE_EQ(0, map.size());
+}
+
+// Capacity Eviction: verify list eviction and string_view validity.
+TEST(LRUMapStringKeyTest, string_key_capacity_eviction) {
+  const size_t cap = 50;
+  LruMap<std::string, int> map(cap);
+
+  for (int i = 0; i < 100; i++) {
+    map.insert("evict_" + std::to_string(i), i);
+  }
+  ASSERT_SIZE_EQ(cap, map.size());
+
+  for (int i = 0; i < 50; i++) {
+    ASSERT_FALSE(map.probe("evict_" + std::to_string(i)));
+  }
+
+  for (int i = 50; i < 100; i++) {
+    ASSERT_TRUE(map.probe("evict_" + std::to_string(i)));
+  }
+
+  for (int i = 100; i < 120; i++) {
+    map.insert("evict_" + std::to_string(i), i);
+  }
+  ASSERT_SIZE_EQ(cap, map.size());
+
+  for (int i = 50; i < 70; i++) {
+    ASSERT_FALSE(map.probe("evict_" + std::to_string(i)));
+  }
+  for (int i = 70; i < 120; i++) {
+    ASSERT_TRUE(map.probe("evict_" + std::to_string(i)));
+  }
+}
+
+// probe triggered splice, the string_view still points to the same node after
+// the node is moved.
+TEST(LRUMapStringKeyTest, string_key_probe_splice_safety) {
+  const size_t cap = 10;
+  LruMap<std::string, int> map(cap);
+
+  for (int i = 0; i < 10; i++) {
+    map.insert("sp_" + std::to_string(i), i);
+  }
+
+  // Keep splicing: probe every element in reverse order.
+  for (int round = 0; round < 5; round++) {
+    for (int i = 9; i >= 0; i--) {
+      ASSERT_TRUE(map.probe("sp_" + std::to_string(i)));
+    }
+  }
+
+  // After splice and insert triggering eviction, verify the remained
+  // string_view's validity.
+  map.insert("sp_new", 99);
+  ASSERT_SIZE_EQ(cap, map.size());
+  ASSERT_FALSE(map.probe("sp_9"));
+  ASSERT_TRUE(map.probe("sp_new"));
+
+  for (int i = 0; i < 9; i++) {
+    ASSERT_TRUE(map.probe("sp_" + std::to_string(i)));
+  }
+}
+
+// Verify that validator accepts the real string instead of dangling
+// string_view.
+TEST(LRUMapStringKeyTest, string_key_validator_accesses_key_content) {
+  auto validator = [](const std::string &key, const int &value) -> bool {
+    return key.find("valid") != std::string::npos;
+  };
+
+  LruMap<std::string, int> map(validator);
+
+  map.insert("valid_1", 1);
+  map.insert("valid_2", 2);
+  map.insert("inval_3", 3);
+  map.insert("valid_4", 4);
+  ASSERT_SIZE_EQ(4, map.size());
+
+  ASSERT_TRUE(map.probe("valid_1"));
+  ASSERT_TRUE(map.probe("valid_2"));
+  ASSERT_FALSE(map.probe("inval_3"));
+  ASSERT_TRUE(map.probe("valid_4"));
+  ASSERT_SIZE_EQ(3, map.size());
+
+  int v;
+  ASSERT_TRUE(map.find_and_erase("valid_1", &v));
+  ASSERT_EQ(v, 1);
+
+  map.insert("inval_5", 5);
+  ASSERT_FALSE(map.find_and_erase("inval_5", &v));
+  ASSERT_SIZE_EQ(2, map.size());
+}
+
+TEST(LRUMapStringKeyTest, string_key_prune) {
+  LruMap<std::string, int> map;
+
+  for (int i = 0; i < 100; i++) {
+    map.insert("pr_" + std::to_string(i), i);
+  }
+
+  // prune by size
+  map.prune(50);
+  ASSERT_SIZE_EQ(50, map.size());
+  for (int i = 0; i < 50; i++) {
+    ASSERT_FALSE(map.probe("pr_" + std::to_string(i)));
+  }
+  for (int i = 50; i < 100; i++) {
+    ASSERT_TRUE(map.probe("pr_" + std::to_string(i)));
+  }
+
+  // prune with callback
+  auto evict_even = [](const std::string &key, const int &value) -> bool {
+    return value % 2 == 0;
+  };
+  map.prune(evict_even);
+  ASSERT_SIZE_EQ(25, map.size());
+
+  for (int i = 50; i < 100; i++) {
+    if (i % 2 == 0)
+      ASSERT_FALSE(map.probe("pr_" + std::to_string(i)));
+    else
+      ASSERT_TRUE(map.probe("pr_" + std::to_string(i)));
+  }
+
+  map.prune(0);
+  ASSERT_SIZE_EQ(0, map.size());
+}
+
+// Mix insert/erase/probe/find_and_erase
+TEST(LRUMapStringKeyTest, string_key_interleaved_ops) {
+  const size_t cap = 200;
+  LruMap<std::string, int> map(cap);
+
+  for (int i = 0; i < 300; i++) {
+    map.insert("il_" + std::to_string(i), i);
+  }
+  ASSERT_SIZE_EQ(cap, map.size());
+
+  for (int i = 200; i < 250; i++) {
+    ASSERT_TRUE(map.probe("il_" + std::to_string(i)));
+  }
+
+  for (int i = 250; i < 270; i++) {
+    map.erase("il_" + std::to_string(i));
+  }
+  ASSERT_SIZE_EQ(cap - 20, map.size());
+
+  for (int i = 250; i < 270; i++) {
+    map.insert("il_" + std::to_string(i), i + 1000);
+  }
+  ASSERT_SIZE_EQ(cap, map.size());
+
+  for (int i = 250; i < 270; i++) {
+    int v;
+    ASSERT_TRUE(map.find_and_erase("il_" + std::to_string(i), &v));
+    ASSERT_EQ(v, i + 1000);
+  }
+  for (int i = 200; i < 250; i++) {
+    ASSERT_TRUE(map.probe("il_" + std::to_string(i)));
+  }
+
+  map.prune(0);
+  ASSERT_SIZE_EQ(0, map.size());
+}
+
+TEST(LRUMapStringKeyTest, string_key_with_unique_ptr_value) {
+  int destruct_sum = 0;
+  struct Tracked {
+    Tracked(int v, int *sum) : val(v), sum_(sum) {}
+    ~Tracked() {
+      if (sum_) *sum_ += val;
+    }
+    Tracked(Tracked &&o) : val(o.val), sum_(o.sum_) {
+      o.sum_ = nullptr;
+    }
+    Tracked &operator=(Tracked &&o) {
+      val = o.val;
+      std::swap(sum_, o.sum_);
+      return *this;
+    }
+    int val;
+    int *sum_;
+  };
+
+  LruMap<std::string, std::unique_ptr<Tracked>> map;
+
+  for (int i = 0; i < 50; i++) {
+    map.insert("tr_" + std::to_string(i),
+               std::make_unique<Tracked>(i, &destruct_sum));
+  }
+  ASSERT_SIZE_EQ(50, map.size());
+
+  destruct_sum = 0;
+  for (int i = 0; i < 10; i++) {
+    map.insert("tr_" + std::to_string(i),
+               std::make_unique<Tracked>(i + 100, &destruct_sum));
+  }
+  ASSERT_EQ(destruct_sum, (9 * 10) / 2);  // 0+1+...+9 = 45
+
+  // erase 10-19
+  destruct_sum = 0;
+  for (int i = 10; i < 20; i++) {
+    map.erase("tr_" + std::to_string(i));
+  }
+  ASSERT_EQ(destruct_sum, (10 + 19) * 10 / 2);  // 10+11+...+19 = 145
+
+  // find_and_erase 20-29
+  destruct_sum = 0;
+  for (int i = 20; i < 30; i++) {
+    std::unique_ptr<Tracked> v;
+    ASSERT_TRUE(map.find_and_erase("tr_" + std::to_string(i), &v));
+    ASSERT_EQ(v->val, i);
+  }
+  ASSERT_EQ(destruct_sum, (20 + 29) * 10 / 2);  // 245
+
+  ASSERT_SIZE_EQ(30, map.size());
+  for (int i = 0; i < 10; i++) {
+    ASSERT_TRUE(map.probe("tr_" + std::to_string(i)));
+  }
+  for (int i = 30; i < 50; i++) {
+    ASSERT_TRUE(map.probe("tr_" + std::to_string(i)));
+  }
+
+  destruct_sum = 0;
+  map.prune(0);
+
+  int expected = 0;
+  for (int i = 0; i < 10; i++) expected += i + 100;
+  for (int i = 30; i < 50; i++) expected += i;
+  ASSERT_EQ(destruct_sum, expected);
+  ASSERT_SIZE_EQ(0, map.size());
+}

@@ -29,35 +29,36 @@
 #include "common/lru_map.h"
 #include "credentials/creds_provider.h"
 #include "dir.h"
+#include "fs/id_manager.h"
 #include "inode.h"
 #include "mem_pool.h"
 #include "negative_cache.h"
 #include "staged_inode_cache.h"
 #include "test/class_declarations.h"
 
-// Call photon OSS SDK's methods in background threads.
-#define DO_SYNC_BACKGROUND_OSS_REQUEST(__fs, __func, ...)                \
-  ({                                                                     \
-    auto __bg_env_ctx =                                                  \
-        __fs->bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next(); \
-    auto __r = __bg_env_ctx.executor->perform([&]() {                    \
-      OssAdapter *__c = __bg_env_ctx.oss_client;                         \
-      return __c->__func(__VA_ARGS__);                                   \
-    });                                                                  \
-    __r;                                                                 \
+// Call obj_store's methods in background threads.
+#define PERFORM_BACKGROUND_OBJ_REQUEST(__fs, __func, ...)              \
+  ({                                                                   \
+    auto __bg_env_ctx =                                                \
+        __fs->bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next(); \
+    auto __r = __bg_env_ctx.executor->perform([&]() {                  \
+      IObjStore *__c = __bg_env_ctx.obj_store;                         \
+      return __c->__func(__VA_ARGS__);                                 \
+    });                                                                \
+    __r;                                                               \
   })
 
-// Call common functions which use oss_client pointer as the first argument
+// Call common functions which use obj_store pointer as the first argument
 // in background threads.
-#define GET_BACKGROUND_OSS_CLIENT_AND_DO_SYNC_FUNC(__fs, __func, ...)    \
-  ({                                                                     \
-    auto __bg_env_ctx =                                                  \
-        __fs->bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next(); \
-    auto __r = __bg_env_ctx.executor->perform([&]() {                    \
-      OssAdapter *__c = __bg_env_ctx.oss_client;                         \
-      return __func(__c, __VA_ARGS__);                                   \
-    });                                                                  \
-    __r;                                                                 \
+#define GET_BACKGROUND_OBJ_STORE_AND_PERFORM(__fs, __func, ...)        \
+  ({                                                                   \
+    auto __bg_env_ctx =                                                \
+        __fs->bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next(); \
+    auto __r = __bg_env_ctx.executor->perform([&]() {                  \
+      IObjStore *__c = __bg_env_ctx.obj_store;                         \
+      return __func(__c, __VA_ARGS__);                                 \
+    });                                                                \
+    __r;                                                               \
   })
 
 #define AUTO_USLEEP(us)                                           \
@@ -74,16 +75,15 @@ namespace OssFileSystem {
 enum class CacheType : uint8_t {
   // kFhCache mode binds memory cache data to file handles.
   kFhCache = 0,
+  kDiskCache = 1,
 };
 
 struct OssFsOptions {
   static int apply_mem_limit(OssFsOptions *fs_options, uint64_t total_mem_limit,
                              double rw_ratio);
 
-  std::string mountpath;
-
   CacheType cache_type = CacheType::kFhCache;
-  bool bind_cache_to_inode = false;
+  bool share_fd_read_buffer = false;
   uint64_t cache_refill_unit = 1024 * 1024;
   uint64_t cache_block_size = 1048576;
   uint64_t memory_data_cache_size = 0;
@@ -133,6 +133,8 @@ struct OssFsOptions {
 
   std::string ram_role;
   std::string credential_process;
+  uint64_t credential_refresh_interval =
+      0;  // 0 means use default expiration-based strategy.
 
   bool enable_admin_server = true;
   bool enable_symlink = false;
@@ -143,7 +145,8 @@ struct OssFsOptions {
 struct LockQueueElement;
 class OssFs : public IFileSystemFuseLL {
  public:
-  OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env);
+  OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env,
+        std::unique_ptr<IIdManager> id_manager = create_heap_id_manager());
   ~OssFs();
 
   int init();
@@ -192,7 +195,7 @@ class OssFs : public IFileSystemFuseLL {
   ssize_t readlink(uint64_t nodeid, char *buf, size_t size) override;
 
   int get_one_list_results(std::string_view full_path,
-                           std::vector<OssDirent> &results,
+                           std::vector<ObjDirent> &results,
                            std::string &marker);
 
   CacheType get_cache_type() {
@@ -201,6 +204,14 @@ class OssFs : public IFileSystemFuseLL {
 
   bool enable_prefetching() {
     return options_.prefetch_concurrency > 0;
+  }
+
+  std::shared_ptr<FixedBlockMemoryPool> get_download_buffers() {
+    return download_buffers_;
+  }
+
+  const OssFsOptions &get_options() const {
+    return options_;
   }
 
  private:
@@ -270,7 +281,7 @@ class OssFs : public IFileSystemFuseLL {
                     const struct stat *stbuf, off_t off),
       void *filler_ctx);
   int get_dirty_children(DirInode *parent_inode, std::string_view full_path,
-                         std::map<estring, OssDirent> &dirty_children);
+                         std::map<estring, ObjDirent> &dirty_children);
   int refresh_dir_plus(DirInode *parent_inode, OssDirHandle *odh);
   int refresh_dir(DirInode *parent_inode, OssDirHandle *odh);
   int seek_dir_plus(DirInode *parent_inode, OssDirHandle *odh,
@@ -291,6 +302,7 @@ class OssFs : public IFileSystemFuseLL {
   void try_update_inode_attr_from_list(Inode *inode, struct stat *stbuf,
                                        std::string_view remote_etag);
 
+  std::shared_ptr<ICache> create_inode_cache();
   void evict_inode_cache(FileInode *inode);
 
   int try_invalidate_inode(uint64_t nodeid, uint64_t nlookup, bool recursive);
@@ -386,8 +398,8 @@ class OssFs : public IFileSystemFuseLL {
   void start_creds_refresher(std::promise<int> &result_promise);
   uint64_t refresh_creds();
   std::pair<int, uint64_t> do_refresh_creds();
-  void update_creds(const OssCredentials &creds);
-  int validate_creds(const OssCredentials &creds);
+  void update_creds(const ObjCredentials &creds);
+  int validate_creds(const ObjCredentials &creds);
 
   static inline constexpr uint64_t kMaxFsSize =
       std::numeric_limits<uint64_t>::max();  // 16 EB;
@@ -402,6 +414,8 @@ class OssFs : public IFileSystemFuseLL {
 
   StagedInodeCache *staged_inodes_cache_ = nullptr;
   NegativeCache *negative_cache_ = nullptr;
+
+  std::unique_ptr<IIdManager> id_manager_;
 
   // key: nodeid. Stores all inodes (active and stale)
   std::map<uint64_t, Inode *> global_inodes_map_;
@@ -426,7 +440,7 @@ class OssFs : public IFileSystemFuseLL {
   std::unique_ptr<photon::semaphore> rename_sem_;
 
   std::unique_ptr<FixedBlockMemoryPool> upload_buffers_;
-  std::unique_ptr<FixedBlockMemoryPool> download_buffers_;
+  std::shared_ptr<FixedBlockMemoryPool> download_buffers_;
 
   // tracking all the dirty inodes
   std::unordered_set<uint64_t> dirty_nodeids_;
@@ -447,6 +461,9 @@ class OssFs : public IFileSystemFuseLL {
   std::atomic<uint64_t> active_file_handles_ = ATOMIC_VAR_INIT(0);
 
   friend class OssWriter;
+  friend class OssSeqWriter;
+  friend class OssNormalWriter;
+  friend class OssAppendableWriter;
   friend class OssCachedReader;
   friend class OssDirectReader;
   friend class OssFileHandle;

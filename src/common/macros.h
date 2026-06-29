@@ -34,14 +34,14 @@ constexpr const char *__basename(const char *path) {
 
 #define __FILENAME__ __basename(__FILE__)
 
-#define RELEASE_ASSERT(expr)         \
-  (static_cast<bool>(unlikely(expr)) \
-       ? void(0)                     \
+#define RELEASE_ASSERT(expr)       \
+  (static_cast<bool>(likely(expr)) \
+       ? void(0)                   \
        : release_assert_fail(__FILENAME__, __LINE__, #expr))
 
 #define RELEASE_ASSERT_WITH_MSG(expr, msg...)             \
   do {                                                    \
-    if (!unlikely(expr)) {                                \
+    if (!likely(expr)) {                                  \
       LOG_ERROR(msg);                                     \
       release_assert_fail(__FILENAME__, __LINE__, #expr); \
     }                                                     \

@@ -121,7 +121,7 @@ RamRoleCredentialsProvider::RamRoleCredentialsProvider(
   }
 }
 
-int RamRoleCredentialsProvider::get_credentials(OssCredentials &out_creds,
+int RamRoleCredentialsProvider::get_credentials(ObjCredentials &out_creds,
                                                 time_t &expiration) {
   std::string response;
   int r = get_ecs_meta(url_, response);

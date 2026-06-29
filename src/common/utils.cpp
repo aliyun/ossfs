@@ -16,9 +16,12 @@
 
 #include "common/utils.h"
 
+#include <city.h>
 #include <fcntl.h>
+#include <photon/net/utils.h>
 #include <signal.h>
 #include <sys/dir.h>
+#include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -405,8 +408,16 @@ bool is_valid_fd(int fd) {
   if (fd < 0) {
     return false;
   }
+  if (fcntl(fd, F_GETFD) == -1) {
+    return false;
+  }
 
-  return fcntl(fd, F_GETFD) != -1;
+  struct pollfd fdevents = {.fd = fd, .events = POLLIN};
+  int ret = poll(&fdevents, 1, 1000);
+  if (ret > 0 && fdevents.revents & POLLERR) {
+    return false;
+  }
+  return true;
 }
 
 std::vector<std::string_view> split_string(std::string_view str,
@@ -430,4 +441,21 @@ std::vector<std::string_view> split_string(std::string_view str,
   }
 
   return parts;
+}
+
+std::string cityhash128_base64url(std::string_view data) {
+  std::string ret;
+  unsigned char hash[16];
+  auto result = CityHash128(data.data(), data.size());
+  std::memcpy(hash, &result.first, 8);
+  std::memcpy(hash + 8, &result.second, 8);
+  photon::net::Base64Encode({(char *)hash, 16}, ret);
+  for (auto &c : ret) {
+    if (c == '+')
+      c = '-';
+    else if (c == '/')
+      c = '_';
+  }
+  while (!ret.empty() && ret.back() == '=') ret.pop_back();
+  return ret;
 }

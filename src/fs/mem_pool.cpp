@@ -110,6 +110,14 @@ size_t FixedBlockMemoryPool::used_blocks() {
   return used_;
 }
 
+double FixedBlockMemoryPool::get_usage_ratio() {
+  if (pool_capacity_ == 0 ||
+      pool_capacity_ == std::numeric_limits<size_t>::max()) {
+    return 0.0;
+  }
+  return static_cast<double>(used_blocks()) / pool_capacity_;
+}
+
 char *FixedBlockMemoryPool::expand_one() {
   char *ptr = nullptr;
   int r = posix_memalign(reinterpret_cast<void **>(&ptr), 4096, block_size_);

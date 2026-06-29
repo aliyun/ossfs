@@ -33,7 +33,7 @@ class RamRoleCredentialsProvider : public CredentialsProvider {
   RamRoleCredentialsProvider(std::string_view ram_role);
 
  private:
-  int get_credentials(OssCredentials &creds, time_t &expiration) override;
+  int get_credentials(ObjCredentials &creds, time_t &expiration) override;
 
   std::string url_;
 

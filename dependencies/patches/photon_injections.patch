@@ -2,7 +2,7 @@ diff --git a/ecosystem/oss.cpp b/ecosystem/oss_patched.cpp
 similarity index 98%
 rename from ecosystem/oss.cpp
 rename to ecosystem/oss_patched.cpp
-index 1e3a523..42950c3 100644
+index b9accd7..8a08d20 100644
 --- a/ecosystem/oss.cpp
 +++ b/ecosystem/oss_patched.cpp
 @@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
@@ -27,11 +27,12 @@ index 1e3a523..42950c3 100644
  
  // unused constants will trigger compile error in photon,
  // unless they are defined in a header file
-@@ -203,6 +206,13 @@ static int error_http_status_to_errno(int status_code) {
+@@ -203,6 +206,14 @@ static int error_http_status_to_errno(int status_code) {
  static int do_http_call(HTTP_STACK_OP& op, const ClientOptions& options,
                          std::string_view object) {
    int ret = -1;
 +  FAULT_INJECTION(FI_OssError_Call_Timeout, [&]() {
++    photon::thread_usleep(200'000);
 +    ret = -ETIMEDOUT;
 +  });
 +  if (ret != -1) {
@@ -41,7 +42,7 @@ index 1e3a523..42950c3 100644
    auto retry_times = options.retry_times;
    auto retry_interval = options.retry_base_interval_us;
  
-@@ -214,6 +224,11 @@ __retry:
+@@ -214,6 +225,11 @@ __retry:
    int __saved_errno = errno;
    {
      int r = 0;
@@ -53,7 +54,7 @@ index 1e3a523..42950c3 100644
      auto start_time = std::chrono::steady_clock::now();
      LOG_DEBUG("Sending oss request ` ` Range[`]", verbstr[op.req.verb()],
                op.req.target(), op.req.headers["Range"]);
-@@ -228,6 +243,11 @@ __retry:
+@@ -228,6 +244,11 @@ __retry:
          "Got oss response ` ` Range[`], code=` content_length=` latency_us=`",
          verbstr[op.req.verb()], op.req.target(), op.req.headers["Range"],
          op.resp.status_code(), op.resp.headers.content_length(), latency);
@@ -65,7 +66,7 @@ index 1e3a523..42950c3 100644
      if (r < 0) {
        if (retry_times-- > 0) {
          photon::thread_usleep(retry_interval);
-@@ -237,6 +257,11 @@ __retry:
+@@ -237,6 +258,11 @@ __retry:
          goto __retry;
        }
      }
@@ -77,7 +78,7 @@ index 1e3a523..42950c3 100644
    }
  
    if (op.status_code != 200 && op.status_code != 206 && op.status_code != 204) {
-@@ -252,6 +277,9 @@ __retry:
+@@ -252,6 +278,9 @@ __retry:
            error_res["EC"].to_string_view());
        // clang-format on
  
@@ -87,7 +88,21 @@ index 1e3a523..42950c3 100644
        if (code_view.find("QpsLimitExceeded") != std::string::npos) {
          if (qps_limit_retry_interval > 0) {
            photon::thread_usleep(qps_limit_retry_interval);
-@@ -715,6 +743,8 @@ retry:
+@@ -507,9 +536,12 @@ int OssClient::walk_list_results(const SimpleDOM::Node& list_bucket_result,
+     auto mtime = NodeStrValue(child["LastModified"]);
+     auto etag = NodeStrValue(child["ETag"]);
+     auto type = NodeStrValue(child["Type"]);
++    FAULT_INJECTION(FI_Oss_Missing_Object_Type, [&]() {
++      type = NodeStrValue(SimpleDOM::Node{});
++    });
+ 
+     if (!key.has_value() || !size.has_value() || !mtime.has_value() ||
+-        !etag.has_value() || !type.has_value())
++        !etag.has_value())
+       LOG_ERROR_RETURN(EINVAL, -1,
+                        "unexpected response: missing required fields");
+ 
+@@ -717,6 +749,8 @@ retry:
      if (key) deleted_size++;
    }
  
@@ -96,7 +111,7 @@ index 1e3a523..42950c3 100644
    if (deleted_size != to_delete_size) {
      // Partial deletion happens when OSS server side is with pressure.
      // If this is the case , we just have another try. It's OK if some keys
-@@ -894,6 +924,7 @@ retry:
+@@ -896,6 +930,7 @@ retry:
    uint64_t content_length = op.resp.headers.content_length();
    auto ret = op.resp.readv(iov, iovcnt);
  
@@ -108,7 +123,7 @@ diff --git a/ecosystem/oss.h b/ecosystem/oss_patched.h
 similarity index 99%
 rename from ecosystem/oss.h
 rename to ecosystem/oss_patched.h
-index 2952cfd..eb246e0 100644
+index 2952cfd..e8816aa 100644
 --- a/ecosystem/oss.h
 +++ b/ecosystem/oss_patched.h
 @@ -28,7 +28,7 @@ limitations under the License.
@@ -120,3 +135,10 @@ index 2952cfd..eb246e0 100644
  
  using StringKV = ordered_string_kv;
  
+@@ -323,5 +323,5 @@ Authenticator* new_cached_oss_authenticator(Authenticator* auth,
+     auth_->set_credentials(std::move(credentials));
+   }
+ };*/
+-}  // namespace objstore
++}  // namespace objstore_from_photon
+ }  // namespace photon

@@ -32,8 +32,10 @@
 #include "common/fuse.h"
 #include "common/macros.h"
 #include "common/utils.h"
+#include "disk_cache.h"
 #include "error_codes.h"
 #include "file.h"
+#include "mem_cache.h"
 #include "metric/metrics.h"
 
 #define GET_INODE_REF_ONLY_WITH_RET(id)                            \
@@ -61,7 +63,6 @@ namespace OssFileSystem {
 
 const uint64_t TEMP_NODEID = std::numeric_limits<uint64_t>::max();
 
-std::atomic<uint64_t> InodeManager::g_nodeid_ = ATOMIC_VAR_INIT(0);
 std::atomic<uint64_t> NegativeCache::create_cache_hit_cnt_ = ATOMIC_VAR_INIT(0);
 std::atomic<uint64_t> NegativeCache::lookup_cache_hit_cnt_ = ATOMIC_VAR_INIT(0);
 
@@ -70,9 +71,11 @@ uid_t Attribute::DEFAULT_UID = 0;
 mode_t Attribute::DEFAULT_DIR_MODE = 0755;
 mode_t Attribute::DEFAULT_FILE_MODE = 0644;
 
-OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
+OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env,
+             std::unique_ptr<IIdManager> id_manager)
     : options_(options),
       bg_vcpu_env_(bg_vcpu_env),
+      id_manager_(std::move(id_manager)),
       prefetch_sem_(
           std::make_unique<photon::semaphore>(options_.prefetch_concurrency)),
       upload_sem_(
@@ -88,7 +91,6 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
                                false, 0, nullptr, "");
   mp_inode_->increment_lookupcnt();
   add_new_inode_to_global_map(mp_inode_);
-  InodeManager::init(1);
 
   Attribute::set_default_gid_uid(options_.gid, options_.uid);
   Attribute::set_default_mode(options_.dir_mode, options_.file_mode);
@@ -97,7 +99,7 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
   upload_buffers_ = std::make_unique<FixedBlockMemoryPool>(
       options_.upload_buffer_size, options_.upload_concurrency + 4,
       options_.upload_concurrency + 4, options_.mempool_purge_interval_ms);
-  if (options_.cache_type == CacheType::kFhCache && enable_prefetching()) {
+  if (enable_prefetching()) {
     size_t blocks_per_prefetch_chunk =
         (options_.prefetch_chunk_size + options_.cache_block_size - 1) /
         options_.cache_block_size;
@@ -119,7 +121,7 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
       purge_interval_ms = 0;
     }
 
-    download_buffers_ = std::make_unique<FixedBlockMemoryPool>(
+    download_buffers_ = std::make_shared<FixedBlockMemoryPool>(
         options_.cache_block_size, pool_capcacity, cached_block_count,
         purge_interval_ms);
   }
@@ -156,6 +158,10 @@ OssFs::~OssFs() {
   JOIN_AND_DELETE_THREAD(reverse_invalidate_th_);
   JOIN_AND_DELETE_THREAD(health_check_th_);
   JOIN_AND_DELETE_THREAD(transmission_control_th_);
+
+  if (enable_staged_cache()) {
+    LOG_INFO("Remained staged inodes number: `", staged_inodes_cache_->size());
+  }
 
   DELETE_VAR(creds_provider_);
   DELETE_VAR(staged_inodes_cache_);
@@ -288,7 +294,7 @@ retry_with_write_path_lock:
   }
 
   std::string remote_etag;
-  r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_stat, full_path, stbuf,
+  r = PERFORM_BACKGROUND_OBJ_REQUEST(this, stat, full_path, stbuf,
                                      &remote_etag);
   if (r == 0) {
     InodeType new_type = Inode::mode_to_inode_type(stbuf->st_mode);
@@ -343,14 +349,17 @@ int OssFs::setattr(uint64_t nodeid, struct stat *stbuf, int to_set) {
     inode->update_attr(inode->attr.size, stbuf->st_mtim);
   } else if (to_set & FUSE_SET_ATTR_SIZE) {
     if (stbuf->st_size != 0) {
-      LOG_WARN("nodeid ` truncate to non-zero is not supported.", nodeid);
+      LOG_ERROR("nodeid ` truncate to non-zero is not supported.", nodeid);
       return -ENOTSUP;
     }
     if (inode->is_dir()) return -EISDIR;
 
     if (inode->attr.size == 0) goto exit;
 
-    if (static_cast<FileInode *>(inode)->is_dirty_file()) return -EBUSY;
+    if (static_cast<FileInode *>(inode)->is_dirty_file()) {
+      LOG_ERROR("nodeid ` is dirty, cannot be truncated", nodeid);
+      return -EBUSY;
+    }
 
     int r = truncate_inode_data(inode, ref.inode_path, 0);
     if (r < 0) return r;
@@ -460,8 +469,8 @@ int OssFs::rename(uint64_t old_parent, std::string_view old_name,
   if (!dst_node && (flags & RENAME_NOREPLACE)) {
     struct stat st;
     std::string unused_etag;
-    int r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_stat, dst_path, &st,
-                                           &unused_etag);
+    int r =
+        PERFORM_BACKGROUND_OBJ_REQUEST(this, stat, dst_path, &st, &unused_etag);
     if (r == 0) {
       return -EEXIST;
     } else if (r != -ENOENT) {
@@ -472,8 +481,8 @@ int OssFs::rename(uint64_t old_parent, std::string_view old_name,
     // cloud.
   } else if (src_node->is_dir() || (dst_node && dst_node->is_dir())) {
     bool is_empty = false;
-    int r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_is_dir_empty, dst_path,
-                                           is_empty);
+    int r =
+        PERFORM_BACKGROUND_OBJ_REQUEST(this, is_dir_empty, dst_path, is_empty);
     if (r != 0) {
       LOG_ERROR("fail to list dir `, with error: `", dst_path, r);
       return r;
@@ -613,7 +622,7 @@ int OssFs::unlink(uint64_t parent, std::string_view name) {
   if (full_path.back() != '/') full_path.append("/");
   full_path.append(name.data(), name.size());
 
-  int r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_delete_object, full_path);
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, delete_object, full_path);
   if (r < 0 && r != -ENOENT) {
     LOG_ERROR("fail to delete ` on the cloud", full_path);
     return r;
@@ -655,7 +664,7 @@ int OssFs::open(uint64_t nodeid, int flags, void **fh, bool *keep_page_cache) {
   if (options_.close_to_open && !inode->is_dirty) {
     struct stat stbuf = {};
     std::string remote_etag;
-    int r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_stat, full_path, &stbuf,
+    int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, stat, full_path, &stbuf,
                                            &remote_etag);
     if (r < 0) {
       LOG_ERROR("fail to open ` on the cloud with r `", full_path, r);
@@ -678,6 +687,11 @@ int OssFs::open(uint64_t nodeid, int flags, void **fh, bool *keep_page_cache) {
 
   if (inode->invalidate_data_cache) {
     evict_inode_cache(inode);
+  }
+
+  if (inode->open_ref_cnt == 0 && options_.share_fd_read_buffer &&
+      inode->cache == nullptr) {
+    inode->cache = create_inode_cache();
   }
 
   if (flags & O_TRUNC) {
@@ -734,6 +748,10 @@ int OssFs::release(uint64_t nodeid, void *fh) {
       inode->invalidate_data_cache = true;
     } else {
       LOG_INFO("release file: `, nodeid: `", oss_fh->get_path(), nodeid);
+    }
+
+    if (inode->open_ref_cnt == 0 && inode->cache) {
+      inode->cache.reset();
     }
   }
 
@@ -982,7 +1000,7 @@ int OssFs::rmdir(uint64_t parent, std::string_view name) {
   full_path.append(name.data(), name.size());
 
   // It's OK this dir has been deleted from cloud, 404 will not be returned.
-  int r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_delete_object,
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, delete_object,
                                          add_backslash(full_path));
   if (r < 0) {
     LOG_ERROR("fail to delete dir ` on the cloud with error code `", full_path,
@@ -1020,8 +1038,7 @@ ssize_t OssFs::readlink(uint64_t nodeid, char *buf, size_t size) {
 
   const auto &full_path = ref.inode_path;
   std::string target;
-  int r =
-      DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_get_symlink, full_path, target);
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, get_symlink, full_path, target);
   if (r < 0) {
     return r;
   }
@@ -1139,7 +1156,7 @@ int OssFs::lookup_get_remote_attr(DirInode *parent_inode, std::string_view name,
       std::this_thread::sleep_for(std::chrono::milliseconds(2 * 1000));
     });
 
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_stat, full_path, stbuf,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, stat, full_path, stbuf,
                                        remote_etag);
     *attr_time = time(0);
   }
@@ -1332,7 +1349,7 @@ int OssFs::lookup_with_inode_ref(DirInode *parent_inode, std::string_view name,
   // Child inode does not exist, or is stale. When reaching here, the
   // child inode must be stale or not exist, and we need to create a new inode.
   uint64_t allocated_nodeid =
-      lookup_from_staged_cache ? stbuf->st_ino : InodeManager::next();
+      lookup_from_staged_cache ? stbuf->st_ino : id_manager_->next_id();
   lookup_create_new_inode(parent_inode, name, remote_etag, allocated_nodeid,
                           stbuf, &attr_time);
   return 0;
@@ -1393,7 +1410,7 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
     // Not exists at local, or is expired.
     struct stat st;
     std::string unused_etag;
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_stat, full_path, &st,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, stat, full_path, &st,
                                        &unused_etag);
     if (r == 0) {
       return -EEXIST;
@@ -1414,15 +1431,14 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
   if (type == InodeType::kDir) {
     iovec iov{nullptr, 0};
     uint64_t expected_crc64 = 0;
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_put_object,
-                                       add_backslash(full_path), &iov, 1,
-                                       &expected_crc64);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(
+        this, put_object, add_backslash(full_path), &iov, 1, &expected_crc64);
     if (r < 0) {
       LOG_ERROR("fail to mkdir from cloud. path ` with error `", full_path, r);
       return r;
     }
   } else if (type == InodeType::kSymlink) {
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_put_symlink, full_path, link);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, put_symlink, full_path, link);
     if (r < 0) {
       LOG_ERROR("fail to create symlink from cloud. path ` link ` with error `",
                 full_path, link, r);
@@ -1437,7 +1453,7 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
   struct timespec now;
   clock_gettime(CLOCK_REALTIME, &now);
   Inode *child_inode;
-  child_inode = create_new_inode(InodeManager::next(), name, file_size, now,
+  child_inode = create_new_inode(id_manager_->next_id(), name, file_size, now,
                                  type, false, parent, parent_inode, "");
 
   // A create request is equivalent to mknod + open, so we need to open the
@@ -1475,10 +1491,10 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
 }
 
 int OssFs::get_one_list_results(std::string_view full_path,
-                                std::vector<OssDirent> &results,
+                                std::vector<ObjDirent> &results,
                                 std::string &marker) {
   results.clear();
-  return DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_list_dir, full_path, results,
+  return PERFORM_BACKGROUND_OBJ_REQUEST(this, list_dir, full_path, results,
                                         &marker);
 }
 
@@ -1486,7 +1502,7 @@ int OssFs::get_one_list_results(std::string_view full_path,
 // Not increment lookup_cnt.
 void OssFs::construct_inodes_if_needed(DirInode *parent_inode,
                                        OssDirHandle *dh) {
-  std::vector<OssDirent> ents;
+  std::vector<ObjDirent> ents;
   dh->get_cur_list_res(ents);
   for (size_t i = dh->get_list_pos(); i < ents.size(); i++) {
     const auto &oss_ent = ents[i];
@@ -1553,7 +1569,7 @@ void OssFs::construct_inodes_if_needed(DirInode *parent_inode,
     }
 
     if (allocated_nodeid == 0) {
-      allocated_nodeid = InodeManager::next();
+      allocated_nodeid = id_manager_->next_id();
     }
 
     auto new_child_node = create_new_inode(
@@ -1618,7 +1634,7 @@ int OssFs::remember_inode_if_needed_with_fill(
 // with parent's rlock held
 int OssFs::get_dirty_children(DirInode *parent_inode,
                               std::string_view full_path,
-                              std::map<estring, OssDirent> &dirty_children_) {
+                              std::map<estring, ObjDirent> &dirty_children_) {
   dirty_children_.clear();
   for (auto &cit : parent_inode->children) {
     Inode *child = cit.second;
@@ -1633,7 +1649,7 @@ int OssFs::get_dirty_children(DirInode *parent_inode,
       // obtained from the Inodes when being filled.
       dirty_children_.emplace(
           cit.first,
-          OssDirent(child->name, child->attr.size, child->attr.mtime.tv_sec,
+          ObjDirent(child->name, child->attr.size, child->attr.mtime.tv_sec,
                     DT_REG, get_inode_etag(child)));
     }
   }
@@ -1647,7 +1663,7 @@ int OssFs::refresh_dir_plus(DirInode *parent_inode, OssDirHandle *odh) {
   // We save current dirty children to a temporary set, in case a
   // currently dirty child becomes clean and is in the list result (filled
   // twice)
-  std::map<estring, OssDirent> dirty_children;
+  std::map<estring, ObjDirent> dirty_children;
   if ((r = get_dirty_children(parent_inode, odh->get_full_path(),
                               dirty_children)) != 0) {
     return r;
@@ -1682,7 +1698,7 @@ int OssFs::refresh_dir(DirInode *parent_inode, OssDirHandle *odh) {
   // We save current dirty children to a temporary set, in case a
   // currently dirty child becomes clean and is in the list result (filled
   // twice)
-  std::map<estring, OssDirent> dirty_children;
+  std::map<estring, ObjDirent> dirty_children;
   if ((r = get_dirty_children(parent_inode, odh->get_full_path(),
                               dirty_children)) != 0) {
     return r;
@@ -2011,9 +2027,8 @@ Inode *OssFs::create_new_inode(uint64_t nodeid, std::string_view name,
   if (type == InodeType::kDir) {
     inode = new DirInode(nodeid, name, mtime, parent_nodeid, parent_node);
   } else {
-    inode = new FileInode(
-        nodeid, name, size, mtime, type, is_dirty, parent_nodeid, parent_node,
-        remote_etag, options_.bind_cache_to_inode, options_.cache_block_size);
+    inode = new FileInode(nodeid, name, size, mtime, type, is_dirty,
+                          parent_nodeid, parent_node, remote_etag);
   }
   if (inode == nullptr) {
     LOG_ERROR("fail to create a new inode.");
@@ -2136,17 +2151,25 @@ int OssFs::init() {
   if (!options_.ram_role.empty()) {
     creds_provider_ = new_ram_role_creds_provider(options_.ram_role);
   } else if (!options_.credential_process.empty()) {
-    creds_provider_ = new_process_creds_provider(options_.credential_process);
+    creds_provider_ = new_process_creds_provider(
+        options_.credential_process, options_.credential_refresh_interval);
   }
 
   int r = 0;
-  if (creds_provider_) {
-    std::promise<int> result_promise;
-    creds_refresh_th_ = new std::thread(&OssFs::start_creds_refresher, this,
-                                        std::ref(result_promise));
-    r = result_promise.get_future().get();
-  } else {
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_check_bucket);
+  {
+    auto t0 = std::chrono::steady_clock::now();
+    if (creds_provider_) {
+      std::promise<int> result_promise;
+      creds_refresh_th_ = new std::thread(&OssFs::start_creds_refresher, this,
+                                          std::ref(result_promise));
+      r = result_promise.get_future().get();
+    } else {
+      r = PERFORM_BACKGROUND_OBJ_REQUEST(this, check_bucket);
+    }
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    LOG_INFO("[MountTiming] bucket validation completed in ` us", elapsed);
   }
 
   if (r < 0) {
@@ -2156,11 +2179,27 @@ int OssFs::init() {
   return r;
 }
 
+std::shared_ptr<ICache> OssFs::create_inode_cache() {
+  std::shared_ptr<ICache> cache = nullptr;
+  switch (options_.cache_type) {
+    case CacheType::kFhCache:
+      if (options_.share_fd_read_buffer) {
+        cache = std::make_shared<BlockCache>(download_buffers_);
+      }
+      break;
+    case CacheType::kDiskCache:
+      cache = std::make_shared<DiskCache>(bg_vcpu_env_.bg_disk_cache_env,
+                                          download_buffers_);
+      break;
+    default:
+      std::abort();
+  }
+  return cache;
+}
+
 void OssFs::evict_inode_cache(FileInode *inode) {
-  if (inode->cache_manager) {
-    const uint64_t cache_block_size = inode->cache_manager->block_size();
-    inode->cache_manager =
-        std::make_shared<BlockCacheManager>(cache_block_size);
+  if (inode->cache) {
+    inode->cache = create_inode_cache();
   }
 }
 
@@ -2205,26 +2244,24 @@ int OssFs::truncate_inode_data(Inode *inode, std::string_view full_path,
 
   struct stat stbuf = {};
 
-  auto background_env =
-      bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next();
+  auto background_env = bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next();
   int r = background_env.executor->perform([&]() {
-    auto oss_client = background_env.oss_client;
+    auto obj_store = background_env.obj_store;
     iovec iov{nullptr, 0};
     uint64_t expected_crc64 = 0;
 
     ssize_t ret = 0;
     if (options_.enable_appendable_object) {
-      ret = oss_client->oss_delete_object(full_path);
+      ret = obj_store->delete_object(full_path);
       if (ret < 0) {
         LOG_ERROR("Failed to unlink file: `, nodeid: ` r: `", full_path,
                   file_inode->nodeid, ret);
         return ret;
       }
 
-      ret =
-          oss_client->oss_append_object(full_path, &iov, 1, 0, &expected_crc64);
+      ret = obj_store->append_object(full_path, &iov, 1, 0, &expected_crc64);
     } else {
-      ret = oss_client->oss_put_object(full_path, &iov, 1, &expected_crc64);
+      ret = obj_store->put_object(full_path, &iov, 1, &expected_crc64);
     }
 
     if (ret < 0) {
@@ -2234,7 +2271,7 @@ int OssFs::truncate_inode_data(Inode *inode, std::string_view full_path,
     }
 
     std::string unused_etag;
-    int stat_r = oss_client->oss_stat(full_path, &stbuf, &unused_etag);
+    int stat_r = obj_store->stat(full_path, &stbuf, &unused_etag);
     return static_cast<ssize_t>(stat_r);
   });
 
@@ -2324,9 +2361,9 @@ void OssFs::mark_inode_stale_if_needed(Inode *inode, bool recursively) {
 }
 
 int OssFs::rename_file(std::string_view old_path, std::string_view new_path) {
-  int r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_rename_object, old_path,
-                                         new_path,
-                                         options_.set_mime_for_rename_dst);
+  int r =
+      PERFORM_BACKGROUND_OBJ_REQUEST(this, rename_object, old_path, new_path,
+                                     options_.set_mime_for_rename_dst);
   if (r != 0) {
     LOG_ERROR("fail to rename file from ` to ` with error: `", old_path,
               new_path, r);
@@ -2367,16 +2404,16 @@ int OssFs::rename_dir(std::string_view old_path, std::string_view new_path) {
   auto before = std::chrono::steady_clock::now();
 
   // We are listing all the objects with old_path/ specified as the prefix.
-  int r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_list_dir_descendants,
-                                         old_obj_parent, list_results, checker,
-                                         &is_dir_obj);
+  int r =
+      PERFORM_BACKGROUND_OBJ_REQUEST(this, list_dir_descendants, old_obj_parent,
+                                     list_results, checker, &is_dir_obj);
   if (r != 0) {
     LOG_ERROR("fail to list objects with prefix ` r = `", old_path, r);
     return r;
   }
   if (!checker()) {
     LOG_ERROR("trying to rename ` files one time, stop.", list_results.size());
-    return -EMFILE;
+    return -E2BIG;
   }
 
   auto after = std::chrono::steady_clock::now();
@@ -2387,7 +2424,7 @@ int OssFs::rename_dir(std::string_view old_path, std::string_view new_path) {
 
   if (is_dir_obj) {
     // Copy old_parent_path/ to new_parent_path/.
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_copy_object, old_obj_parent,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, copy_object, old_obj_parent,
                                        new_obj_parent, true);
     if (r != 0) {
       LOG_ERROR("fail to copy ` to ` with r `", old_obj_parent, new_obj_parent,
@@ -2444,7 +2481,7 @@ int OssFs::rename_dir(std::string_view old_path, std::string_view new_path) {
 
       auto th = photon::thread_create(do_rename_task, ctx);
       photon::thread_migrate(th,
-                             bg_vcpu_env_.bg_oss_client_env->get_vcpu_next());
+                             bg_vcpu_env_.bg_obj_store_env->get_vcpu_next());
     }
 
     while (running_tasks_cnt.load() > 0) {
@@ -2470,7 +2507,7 @@ int OssFs::rename_dir(std::string_view old_path, std::string_view new_path) {
 
   if (is_dir_obj) {
     // Delete old_parent_path/.
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(this, oss_delete_object, old_obj_parent);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, delete_object, old_obj_parent);
     if (r != 0) {
       LOG_ERROR("fail to delete ` with r `", old_obj_parent, r);
       return r;
@@ -2482,8 +2519,8 @@ int OssFs::rename_dir(std::string_view old_path, std::string_view new_path) {
 
 void *OssFs::do_rename_task(void *arg) {
   auto ctx = (RenameContext *)arg;
-  thread_local auto oss_client =
-      ctx->fs->bg_vcpu_env_.bg_oss_client_env->get_oss_client();
+  thread_local auto obj_store =
+      ctx->fs->bg_vcpu_env_.bg_obj_store_env->get_obj_store();
 
   int r = 0;
 
@@ -2493,7 +2530,7 @@ void *OssFs::do_rename_task(void *arg) {
                          ctx->list_results->at(ctx->obj_index));
     dst_obj_path.appends(ctx->new_parent_path,
                          ctx->list_results->at(ctx->obj_index));
-    r = oss_client->oss_copy_object(src_obj_path, dst_obj_path);
+    r = obj_store->copy_object(src_obj_path, dst_obj_path);
   } else {
     auto start_it = ctx->list_results->begin() + ctx->obj_index;
     auto end_it = (ctx->obj_index + 1000) < ctx->list_results->size()
@@ -2508,8 +2545,7 @@ void *OssFs::do_rename_task(void *arg) {
       LOG_DEBUG("rename from ` trying to delete objs from ` to the end",
                 ctx->old_parent_path, *start_it);
     }
-    r = oss_client->oss_delete_objects_under_dir(ctx->old_parent_path,
-                                                 batch_objs);
+    r = obj_store->delete_objects_under_dir(ctx->old_parent_path, batch_objs);
   }
   if (r < 0) {
     LOG_ERROR(
@@ -2840,23 +2876,23 @@ void OssFs::run_health_check() {
   while (!is_stopping_) AUTO_USLEEP(100000);
 }
 
-void OssFs::update_creds(const OssCredentials &creds) {
-  auto ctxs = bg_vcpu_env_.bg_oss_client_env->get_all_env_cxts();
+void OssFs::update_creds(const ObjCredentials &creds) {
+  auto ctxs = bg_vcpu_env_.bg_obj_store_env->get_all_env_cxts();
   for (auto &ctx : ctxs) {
     ctx.executor->perform([&]() {
-      ctx.oss_client->set_credentials(
+      ctx.obj_store->set_credentials(
           {creds.accessKeyId, creds.accessKeySecret, creds.securityToken});
     });
   }
 }
 
-int OssFs::validate_creds(const OssCredentials &creds) {
-  auto options = DO_SYNC_BACKGROUND_OSS_REQUEST(this, get_options);
-  std::unique_ptr<OssAdapter> oss_client =
-      std::unique_ptr<OssAdapter>(new_oss_client("", "", options));
-  oss_client->set_credentials(
+int OssFs::validate_creds(const ObjCredentials &creds) {
+  auto options = PERFORM_BACKGROUND_OBJ_REQUEST(this, get_options);
+  std::unique_ptr<IObjStore> obj_store =
+      std::unique_ptr<IObjStore>(new_oss_store("", "", options));
+  obj_store->set_credentials(
       {creds.accessKeyId, creds.accessKeySecret, creds.securityToken});
-  int r = oss_client->oss_check_bucket();
+  int r = obj_store->check_bucket();
   if (r != 0) {
     LOG_ERROR("Fail to check bucket with ak ` error `", creds.accessKeyId, r);
   }
@@ -2866,7 +2902,7 @@ int OssFs::validate_creds(const OssCredentials &creds) {
 std::pair<int, uint64_t> OssFs::do_refresh_creds() {
   int r = -EINVAL;
   auto info =
-      creds_provider_->refresh_credentials([&](const OssCredentials &creds) {
+      creds_provider_->refresh_credentials([&](const ObjCredentials &creds) {
         r = validate_creds(creds);
         return r == 0;
       });

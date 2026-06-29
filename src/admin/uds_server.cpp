@@ -32,6 +32,18 @@ static const uint32_t kUdsRecvSize = 1024;
 static const uint32_t kUdsMessageLengthSize = 10;
 static const std::string kUdsDir = "/run/ossfs2";
 
+// Context structure to hold the process function on the heap.
+// This fixes a use-after-free bug where Photon's Delegate only stores
+// the address of the handler lambda, which becomes invalid after
+// create_uds_server returns.
+struct UdsHandlerContext {
+  std::function<std::string(std::string_view, std::string_view)> process;
+};
+
+// Static pointer to the context. Since each process has only one UDS server
+// and create/destroy are called in the same thread, no lock is needed.
+static UdsHandlerContext *g_uds_context = nullptr;
+
 std::string generate_uds_path_from_pid(pid_t pid) {
   if (pid == 0) return "";
   return join_paths(kUdsDir, "ossfs2_uds_" + std::to_string(pid) + ".sock");
@@ -59,6 +71,26 @@ static void recv_message(photon::net::ISocketStream *sock,
     output.append(buf, recv_size);
     length -= recv_size;
   }
+}
+
+static int uds_connection_handler(UdsHandlerContext *ctx,
+                                  photon::net::ISocketStream *sock) {
+  std::string input;
+  recv_message(sock, input);
+
+  std::string_view input_view = input;
+  std::string_view action, param;
+  auto pos = input.find(',');
+  if (pos == std::string::npos) {
+    action = input_view;
+  } else {
+    action = input_view.substr(0, pos);
+    param = input_view.substr(pos + 1, input.size() - pos - 1);
+  }
+
+  std::string output = ctx->process(action, param);
+  send_message(sock, output);
+  return 0;
 }
 
 void send_uds_request(const std::string &uds_path, const std::string &action,
@@ -89,28 +121,18 @@ photon::net::ISocketServer *create_uds_server(
     std::function<std::string(std::string_view, std::string_view)> process) {
   photon::net::ISocketServer *uds_server = nullptr;
   int r = 0;
+
+  // Allocate context on heap to ensure it outlives this function.
+  // Photon's Delegate stores the object address, not a copy, so the
+  // object must remain valid for the server's entire lifetime.
+  auto *ctx = new UdsHandlerContext{std::move(process)};
+
   DEFER({
-    if (r != 0 && uds_server) delete uds_server;
-  });
-
-  auto handler = [process](photon::net::ISocketStream *sock) -> int {
-    std::string input;
-    recv_message(sock, input);
-
-    std::string_view input_view = input;
-    std::string_view action, param;
-    auto pos = input.find(',');
-    if (pos == std::string::npos) {
-      action = input_view;
-    } else {
-      action = input_view.substr(0, pos);
-      param = input_view.substr(pos + 1, input.size() - pos - 1);
+    if (r != 0) {
+      if (uds_server) delete uds_server;
+      delete ctx;
     }
-
-    std::string output = process(action, param);
-    send_message(sock, output);
-    return 0;
-  };
+  });
 
   uds_server = photon::net::new_uds_server();
   if (uds_server == nullptr) {
@@ -133,18 +155,25 @@ photon::net::ISocketServer *create_uds_server(
     }
   }
 
+  // Use static handler with heap-allocated context.
+  // Explicitly construct Handler (Delegate) with context pointer and function.
+  photon::net::ISocketServer::Handler handler(ctx, uds_connection_handler);
   r = uds_server->set_handler(handler)->listen();
   if (r != 0) {
     LOG_ERROR("Failed to listen to Unix Domain Socket `", uds_path);
     return nullptr;
   }
 
+  // Success: transfer context ownership to global pointer.
+  g_uds_context = ctx;
   return uds_server;
 }
 
 void destroy_uds_server(photon::net::ISocketServer *server) {
   if (server) {
     server->terminate();
+    delete g_uds_context;
+    g_uds_context = nullptr;
     delete server;
   }
 }

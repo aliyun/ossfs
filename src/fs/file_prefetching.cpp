@@ -48,8 +48,8 @@ void EnableFilePrefetching<Derived>::do_prefetch(size_t remote_size,
     if (offset == 0) {
       derived()->try_expand_prefetch_window(remote_size);
       if (derived()->has_enough_space(remote_size)) {
-        GET_BACKGROUND_OSS_CLIENT_AND_DO_SYNC_FUNC(fs_, do_prefetch_range, 0,
-                                                   remote_size);
+        GET_BACKGROUND_OBJ_STORE_AND_PERFORM(fs_, do_prefetch_range, 0,
+                                             remote_size);
       }
     }
     return;
@@ -74,7 +74,7 @@ void EnableFilePrefetching<Derived>::do_prefetch(size_t remote_size,
 template <typename Derived>
 void EnableFilePrefetching<Derived>::adjust_next_prefetch_off(off_t remote_size,
                                                               off_t offset) {
-  bool left = prefetch_window_size_ > 0 &&
+  bool left = estimate_tasks_by_window_size() > 0 &&
               static_cast<size_t>(offset) +
                       get_prefetch_buffer_size(prefetch_window_size_) <
                   static_cast<size_t>(next_prefetch_off_);
@@ -123,13 +123,24 @@ void EnableFilePrefetching<Derived>::reset_prefetch(off_t remote_size,
 //
 
 template <typename Derived>
-void EnableFilePrefetching<Derived>::schedule_prefetch(off_t remote_size) {
-  derived()->try_expand_prefetch_window(remote_size);
-  if (prefetch_window_size_ == 0) return;
+bool EnableFilePrefetching<Derived>::is_prefetch_too_far_ahead() const {
+  if (prefetch_window_size_ == 0) return false;
+  if (next_prefetch_off_ <= next_read_off_) return false;
 
-  if (is_prefetching_scheduled_ &&
-      next_read_off_ + prefetch_window_size_ <=
-          static_cast<size_t>(next_prefetch_off_)) {
+  size_t distance = next_prefetch_off_ - next_read_off_;
+  return distance >= prefetch_window_size_;
+}
+
+template <typename Derived>
+void EnableFilePrefetching<Derived>::schedule_prefetch(off_t remote_size) {
+  if (remote_size <= next_prefetch_off_) return;
+  size_t remain_prefetch_size = remote_size - next_prefetch_off_;
+
+  derived()->try_expand_prefetch_window(remain_prefetch_size);
+  auto expected_task_count = estimate_tasks_by_window_size();
+  if (expected_task_count == 0) return;
+
+  if (is_prefetching_scheduled_ && is_prefetch_too_far_ahead()) {
     return;
   }
 
@@ -139,13 +150,10 @@ void EnableFilePrefetching<Derived>::schedule_prefetch(off_t remote_size) {
   auto running_tsks = running_download_tasks_.load();
   uint64_t max_tsks = std::min(
       static_cast<uint64_t>(fs_->options_.prefetch_concurrency_per_file),
-      prefetch_window_size_ / 2 / prefetch_chunk_size_);
+      expected_task_count);
   if (max_tsks <= running_tsks) return;
 
   max_tsks = max_tsks - running_tsks;
-  size_t remain_prefetch_size = remote_size - next_prefetch_off_;
-
-  if (remain_prefetch_size == 0) return;
 
   size_t prefetch_size =
       std::min(next_prefetch_size_, max_tsks * prefetch_chunk_size_);
@@ -164,8 +172,7 @@ void EnableFilePrefetching<Derived>::schedule_prefetch(off_t remote_size) {
 
   auto th = photon::thread_create(prefetch_tsk, ctx);
   photon::thread_migrate(
-      th,
-      ctx->prefetcher->fs_->bg_vcpu_env_.bg_oss_client_env->get_vcpu_next());
+      th, ctx->prefetcher->fs_->bg_vcpu_env_.bg_obj_store_env->get_vcpu_next());
 
   next_prefetch_size_ =
       std::min(next_prefetch_size_ * 2, fs_->max_prefetch_size_per_handle_);
@@ -189,7 +196,7 @@ void *EnableFilePrefetching<Derived>::prefetch_tsk(void *args) {
     auto th = photon::thread_create(do_prefetch_tsk, sub_ctx);
     photon::thread_migrate(
         th,
-        ctx->prefetcher->fs_->bg_vcpu_env_.bg_oss_client_env->get_vcpu_next());
+        ctx->prefetcher->fs_->bg_vcpu_env_.bg_obj_store_env->get_vcpu_next());
   }
 
   delete ctx;
@@ -200,7 +207,7 @@ template <typename Derived>
 void *EnableFilePrefetching<Derived>::do_prefetch_tsk(void *args) {
   auto ctx = (PrefetchContext *)args;
   thread_local auto back_fs =
-      ctx->prefetcher->fs_->bg_vcpu_env_.bg_oss_client_env->get_oss_client();
+      ctx->prefetcher->fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store();
   ctx->prefetcher->do_prefetch_range(back_fs, ctx->offset,
                                      ctx->prefetcher->prefetch_chunk_size_);
   ctx->prefetcher->fs_->prefetch_sem_->signal(1);
@@ -212,8 +219,9 @@ void *EnableFilePrefetching<Derived>::do_prefetch_tsk(void *args) {
 }
 
 template <typename Derived>
-ssize_t EnableFilePrefetching<Derived>::do_prefetch_range(
-    OssAdapter *oss_client, off_t offset, size_t count) {
+ssize_t EnableFilePrefetching<Derived>::do_prefetch_range(IObjStore *obj_store,
+                                                          off_t offset,
+                                                          size_t count) {
   uint64_t end = photon::sat_add(offset, count);
   auto alignment = derived()->get_prefetch_alignment();
 
@@ -230,7 +238,7 @@ ssize_t EnableFilePrefetching<Derived>::do_prefetch_range(
   while (remain > 0) {
     off_t min = std::min(kMaxPrefetchSizePerRequest, remain);
     remain -= min;
-    auto ret = derived()->bg_try_refill_range(oss_client, offset,
+    auto ret = derived()->bg_try_refill_range(obj_store, offset,
                                               static_cast<size_t>(min));
     if (ret < 0) {
       return ret;

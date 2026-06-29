@@ -21,6 +21,8 @@ DEFINE_uint64(test_mem_usage_file_num, 1000000,
 DEFINE_bool(test_mem_usage_staged, false,
             "Enable metadata usage test with staged inode cache.");
 DEFINE_bool(test_mem_usage_dir, false, "Create subdir instead of subfile");
+DEFINE_bool(test_mem_name_len_255, false,
+            "Test inode with name length 255, otherwise 50");
 
 // Ossfs2InodeTest contains basic inode tests for lookup, forget,
 // getattr, setattr and evict.
@@ -967,7 +969,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     DEFER(fs_->forget(new_childs[2].nodeid, 1));
     DEFER(fs_->forget(new_childs[3].nodeid, 1));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));  // attrtime
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));  // attrtime
 
     bool file_is_as_expected = false, dir_is_as_expected = false;
     for (auto &it : new_childs) {
@@ -1203,26 +1205,26 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     DEFER(fs_->forget(nodeid3, 1));
 
     bool is_dir_empty = false;
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(
-        fs_, oss_is_dir_empty, join_paths(parent_path, "non_exist_path"),
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(
+        fs_, is_dir_empty, join_paths(parent_path, "non_exist_path"),
         is_dir_empty);
     ASSERT_EQ(r, 0);
     ASSERT_TRUE(is_dir_empty);
 
     is_dir_empty = false;
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_is_dir_empty,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, is_dir_empty,
                                        nodeid_to_path(nodeid1), is_dir_empty);
     ASSERT_EQ(r, 0);
     ASSERT_TRUE(is_dir_empty);
 
     is_dir_empty = false;
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_is_dir_empty,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, is_dir_empty,
                                        nodeid_to_path(nodeid2), is_dir_empty);
     ASSERT_EQ(r, 0);
     ASSERT_FALSE(is_dir_empty);
 
     is_dir_empty = false;
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_is_dir_empty,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, is_dir_empty,
                                        nodeid_to_path(nodeid3), is_dir_empty);
     ASSERT_EQ(r, 0);
     ASSERT_FALSE(is_dir_empty);
@@ -1231,8 +1233,8 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     for (size_t i = 0; i < nodeids.size(); i++) {
       struct stat st;
       std::string unused_etag;
-      r = DO_SYNC_BACKGROUND_OSS_REQUEST(
-          fs_, oss_stat, nodeid_to_path(nodeid1).c_str(), &st, &unused_etag);
+      r = PERFORM_BACKGROUND_OBJ_REQUEST(
+          fs_, stat, nodeid_to_path(nodeid1).c_str(), &st, &unused_etag);
       ASSERT_EQ(r, 0);
       ASSERT_TRUE(S_ISDIR(st.st_mode));
     }
@@ -1407,8 +1409,9 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     LOG_INFO("sizeof(DirInode) = `, sizeof(FileInode) = `", sizeof(DirInode),
              sizeof(FileInode));
 
-    LOG_INFO("Create 1 DirInode and ` sub- ` whose names are sized of 50.",
-             file_num, FLAGS_test_mem_usage_dir ? "dirs" : "files");
+    LOG_INFO("Create 1 DirInode and ` sub- ` whose names are sized of `.",
+             file_num, FLAGS_test_mem_usage_dir ? "dirs" : "files",
+             FLAGS_test_mem_name_len_255 ? 255 : 50);
     bool enable_staged_inode = FLAGS_test_mem_usage_staged;
     LOG_INFO("Test staged cache mem usage: `", enable_staged_inode);
 
@@ -1416,6 +1419,11 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     std::map<uint64_t, Inode *> glb_map;
     std::string len_of_50 =
         "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij";
+    std::string len_of_255 =
+        "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+        "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+        "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+        "abcdefghijabcdefghijabcdefghijabcdefghijkmnop";
     std::string etag = "7D3EBDBD61A735B60D8F930C57D7BB73";
 
     auto staged_cache = enable_staged_inode
@@ -1424,7 +1432,12 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     for (uint64_t i = 0; i < file_num; ++i) {
       std::string index_str = std::to_string(i);
-      std::string name = len_of_50.substr(0, 50 - index_str.size()) + index_str;
+      std::string name;
+      if (FLAGS_test_mem_name_len_255) {
+        name = len_of_255.substr(0, 255 - index_str.size()) + index_str;
+      } else {
+        name = len_of_50.substr(0, 50 - index_str.size()) + index_str;
+      }
 
       Inode *inode = nullptr;
 
@@ -1432,7 +1445,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
         inode = new DirInode(i + 2, name, {0, 0}, 1, root);
       } else {
         inode = new FileInode(i + 2, name, 0, {0, 0}, InodeType::kFile, false,
-                              1, root, etag, false, 0);
+                              1, root, etag);
       }
 
       root->add_child_node(inode);
@@ -1478,9 +1491,9 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     std::vector<Inode *> children;
     for (int i = 0; i < 3; ++i) {
-      FileInode *node = new FileInode(i + 3, "testfile_" + std::to_string(i), 0,
-                                      {0, 0}, InodeType::kFile, false, 2,
-                                      dir_inode, "ETAG", false, 0);
+      FileInode *node =
+          new FileInode(i + 3, "testfile_" + std::to_string(i), 0, {0, 0},
+                        InodeType::kFile, false, 2, dir_inode, "ETAG");
       ASSERT_TRUE(node->is_file());
       ASSERT_FALSE(node->is_dirty_file());
       children.push_back(node);
@@ -1500,7 +1513,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     FileInode *node1 =
         new FileInode(6, "testfile_1", 0, {0, 0}, InodeType::kFile, false, 2,
-                      dir_inode, "ETAG", false, 0);
+                      dir_inode, "ETAG");
     ASSERT_TRUE(node1->is_file());
     ASSERT_FALSE(node1->is_dirty_file());
     dir_inode->add_child_node(node1);  // cover a stale child node
@@ -1516,7 +1529,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     FileInode *node2 =
         new FileInode(7, "testfile_2", 0, {0, 0}, InodeType::kFile, false, 2,
-                      dir_inode, "ETAG", false, 0);
+                      dir_inode, "ETAG");
     ASSERT_TRUE(node2->is_file());
     ASSERT_FALSE(node2->is_dirty_file());
     dir_inode->add_child_node_directly(node2);
@@ -1618,7 +1631,7 @@ TEST_F(Ossfs2InodeTest, verify_etag) {
 TEST_F(Ossfs2InodeTest, verify_remote_inode_type_change) {
   INIT_PHOTON();
   OssFsOptions opts;
-  opts.attr_timeout = 1;
+  opts.attr_timeout = 2;
   init(opts);
   verify_remote_inode_type_change();
 }

@@ -34,13 +34,16 @@
 extern ALogLogger *ossfs_logger_ptr;
 
 struct OssfsPrologue {
-  const char *addr_file;
-  int len_file;
+  const char *addr_func, *addr_file;
+  int len_func, len_file;
   int line, level;
 
-  template <typename FILEN>
-  constexpr OssfsPrologue(FILEN addr_file_, int line_, int level_)
-      : addr_file(addr_file_.chars),
+  template <size_t N, typename FILEN>
+  constexpr OssfsPrologue(const char (&addr_func_)[N], FILEN addr_file_,
+                          int line_, int level_)
+      : addr_func(addr_func_),
+        addr_file(addr_file_.chars),
+        len_func(N - 1),
         len_file(addr_file_.len),
         line(line_),
         level(level_) {}
@@ -92,14 +95,13 @@ struct OssfsSTFMTLogBuffer : public LogBuffer {
 };
 
 template <typename FMT, typename... Ts>
-inline OssfsSTFMTLogBuffer __ossfs_log__(int level, ILogOutput *output,
-                                         const OssfsPrologue &prolog, FMT fmt,
-                                         Ts &&...xs) {
-  OssfsSTFMTLogBuffer log(output);
+inline void __ossfs_log__(int level, ILogOutput *output,
+                          const OssfsPrologue &prolog, FMT fmt, Ts &&...xs) {
+  char buf[LOG_BUFFER_SIZE];
+  OssfsSTFMTLogBuffer log(buf, sizeof(buf), output);
   log << prolog;
   log.print_fmt(fmt, std::forward<Ts>(xs)..., '\n');
   log.level = level;
-  return log;
 }
 
 #define DEFINE_OSSFS_PROLOGUE(level)                                         \
@@ -107,7 +109,8 @@ inline OssfsSTFMTLogBuffer __ossfs_log__(int level, ILogOutput *output,
   constexpr auto _partial_file =                                             \
       ConstString::TSpliter<'/', ' ',                                        \
                             decltype(_prologue_file_r)>::Current::reverse(); \
-  constexpr static OssfsPrologue prolog(_partial_file, __LINE__, level);
+  constexpr static OssfsPrologue prolog(__func__, _partial_file, __LINE__,   \
+                                        level);
 
 #define __DO_OSSFS_LOG__(attr, logger, level, first, ...)                  \
   ({                                                                       \

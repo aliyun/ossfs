@@ -16,6 +16,7 @@
 
 #include "test_util.h"
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -156,4 +157,20 @@ std::string read_file(const std::string &filename) {
   }
   return std::string(std::istreambuf_iterator<char>(file),
                      std::istreambuf_iterator<char>());
+}
+
+void write_file(const std::string &filename, const std::string &content) {
+  std::ofstream file(filename, std::ios::binary);
+  if (!file.is_open()) {
+    throw std::runtime_error("Cannot open file: " + filename);
+  }
+  file.write(content.data(), content.size());
+}
+
+void remove_file(const std::string &filename) {
+  std::filesystem::remove(filename);
+}
+
+bool file_exists(const std::string &filename) {
+  return std::filesystem::exists(filename);
 }

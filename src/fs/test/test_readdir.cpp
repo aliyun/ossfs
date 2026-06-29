@@ -1244,6 +1244,49 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     r = fs_->releasedir(parent, dirp);
     ASSERT_EQ(r, 0);
   }
+
+  void verify_readdir_missing_object_type() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    // Create regular files
+    std::vector<uint64_t> file_nodeids;
+    for (int i = 0; i < 3; i++) {
+      uint64_t nodeid;
+      void *handle;
+      struct stat st;
+      std::string name = "file_" + std::to_string(i);
+      int r = create_and_flush(parent, name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
+                               0, 0, &nodeid, &st, &handle);
+      ASSERT_EQ(r, 0);
+      r = fs_->release(nodeid, get_file_from_handle(handle));
+      ASSERT_EQ(r, 0);
+      file_nodeids.push_back(nodeid);
+    }
+    DEFER(for (auto nid : file_nodeids) fs_->forget(nid, 2););
+
+    // Enable injection: clear type in walk_list_results
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_Oss_Missing_Object_Type);
+
+    // readdir should succeed, all files should be regular (not symlinks)
+    std::vector<TestInode> childs;
+    int r = read_dir_without_dots(parent, childs);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(childs.size(), 3u);
+
+    // Verify each file's inode type is regular file
+    for (auto &child : childs) {
+      struct stat st;
+      r = fs_->getattr(child.nodeid, &st);
+      ASSERT_EQ(r, 0);
+      ASSERT_TRUE(S_ISREG(st.st_mode))
+          << child.name << " should be regular file, got mode=" << st.st_mode;
+    }
+
+    g_fault_injector->clear_injection(
+        FaultInjectionId::FI_Oss_Missing_Object_Type);
+  }
 };
 
 TEST_F(Ossfs2ReaddirTest, verify_readdir_while_create_and_unlink) {
@@ -1371,4 +1414,11 @@ TEST_F(Ossfs2ReaddirTest, verify_remember_null_stale_child) {
   OssFsOptions opts;
   init(opts);
   verify_remember_null_stale_child();
+}
+
+TEST_F(Ossfs2ReaddirTest, verify_readdir_missing_object_type) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts, get_random_max_keys());
+  verify_readdir_missing_object_type();
 }

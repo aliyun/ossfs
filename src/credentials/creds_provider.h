@@ -18,7 +18,7 @@
 
 #include <map>
 
-#include "oss/oss_adapter.h"
+#include "oss/obj_store.h"
 
 namespace OssFileSystem {
 
@@ -41,21 +41,40 @@ class CredentialsProvider : public Object {
   static constexpr int64_t kRetryIntervalInUsec = 15ULL * 1000000;
 
   struct CredentialsInfo {
-    std::shared_ptr<OssCredentials> creds;
+    std::shared_ptr<ObjCredentials> creds;
     int64_t next_refresh_interval_us = 0;
   };
 
-  using CredentialsValidator = std::function<bool(const OssCredentials &)>;
+  using CredentialsValidator = std::function<bool(const ObjCredentials &)>;
+
+  CredentialsProvider() = default;
+  CredentialsProvider(uint64_t refresh_interval_sec)
+      : refresh_interval_sec_(refresh_interval_sec) {}
+  virtual ~CredentialsProvider() = default;
 
   virtual CredentialsInfo refresh_credentials(CredentialsValidator validator);
 
  protected:
-  virtual int get_credentials(OssCredentials &out_creds, time_t &expiration) {
+  virtual int get_credentials(ObjCredentials &out_creds, time_t &expiration) {
     return -ENOSYS;
   }
+
+  CredentialsInfo refresh_with_fixed_interval(CredentialsValidator validator);
+
+  bool is_credentials_changed(const ObjCredentials &new_creds,
+                              time_t new_expiration) const;
+
+  // 0 means use default expiration-based strategy.
+  const uint64_t refresh_interval_sec_ = 0;
+
+  // Current credentials for comparison.
+  ObjCredentials current_creds_;
+  time_t current_expiration_ = 0;
+  time_t last_refresh_time_ = 0;
 };
 
 CredentialsProvider *new_ram_role_creds_provider(std::string_view ram_role);
-CredentialsProvider *new_process_creds_provider(std::string_view process_cmd);
+CredentialsProvider *new_process_creds_provider(
+    std::string_view process_cmd, uint64_t refresh_interval_sec = 0);
 
 };  // namespace OssFileSystem

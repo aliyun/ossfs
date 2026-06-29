@@ -20,6 +20,7 @@
 #include <limits.h>
 #include <photon/thread/thread.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -251,40 +252,51 @@ void set_default_logger_output_to_ossfs_log_file(int log_level) {
 __attribute__((constructor)) static void __initial_timezone() {
   tzset();
 }
-static time_t dayid = 0, minuteid = -1, tsdelta = 0;
-static struct tm olog_time = {0};
-static struct tm *olog_update_time(time_t now0) {
-  auto now = now0 + tsdelta;
-  int sec = now % 60;
-  now /= 60;
-  if (unlikely(now != minuteid)) {  // calibrate wall time every minute
-    now = time(0) - timezone;
-    tsdelta = now - now0;
-    sec = now % 60;
-    now /= 60;
-    minuteid = now;
+
+struct OssfsTM : tm {
+  uint64_t tsdelta = 0;
+  uint32_t dayid = -1, minuteid = -1, tm_usec;
+  OssfsTM() : tm{0} {}
+
+  template <typename T>
+  T cut(T &x, uint64_t mod) {
+    T r = x % mod;
+    x /= mod;
+    return r;
   }
-  int min = now % 60;
-  now /= 60;
-  int hor = now % 24;
-  now /= 24;
-  if (now != dayid) {
-    dayid = now;
-    auto now_ = now0 + tsdelta;
-    gmtime_r(&now_, &olog_time);
-    olog_time.tm_year += 1900;
-    olog_time.tm_mon++;
-  } else {
-    olog_time.tm_sec = sec;
-    olog_time.tm_min = min;
-    olog_time.tm_hour = hor;
+
+  void update(uint64_t now0) {
+    auto now = now0 + tsdelta;
+    tm_usec = cut(now, 1000000ul);
+    time_t ts = now;
+    tm_sec = cut(now, 60);
+    if (unlikely(now != minuteid)) {  // calibrate wall time every minute
+      struct timeval tv;
+      gettimeofday(&tv, NULL);
+      tv.tv_sec -= timezone;
+      now = tv.tv_sec * 1000000ul + tv.tv_usec;
+      tsdelta = now - now0;
+      tm_usec = tv.tv_usec;
+      now = ts = tv.tv_sec;
+      tm_sec = cut(now, 60);
+      minuteid = now;
+    }
+    tm_min = cut(now, 60);
+    tm_hour = cut(now, 24);
+    if (unlikely(now != dayid)) {
+      dayid = now;
+      gmtime_r(&ts, this);
+      tm_year += 1900;
+      tm_mon++;
+    }
   }
-  return &olog_time;
-}
+};
+
+static thread_local OssfsTM ossfs_alog_time;
 
 LogBuffer &operator<<(LogBuffer &log, const OssfsPrologue &pro) {
-  auto ts = photon::__update_now();
-  auto t = olog_update_time(ts.sec());
+  ossfs_alog_time.update(photon::__update_now());
+  const auto t = &ossfs_alog_time;
 
 #define DEC_W2P0(x) DEC(x).width(2).padding('0')
   log.printf(t->tm_year, '/');
@@ -293,12 +305,13 @@ LogBuffer &operator<<(LogBuffer &log, const OssfsPrologue &pro) {
   log.printf(DEC_W2P0(t->tm_hour), ':');
   log.printf(DEC_W2P0(t->tm_min), ':');
   log.printf(DEC_W2P0(t->tm_sec), '.');
-  log.printf(DEC(ts.usec()).width(6).padding('0'));
+  log.printf(DEC(t->tm_usec).width(6).padding('0'));
 
-  static const char levels[] =
-      "|DEBUG|th=|INFO |th=|WARN |th=|ERROR|th=|FATAL|th=|TEMP |th=|AUDIT|th=";
+  static const char levels[] = "|DEBUG|INFO |WARN |ERROR|FATAL|TEMP |AUDIT";
+  static const pid_t pid = getpid();
   log.level = pro.level;
-  log.printf(ALogString(&levels[pro.level * 10], 10));
+  log.printf(ALogString(&levels[pro.level * 6], 6));
+  log.printf("|pid=", pid, "|th=");
   log.printf(photon::CURRENT, '|');
   if (pro.level != ALOG_AUDIT) {
     log.printf(ALogString(pro.addr_file, pro.len_file), ':');

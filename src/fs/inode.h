@@ -33,9 +33,9 @@
 #include <shared_mutex>
 #include <string>
 
+#include "cache.h"
 #include "common/logger.h"
 #include "common/macros.h"
-#include "mem_cache.h"
 
 namespace OssFileSystem {
 
@@ -192,21 +192,16 @@ struct FileInode final : public Inode {
 
   std::string etag;
 
-  std::shared_ptr<BlockCacheManager> cache_manager;
+  std::shared_ptr<ICache> cache;
 
   FileInode(uint64_t file_ino, std::string_view file_name, uint64_t file_size,
             struct timespec file_mtime, InodeType type, bool is_dirty,
-            uint64_t parent_id, Inode *parent_node, std::string_view etag,
-            bool bind_cache, size_t cache_block_size)
+            uint64_t parent_id, Inode *parent_node, std::string_view etag)
       : Inode(file_ino, file_name, file_size, file_mtime, type, parent_id,
               parent_node),
         is_dirty(is_dirty),
         invalidate_data_cache(false),
-        etag(etag) {
-    if (bind_cache) {
-      cache_manager = std::make_shared<BlockCacheManager>(cache_block_size);
-    }
-  }
+        etag(etag) {}
 
   bool is_attr_valid(uint64_t timeout) const override {
     if (is_dirty) return true;
@@ -240,10 +235,6 @@ struct DirInode final : public Inode {
   void add_child_node_directly(Inode *inode);
   Inode *find_child_node(std::string_view name) const;
   void erase_child_node(std::string_view name, const uint64_t noid);
-
-  void invalidate_kernel_readdir_cache() {
-    kernel_readdir_cache_time = {};
-  }
 
   bool is_kernel_readdir_cache_valid(int64_t timeout) const {
     auto elapsed =
@@ -283,24 +274,6 @@ struct DentryView {
   uint64_t parent;
   uint64_t nodeid;
   std::string_view name;
-};
-
-class InodeManager {
- public:
-  static void init(uint64_t nodeid) {
-    g_nodeid_.store(nodeid);
-  }
-
-  static uint64_t next() {
-    return ++g_nodeid_;
-  }
-
-  static uint64_t get() {
-    return g_nodeid_.load();
-  }
-
- private:
-  static std::atomic<uint64_t> g_nodeid_;
 };
 
 inline std::string inode_number_to_string(uint64_t inode) {

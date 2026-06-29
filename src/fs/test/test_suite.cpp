@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "fs/id_manager.h"
+
 // for oss client
 DEFINE_string(oss_endpoint, "", "");
 DEFINE_string(oss_bucket, "", "");
@@ -32,6 +34,10 @@ DEFINE_uint64(oss_request_timeout_ms, 32000, "oss request timeout");
 
 DEFINE_bool(write_with_fuse_bufvec, true, "");
 
+DEFINE_string(disk_cache_dir, "/root/tmp/ossfs2/cache", "disk cache dir");
+DEFINE_string(disk_cache_io_engine, "random", "disk cache io engine");
+DEFINE_string(http_proxy, "", "");
+
 const std::string kOssMetaStorageClass = "X-Oss-Storage-Class";
 const std::string kOssSCStandard = "Standard";
 const std::string kOssSCIA = "IA";
@@ -40,6 +46,18 @@ const std::string kOssSCColdArchive = "ColdArchive";
 const std::string kOssSCDeepColdArchive = "DeepColdArchive";
 
 const std::string kUserAgentPrefix = "InvalidRamrole";
+
+int random_disk_cache_io_engine(int specified_engine) {
+  if (specified_engine == -1) {
+    std::string engine = FLAGS_disk_cache_io_engine;
+    if (engine == "random") {
+      engine = (rand() % 2 == 0) ? "psync" : "libaio";
+    }
+    specified_engine = (engine == "psync") ? photon::fs::ioengine_psync
+                                           : photon::fs::ioengine_libaio;
+  }
+  return specified_engine;
+}
 
 std::string random_string(int length) {
   static std::string charset =
@@ -135,18 +153,23 @@ void Ossfs2TestSuite::TearDown() {
 }
 
 void Ossfs2TestSuite::init(OssFsOptions fs_opts, int max_list_ret,
-                           std::string bind_ips, bool preserve_input_options) {
-  ASSERT_EQ(fs_opts.cache_type, CacheType::kFhCache);
-  ASSERT_EQ(do_init(fs_opts, max_list_ret, bind_ips, preserve_input_options),
+                           std::string bind_ips, bool preserve_input_options,
+                           int disk_cache_io_engine) {
+  ASSERT_EQ(do_init(fs_opts, max_list_ret, bind_ips, preserve_input_options,
+                    disk_cache_io_engine),
             0);
 }
 
 int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
-                             std::string bind_ips,
-                             bool preserve_input_options) {
+                             std::string bind_ips, bool preserve_input_options,
+                             int disk_cache_io_engine) {
   std::string endpoint = FLAGS_oss_endpoint;
   std::string bucket = FLAGS_oss_bucket;
   std::string prefix = FLAGS_oss_bucket_prefix;
+  // Normalize prefix: strip one leading and one trailing slash (same as
+  // main.cpp).
+  if (!prefix.empty() && prefix.front() == '/') prefix.erase(0, 1);
+  if (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
   std::string accessKeyId = FLAGS_oss_access_key_id;
   std::string accessKeySecret = FLAGS_oss_access_key_secret;
   auto timeout_ms = FLAGS_oss_request_timeout_ms;
@@ -158,7 +181,7 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
   }
 
   bool use_list_obj_v2 = rand() % 2;
-  bg_vcpu_env_.bg_oss_client_env = new OssFileSystem::BGVCpuOssClientEnv;
+  bg_vcpu_env_.bg_obj_store_env = new OssFileSystem::BGVCpuObjStoreEnv;
   int vcpu_num = rand() % 4 + 1;
   LOG_INFO("create ` background vcpu oss client", vcpu_num);
 
@@ -169,8 +192,8 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
 
     auto executor = new photon::Executor(
         OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {}, EXECUTOR_QUEUE_OPTION);
-    auto oss_client = executor->perform([&]() {
-      OssFileSystem::OssAdapterOptions options;
+    auto obj_store = executor->perform([&]() {
+      OssFileSystem::ObjStoreOptions options;
       if (max_list_ret != -1) {
         options.max_list_ret_cnt = max_list_ret;
       }
@@ -206,20 +229,57 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
       options.use_list_obj_v2 = use_list_obj_v2;
       options.use_auth_cache = rand() % 2;
       options.enable_symlink = fs_opts.enable_symlink;
+      options.proxy = FLAGS_http_proxy;
       oss_options_ = options;
-      return new_oss_client(accessKeyId.c_str(), accessKeySecret.c_str(),
-                            oss_options_);
+      return new_oss_store(accessKeyId.c_str(), accessKeySecret.c_str(),
+                           oss_options_);
     });
 
-    bg_vcpu_env_.bg_oss_client_env->add_oss_client_env(executor, oss_client);
+    bg_vcpu_env_.bg_obj_store_env->add_obj_store_env(executor, obj_store);
   }
 
-  if (!preserve_input_options) {
-    fs_opts.bind_cache_to_inode = rand() % 2;
+  if (fs_opts.cache_type == CacheType::kDiskCache) {
+    fs_opts.share_fd_read_buffer = true;
+    std::filesystem::remove_all(FLAGS_disk_cache_dir);
+    sigset_t oldset;
+    int bas = block_all_signal(&oldset);
+    DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
+
+    int io_engine_type = random_disk_cache_io_engine(disk_cache_io_engine);
+    uint64_t photon_io_init = photon::INIT_IO_NONE;
+    if (io_engine_type == photon::fs::ioengine_libaio) {
+      LOG_INFO("Using libaio IO engine");
+      photon_io_init = photon::INIT_IO_LIBAIO;
+    }
+
+    auto bg_disk_cache_env = new OssFileSystem::BGVCpuDiskCacheEnv();
+    auto executor =
+        new photon::Executor(OSSFS_EVENT_ENGINE, photon_io_init,
+                             LIBAIO_PHOTON_OPTION, EXECUTOR_QUEUE_OPTION);
+    bg_disk_cache_env->set_executor(executor);
+
+    OssFileSystem::DiskCacheOptions cache_opts(FLAGS_disk_cache_dir, 1,
+                                               1024 * 1024, io_engine_type);
+    int r = bg_disk_cache_env->init(cache_opts);
+    if (r != 0) {
+      LOG_ERROR("Failed to init bg disk cache env.");
+      return r;
+    }
+    bg_vcpu_env_.bg_disk_cache_env = bg_disk_cache_env;
+  } else if (fs_opts.cache_type == CacheType::kFhCache) {
+    if (!preserve_input_options) {
+      fs_opts.share_fd_read_buffer = rand() % 2;
+    }
+  } else {
+    std::abort();
   }
-  LOG_INFO("bind_cache_to_inode is: `",
-           fs_opts.bind_cache_to_inode ? "enabled" : "disabled");
-  fs_ = new AuditableOssFs(fs_opts, bg_vcpu_env_);
+  LOG_INFO("share_fd_read_buffer is: `",
+           fs_opts.share_fd_read_buffer ? "enabled" : "disabled");
+
+  auto id_manager = OssFileSystem::create_heap_id_manager();
+  if (id_manager == nullptr) return -1;
+
+  fs_ = new AuditableOssFs(fs_opts, bg_vcpu_env_, std::move(id_manager));
   root_nodeid_ = fs_->mp_inode_->nodeid;
 
   return fs_->init();
@@ -227,7 +287,8 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
 
 void Ossfs2TestSuite::destroy() {
   if (fs_) delete fs_;
-  if (bg_vcpu_env_.bg_oss_client_env) delete bg_vcpu_env_.bg_oss_client_env;
+  if (bg_vcpu_env_.bg_obj_store_env) delete bg_vcpu_env_.bg_obj_store_env;
+  if (bg_vcpu_env_.bg_disk_cache_env) delete bg_vcpu_env_.bg_disk_cache_env;
 }
 
 void Ossfs2TestSuite::remount() {
@@ -545,7 +606,6 @@ ssize_t Ossfs2TestSuite::read_file_in_folder(uint64_t parent,
   uint64_t nodeid = 0;
   int r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
   if (r < 0) return r;
-
   DEFER(fs_->forget(nodeid, 1));
 
   void *handle = nullptr;
@@ -606,8 +666,8 @@ ssize_t Ossfs2TestSuite::write_with_fuse_bufvec(void *fh, const char *buf,
     return -1;
   }
   DEFER({
-    close(pipe_fd[0]);
-    close(pipe_fd[1]);
+    if (pipe_fd[0] >= 0) close(pipe_fd[0]);
+    if (pipe_fd[1] >= 0) close(pipe_fd[1]);
   });
 
   struct fuse_bufvec buf_vec;
@@ -630,7 +690,9 @@ ssize_t Ossfs2TestSuite::write_with_fuse_bufvec(void *fh, const char *buf,
   ssize_t r1 = fs_->write_buf(get_nodeid_from_handle(fh), fh, &buf_vec, offset);
   if (r1 < 0) {
     close(pipe_fd[0]);
+    pipe_fd[0] = -1;
     close(pipe_fd[1]);
+    pipe_fd[1] = -1;
     writer.get();
     return r1;
   }
@@ -797,6 +859,7 @@ int Ossfs2TestSuite::create_dir(const std::string &target,
         FLAGS_oss_access_key_secret + " -e " + FLAGS_oss_endpoint +
         " mkdir \"oss://" + FLAGS_oss_bucket + "/" + osspath + "\"";
 
+  LOG_DEBUG("mkdir: `, cmd: `", target, cmd);
   int r;
   if ((r = system(cmd.c_str())) != 0) {
     LOG_ERROR("Fail to mkdir: `", target);

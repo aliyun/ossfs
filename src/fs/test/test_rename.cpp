@@ -210,7 +210,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
       // we are listing all the objects with old_path/ specified as both prefix
       auto old_files_base = join_paths(parent_path, old_dir_name);
       old_files_base = join_paths(old_files_base, subdir_name);
-      r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
+      r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants,
                                          old_files_base, list_results);
       ASSERT_EQ(r, 0);
       ASSERT_SIZE_EQ(list_results.size(), file_cnt);
@@ -223,7 +223,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
       list_results.clear();
 
       bool is_dirobj = false;
-      r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
+      r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants,
                                          old_files_base, list_results, nullptr,
                                          &is_dirobj);
       ASSERT_EQ(r, 0);
@@ -232,7 +232,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
 
       auto new_files_base = join_paths(parent_path, new_dir_name);
       new_files_base = join_paths(new_files_base, subdir_name);
-      r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
+      r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants,
                                          new_files_base, list_results);
       ASSERT_EQ(r, 0);
       ASSERT_SIZE_EQ(list_results.size(), file_cnt);
@@ -439,7 +439,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     }
 
     r = fs_->rename(parent, "test_dir", parent, "new_test_dir", 0);
-    ASSERT_EQ(r, -EMFILE);
+    ASSERT_EQ(r, -E2BIG);
 
     uint64_t file_nodeid = 0;
     r = fs_->lookup(dir_nodeid, file_names[0].c_str(), &file_nodeid, &st);
@@ -867,8 +867,8 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
 
     std::vector<std::string> list_results;
     auto dst_dir_path = join_paths(parent_path, "test_dir_partial_dst");
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
-                                       dst_dir_path, list_results);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants, dst_dir_path,
+                                       list_results);
     ASSERT_EQ(r, 0);
     ASSERT_SIZE_EQ(list_results.size(), file_cnt);
 
@@ -883,14 +883,14 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
                     0);
     ASSERT_EQ(r, 0);
     list_results.clear();
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
-                                       dst_dir_path, list_results);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants, dst_dir_path,
+                                       list_results);
     ASSERT_EQ(r, 0);
     ASSERT_SIZE_EQ(list_results.size(), 0);
 
     dst_dir_path = join_paths(parent_path, "test_dir_full_dst");
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
-                                       dst_dir_path, list_results);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants, dst_dir_path,
+                                       list_results);
     ASSERT_EQ(r, 0);
     ASSERT_SIZE_EQ(list_results.size(), file_cnt);
 

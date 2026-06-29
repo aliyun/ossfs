@@ -190,6 +190,20 @@ static bool validate_credential_process(const char *flagname,
 
 DEFINE_validator(credential_process, &validate_credential_process);
 
+DEFINE_OPTION(credential_refresh_interval, uint64, 0,
+              "Credential refresh interval in seconds (0 means use default "
+              "expiration-based strategy)",
+              kOssCredentialsOptions, false, false);
+
+static bool validate_credential_refresh_interval(const char *flagname,
+                                                 uint64_t value) {
+  // At most 1 day.
+  return value <= 86400;
+}
+
+DEFINE_validator(credential_refresh_interval,
+                 &validate_credential_refresh_interval);
+
 // ==================== Caching options ====================
 DEFINE_OPTION(attr_timeout, uint64, 60, "Attribute cache timeout in seconds",
               kCachingOptions, false, false);
@@ -254,6 +268,46 @@ DEFINE_OPTION(
     kCachingOptions, false, false);
 
 DEFINE_validator(memory_data_cache_size, &validate_bytes_string);
+
+DEFINE_OPTION(share_fd_read_buffer, bool, true, "Enable shared fd read buffer",
+              kCachingOptions, true, true);
+
+DEFINE_OPTION(
+    disk_data_cache_dir, string, "",
+    "The directory for disk data cache. NOTICE: Directory must be empty",
+    kCachingOptions, true, true);
+
+DEFINE_OPTION(disk_data_cache_size, string, "0",
+              "The capacity for disk data cache. Value should be aligned "
+              "to GiB",
+              kCachingOptions, true, true);
+static bool validate_disk_data_cache_size(const char *flagname,
+                                          const std::string &value) {
+  auto size = parse_bytes_string(value);
+  if (!size.has_value()) return false;
+  return size.value() % (1ULL << 30) == 0;
+}
+DEFINE_validator(disk_data_cache_size, &validate_disk_data_cache_size);
+
+DEFINE_OPTION(disk_data_cache_io_engine, string, "psync",
+              "IO engine for disk data cache: libaio or psync", kCachingOptions,
+              true, true);
+static bool validate_disk_data_cache_io_engine(const char *flagname,
+                                               const std::string &value) {
+  return value == "libaio" || value == "psync";
+}
+DEFINE_validator(disk_data_cache_io_engine,
+                 &validate_disk_data_cache_io_engine);
+
+DEFINE_OPTION(disk_available_space, string, "1G",
+              "Available space threshold for disk (default 1G)",
+              kCachingOptions, true, true);
+static bool validate_disk_available_space(const char *flagname,
+                                          const std::string &value) {
+  auto size = parse_bytes_string(value);
+  return size.has_value() && size.value() > 0;
+}
+DEFINE_validator(disk_available_space, &validate_disk_available_space);
 
 // ==================== Oss Client Options ====================
 DEFINE_OPTION(upload_buffer_size, string, "8388608", "Upload buffer size",
@@ -439,3 +493,8 @@ DEFINE_OPTION(enable_test_signal_handler, bool, false,
 
 DEFINE_OPTION(enable_admin_server, bool, true, "Enable admin server",
               kAdvancedOptions, true, true);
+
+DEFINE_OPTION(fuse_device_fd, int32, -1,
+              "Pre-opened FUSE device file descriptor for unprivileged launch"
+              "-1 means ossfs2 opens /dev/fuse itself",
+              kAdvancedOptions, false, false);
