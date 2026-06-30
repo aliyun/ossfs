@@ -141,6 +141,7 @@ class S3fsCurl
         static bool             is_content_md5;
         static bool             is_verbose;
         static bool             is_dump_body;
+        static bool             is_follow_location;
         static S3fsCred*        ps3fscred;
         static long             ssl_verify_hostname;
         static curltime_t       curl_times;
@@ -314,6 +315,8 @@ class S3fsCurl
         static bool IsSetSseCMK() { return S3fsCurl::is_sse_cmk; }
         static bool SetVerbose(bool flag);
         static bool GetVerbose() { return S3fsCurl::is_verbose; }
+        static bool SetFollowLocation(bool flag);
+        static bool GetFollowLocation() { return S3fsCurl::is_follow_location; }
         static bool SetDumpBody(bool flag);
         static bool IsDumpBody() { return S3fsCurl::is_dump_body; }
         static long SetSslVerifyHostname(long value);

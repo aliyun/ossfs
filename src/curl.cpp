@@ -98,6 +98,7 @@ bool             S3fsCurl::is_sse_cmk          = false; // use the default custo
 bool             S3fsCurl::is_content_md5      = false;
 bool             S3fsCurl::is_verbose          = false;
 bool             S3fsCurl::is_dump_body        = false;
+bool             S3fsCurl::is_follow_location  = false;
 S3fsCred*        S3fsCurl::ps3fscred           = NULL;
 long             S3fsCurl::ssl_verify_hostname = 1;    // default(original code...)
 
@@ -1004,6 +1005,13 @@ bool S3fsCurl::SetVerbose(bool flag)
 {
     bool old = S3fsCurl::is_verbose;
     S3fsCurl::is_verbose = flag;
+    return old;
+}
+
+bool S3fsCurl::SetFollowLocation(bool flag)
+{
+    bool old = S3fsCurl::is_follow_location;
+    S3fsCurl::is_follow_location = flag;
     return old;
 }
 
@@ -2137,6 +2145,9 @@ bool S3fsCurl::RemakeHandle()
             if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
                 return false;
             }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_FOLLOWLOCATION, S3fsCurl::is_follow_location)){
+                return false;
+            }
             break;
 
         case REQTYPE_LISTBUCKET:
@@ -2147,6 +2158,9 @@ bool S3fsCurl::RemakeHandle()
                 return false;
             }
             if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+                return false;
+            }
+            if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_FOLLOWLOCATION, S3fsCurl::is_follow_location)){
                 return false;
             }
             break;
@@ -3483,6 +3497,9 @@ int S3fsCurl::CheckBucket(const char* check_path)
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
         return -EIO;
     }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_FOLLOWLOCATION, S3fsCurl::is_follow_location)){
+        return -EIO;
+    }
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UNRESTRICTED_AUTH, 1L)){
         return -EIO;
     }
@@ -3491,6 +3508,31 @@ int S3fsCurl::CheckBucket(const char* check_path)
     }
 
     int result = RequestPerform();
+
+    // Log network phase timing for startup diagnostics
+    double dns_time = 0, connect_time = 0, appconnect_time = 0, starttransfer_time = 0, total_time = 0;
+    curl_easy_getinfo(hCurl, CURLINFO_NAMELOOKUP_TIME, &dns_time);
+    curl_easy_getinfo(hCurl, CURLINFO_CONNECT_TIME, &connect_time);
+    curl_easy_getinfo(hCurl, CURLINFO_APPCONNECT_TIME, &appconnect_time);
+    curl_easy_getinfo(hCurl, CURLINFO_STARTTRANSFER_TIME, &starttransfer_time);
+    curl_easy_getinfo(hCurl, CURLINFO_TOTAL_TIME, &total_time);
+
+    // appconnect_time is 0 when no SSL handshake occurs (plain HTTP)
+    if(appconnect_time > 0){
+        S3FS_PRN_WARN("CheckBucket network timing: dns=%.1fms, tcp_connect=%.1fms, ssl_handshake=%.1fms, send_to_first_byte=%.1fms, total=%.1fms",
+                      dns_time * 1000.0,
+                      (connect_time - dns_time) * 1000.0,
+                      (appconnect_time - connect_time) * 1000.0,
+                      (starttransfer_time - appconnect_time) * 1000.0,
+                      total_time * 1000.0);
+    }else{
+        S3FS_PRN_WARN("CheckBucket network timing: dns=%.1fms, tcp_connect=%.1fms, ssl_handshake=none, send_to_first_byte=%.1fms, total=%.1fms",
+                      dns_time * 1000.0,
+                      (connect_time - dns_time) * 1000.0,
+                      (starttransfer_time - connect_time) * 1000.0,
+                      total_time * 1000.0);
+    }
+
     if (result != 0) {
         S3FS_PRN_ERR("Check bucket failed, OSS response: %s", bodydata.c_str());
     }
@@ -3533,6 +3575,9 @@ int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
         return -EIO;
     }
     if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_FOLLOWLOCATION, S3fsCurl::is_follow_location)){
         return -EIO;
     }
     if(S3fsCurl::is_verbose){
