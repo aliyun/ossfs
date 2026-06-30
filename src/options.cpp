@@ -275,12 +275,12 @@ DEFINE_OPTION(share_fd_read_buffer, bool, true, "Enable shared fd read buffer",
 DEFINE_OPTION(
     disk_data_cache_dir, string, "",
     "The directory for disk data cache. NOTICE: Directory must be empty",
-    kCachingOptions, true, true);
+    kCachingOptions, false, false);
 
 DEFINE_OPTION(disk_data_cache_size, string, "0",
               "The capacity for disk data cache. Value should be aligned "
               "to GiB",
-              kCachingOptions, true, true);
+              kCachingOptions, false, false);
 static bool validate_disk_data_cache_size(const char *flagname,
                                           const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -291,7 +291,7 @@ DEFINE_validator(disk_data_cache_size, &validate_disk_data_cache_size);
 
 DEFINE_OPTION(disk_data_cache_io_engine, string, "psync",
               "IO engine for disk data cache: libaio or psync", kCachingOptions,
-              true, true);
+              false, false);
 static bool validate_disk_data_cache_io_engine(const char *flagname,
                                                const std::string &value) {
   return value == "libaio" || value == "psync";
