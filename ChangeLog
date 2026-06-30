@@ -1,5 +1,10 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.11 (30/06/2026)
+ - Remove redundant bucket-checking on mounting.
+ - Add time cost statistics in mounting process.
+ - Disable CURLOPT_FOLLOWLOCATION for OSS signature V1 for security.
+
 ## v1.91.10 (31/03/2026)
  - Release ossfs of Alibaba Cloud Linux 3(aarch64).
  - Switch the main branch to main-v1.

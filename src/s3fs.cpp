@@ -3767,18 +3767,38 @@ static int s3fs_check_service()
 {
     S3FS_PRN_INFO("check services.");
 
+    struct timespec ts_start, ts_end;
+    long load_iam_role_ms = 0, check_iam_cred_ms = 0, check_bucket_ms = 0;
+
+    auto timespec_diff_ms = [](const struct timespec& end, const struct timespec& start) -> long {
+        long sec_diff  = static_cast<long>(end.tv_sec - start.tv_sec);
+        long nsec_diff = end.tv_nsec - start.tv_nsec;
+        if(nsec_diff < 0){
+            sec_diff--;
+            nsec_diff += 1000000000L;
+        }
+        return sec_diff * 1000L + nsec_diff / 1000000L;
+    };
+
     // check loading IAM role name
+    clock_gettime(S3FS_CLOCK_MONOTONIC, &ts_start);
     if(!ps3fscred->LoadIAMRoleFromMetaData()){
         S3FS_PRN_EXIT("could not load RAM role name from instance meta data.");
         return EXIT_FAILURE;
     }
+    clock_gettime(S3FS_CLOCK_MONOTONIC, &ts_end);
+    load_iam_role_ms = timespec_diff_ms(ts_end, ts_start);
 
     // At first time for access OSS, we check IAM role if it sets.
+    clock_gettime(S3FS_CLOCK_MONOTONIC, &ts_start);
     if(!ps3fscred->CheckIAMCredentialUpdate()){
         S3FS_PRN_EXIT("Failed to initialize RAM credential.");
         return EXIT_FAILURE;
     }
+    clock_gettime(S3FS_CLOCK_MONOTONIC, &ts_end);
+    check_iam_cred_ms = timespec_diff_ms(ts_end, ts_start);
 
+    clock_gettime(S3FS_CLOCK_MONOTONIC, &ts_start);
     S3fsCurl s3fscurl;
     int      res;
     if(0 > (res = s3fscurl.CheckBucket(get_realpath("/").c_str()))){
@@ -3895,7 +3915,13 @@ static int s3fs_check_service()
         }
     }
     S3FS_MALLOCTRIM(0);
-    
+
+    clock_gettime(S3FS_CLOCK_MONOTONIC, &ts_end);
+    check_bucket_ms = timespec_diff_ms(ts_end, ts_start);
+
+    S3FS_PRN_WARN("Startup service check timing: LoadIAMRole=%ldms, CheckIAMCredential=%ldms, CheckBucket=%ldms",
+                  load_iam_role_ms, check_iam_cred_ms, check_bucket_ms);
+
     return EXIT_SUCCESS;
 }
 
@@ -4719,6 +4745,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
             S3fsLog::SetLogLevel(S3fsLog::LEVEL_DBG);
             return 0;
         }
+        if(0 == strcmp(arg, "curl_follow_location")){
+            S3fsCurl::SetFollowLocation(true);
+            return 0;
+        }
         if(0 == strcmp(arg, "curldbg")){
             S3fsCurl::SetVerbose(true);
             return 0;
@@ -4985,6 +5015,10 @@ int main(int argc, char* argv[])
 
     if (S3fsCurl::GetSignatureType() != V4_ONLY) {
       printf("[NOTICE] OSS signature V1 service will not be available in the near future. It is recommended to mount with OSS signature V4:\n\t ossfs [oss-bucket] [mount-path] [options] -osigv4 -oregion=[your-region-id]\n");
+    }
+
+    if (S3fsCurl::GetSignatureType() != V1_ONLY) {
+        S3fsCurl::SetFollowLocation(true);
     }
 
     // init mime types for curl
