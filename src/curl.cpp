@@ -1332,7 +1332,7 @@ int S3fsCurl::ParallelMixMultipartUploadRequest(const char* tpath, headers_t& me
         return -errno;
     }
 
-    if(0 != (result = s3fscurl.PreMultipartPostRequest(tpath, meta, upload_id, true))){
+    if(0 != (result = s3fscurl.PreMultipartPostRequest(tpath, meta, upload_id, false))){
         close(fd2);
         return result;
     }
