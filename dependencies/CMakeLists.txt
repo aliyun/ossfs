@@ -1,13 +1,13 @@
 set(PRE_BUILT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/pre-built)
 
 # process PhotonLibOS
-set(PHOTONLIBOS_REF 8c46b4e3 CACHE STRING "PhotonLibOS git ref" FORCE)
+set(PHOTONLIBOS_REF 2bebdafb CACHE STRING "PhotonLibOS git ref" FORCE)
 if (${ARCH} STREQUAL x86_64)
   set(PHOTONLIBOS_URL file://${PRE_BUILT_DIR}/PhotonLibOS/PhotonLibOS-${PHOTONLIBOS_REF}-linux-x86_64.tar.gz)
-  set(PHOTONLIBOS_HASH MD5=1fdb90c629da4eeaeeb4e2d1d7fdbe93)
+  set(PHOTONLIBOS_HASH MD5=9e682eebd50055cf9b27d77cf6c57200)
 elseif (${ARCH} STREQUAL aarch64)
   set(PHOTONLIBOS_URL file://${PRE_BUILT_DIR}/PhotonLibOS/PhotonLibOS-${PHOTONLIBOS_REF}-linux-aarch64.tar.gz)
-  set(PHOTONLIBOS_HASH MD5=de4f86397c63d64c1128743064dbfc75)
+  set(PHOTONLIBOS_HASH MD5=5e0614ab3f6413048c6ba3ea7acb8930)
 endif ()
 
 ExternalProject_Add(PhotonLibOS
