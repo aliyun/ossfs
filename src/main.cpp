@@ -20,6 +20,7 @@
 #include <photon/io/signal.h>
 #include <pwd.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -38,10 +39,12 @@
 #include "fs/fs.h"
 #include "fuse_adapter_ll.h"
 #include "options.h"
-#include "oss/oss_adapter.h"
+#include "oss/oss_store.h"
 
 #define EXECUTOR_QUEUE_OPTION \
   { 16, 1024 }
+#define LIBAIO_PHOTON_OPTION \
+  { 128 }
 
 #define DEV_STDOUT "/dev/stdout"
 #define LOG_FILE_PREFIX "ossfs2.log"
@@ -78,24 +81,40 @@ std::tuple<std::string, std::string> get_oss_credentials() {
   return std::make_tuple(FLAGS_oss_access_key_id, FLAGS_oss_access_key_secret);
 }
 
-static OssFileSystem::OssAdapter *create_oss_client(
+// Build the fsname shown in `mount` output.
+// Format: bucket.endpoint:/prefix
+static std::string build_fsname(const std::string &bucket,
+                                const std::string &endpoint,
+                                const std::string &prefix) {
+  std::string_view ep = endpoint;
+  if (ep.substr(0, 8) == "https://") {
+    ep = ep.substr(8);
+  } else if (ep.substr(0, 7) == "http://") {
+    ep = ep.substr(7);
+  }
+  auto is_slash = [](char c) { return c == '/'; };
+  ep = trim_string_view(ep, is_slash);
+  return bucket + "." + ep + ":/" + prefix;
+}
+
+static OssFileSystem::IObjStore *create_obj_store(
     photon::Executor *eth, const std::string &access_key_id,
     const std::string &access_key_secret,
-    const OssFileSystem::OssAdapterOptions &options) {
+    const OssFileSystem::ObjStoreOptions &options) {
   return eth->perform([&]() {
-    OssFileSystem::OssAdapter *ossfs = nullptr;
+    OssFileSystem::IObjStore *ossfs = nullptr;
 
-    ossfs = OssFileSystem::new_oss_client(access_key_id.c_str(),
-                                          access_key_secret.c_str(), options);
+    ossfs = OssFileSystem::new_oss_store(access_key_id.c_str(),
+                                         access_key_secret.c_str(), options);
 
     return ossfs;
   });
 }
 
-int create_background_oss_clients() {
+int create_background_obj_stores() {
   const std::string &endpoint = FLAGS_oss_endpoint;
   const std::string &bucket = FLAGS_oss_bucket;
-  std::string prefix = remove_prepend_backslash(FLAGS_oss_bucket_prefix);
+  std::string prefix = FLAGS_oss_bucket_prefix;
   auto [access_key_id, access_key_secret] = get_oss_credentials();
 
   if ((access_key_id.empty() || access_key_secret.empty()) &&
@@ -111,7 +130,7 @@ int create_background_oss_clients() {
     access_key_secret.clear();
   }
 
-  OssFileSystem::OssAdapterOptions options;
+  OssFileSystem::ObjStoreOptions options;
   options.max_list_ret_cnt = FLAGS_max_list_ret_count;
   options.use_list_obj_v2 = FLAGS_use_list_obj_v2;
   options.user_agent = kUserAgentPrefix + MACRO_STR(OSSFS_VERSION_ID);
@@ -130,7 +149,7 @@ int create_background_oss_clients() {
   int bas = block_all_signal(&oldset);
   DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
 
-  g_bg_vcpu_env.bg_oss_client_env = new OssFileSystem::BGVCpuOssClientEnv;
+  g_bg_vcpu_env.bg_obj_store_env = new OssFileSystem::BGVCpuObjStoreEnv;
 
   auto hw_concurrency = std::thread::hardware_concurrency();
   if (hw_concurrency > 0 &&
@@ -143,11 +162,61 @@ int create_background_oss_clients() {
   for (unsigned i = 0; i < FLAGS_oss_vcpu_count; i++) {
     auto executor = new photon::Executor(
         OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {}, EXECUTOR_QUEUE_OPTION);
-    auto oss_client =
-        create_oss_client(executor, access_key_id, access_key_secret, options);
-    g_bg_vcpu_env.bg_oss_client_env->add_oss_client_env(executor, oss_client);
+    auto obj_store =
+        create_obj_store(executor, access_key_id, access_key_secret, options);
+    g_bg_vcpu_env.bg_obj_store_env->add_obj_store_env(executor, obj_store);
   }
 
+  return 0;
+}
+
+static int create_background_disk_cache(OssFileSystem::OssFsOptions *fs_opts) {
+  uint64_t cache_size = parse_bytes_string(FLAGS_disk_data_cache_size).value();
+  if (cache_size < (1ULL << 30)) {
+    LOG_ERROR("Disk cache size must be at least 1GB, got ` bytes", cache_size);
+    return -1;
+  }
+
+  if (fs_opts->prefetch_concurrency == 0) {
+    LOG_ERROR("prefetch_concurrency must be greater than 0 for disk cache");
+    return -1;
+  }
+  fs_opts->cache_type = OssFileSystem::CacheType::kDiskCache;
+  fs_opts->share_fd_read_buffer = true;
+
+  sigset_t oldset;
+  int bas = block_all_signal(&oldset);
+  DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
+
+  static const rlim_t kNofileLimit = 1048576;
+  rlimit nofile_limit{.rlim_cur = kNofileLimit, .rlim_max = kNofileLimit};
+  if (setrlimit(RLIMIT_NOFILE, &nofile_limit) != 0) {
+    // If failed to set the open file limit, we use system default value and
+    // it will limit the bandwidth in small-file read scenarios.
+    LOG_WARN("Failed to set open file limit to 1048576, errno `", errno);
+  }
+
+  int io_engine_type = photon::fs::ioengine_libaio;
+  uint64_t photon_io_init = photon::INIT_IO_LIBAIO;
+  if (FLAGS_disk_data_cache_io_engine == "psync") {
+    io_engine_type = photon::fs::ioengine_psync;
+    photon_io_init = photon::INIT_IO_NONE;
+  }
+  auto bg_disk_cache_env = new OssFileSystem::BGVCpuDiskCacheEnv();
+  auto executor =
+      new photon::Executor(OSSFS_EVENT_ENGINE, photon_io_init,
+                           LIBAIO_PHOTON_OPTION, EXECUTOR_QUEUE_OPTION);
+  bg_disk_cache_env->set_executor(executor);
+
+  OssFileSystem::DiskCacheOptions cache_opts(
+      FLAGS_disk_data_cache_dir, cache_size >> 30, 1024 * 1024, io_engine_type,
+      parse_bytes_string(FLAGS_disk_available_space).value());
+  auto r = bg_disk_cache_env->init(cache_opts);
+  if (r != 0) {
+    delete bg_disk_cache_env;
+    return r;
+  }
+  g_bg_vcpu_env.bg_disk_cache_env = bg_disk_cache_env;
   return 0;
 }
 
@@ -208,10 +277,10 @@ static int adjust_fs_options_with_mem_limit(
         total_mem_limit);
   }
 
-  // at least 256MB
-  if (total_mem_limit < 256ULL * 1024 * 1024) {
-    LOG_WARN("total_mem_limit is too small, force set to 256MB");
-    total_mem_limit = 256ULL * 1024 * 1024;
+  const uint64_t kMinTotalMemLimit = 128ULL * 1024 * 1024;
+  if (total_mem_limit < kMinTotalMemLimit) {
+    LOG_WARN("total_mem_limit is too small, force set to 128MB");
+    total_mem_limit = kMinTotalMemLimit;
   }
 
   // use 64MB for threads
@@ -286,6 +355,7 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->set_mime_for_rename_dst = FLAGS_set_mime_for_rename_dst;
   fs_options->ram_role = FLAGS_ram_role;
   fs_options->credential_process = FLAGS_credential_process;
+  fs_options->credential_refresh_interval = FLAGS_credential_refresh_interval;
 
   mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
   fs_options->cache_refill_unit = fs_options->cache_block_size;
@@ -295,8 +365,9 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->memory_data_cache_size =
       parse_bytes_string(FLAGS_memory_data_cache_size).value();
 
+  fs_options->share_fd_read_buffer = FLAGS_share_fd_read_buffer;
   if (fs_options->memory_data_cache_size > 0) {
-    fs_options->bind_cache_to_inode = true;
+    fs_options->share_fd_read_buffer = true;
     if (fs_options->prefetch_concurrency == 0) {
       LOG_ERROR("prefetch_concurrency must be greater than 0.");
       return -EINVAL;
@@ -374,8 +445,6 @@ static void dump_mount_options() {
     }
   }
 
-  LOG_INFO("Ossfs2 version: `(`)", MACRO_STR(OSSFS_VERSION_ID),
-           std::string_view(MACRO_STR(OSSFS_COMMIT_ID)).substr(0, 8));
   LOG_INFO("Mount options: ");
 
   for (const auto &it : common_options) {
@@ -475,23 +544,35 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
                                      int pipefd) {
   init_logger();
 
+  LOG_INFO("Ossfs2 version: `(`)", MACRO_STR(OSSFS_VERSION_ID),
+           std::string_view(MACRO_STR(OSSFS_COMMIT_ID)).substr(0, 8));
+
   int err = -1;
   char completed = 1;
   struct fuse_session *session = nullptr;
   struct fuse_lowlevel_ops *fs_ops_ll;
   OssFileSystem::OssFsOptions fs_options;
-  OssFileSystem::OssFs *fs = nullptr;
-  std::thread *http_server_thread = nullptr;
+  std::unique_ptr<IFileSystemFuseLL> fs;
+  auto http_server_thread_deleter = [](std::thread *t) {
+    if (t) {
+      t->join();
+      delete t;
+    }
+  };
+  std::unique_ptr<std::thread, decltype(http_server_thread_deleter)>
+      http_server_thread(nullptr, http_server_thread_deleter);
   bool is_stopping = false;
+
+  auto mount_start = std::chrono::steady_clock::now();
 
   if (!SSLProbe::setup_ssl_env()) {
     LOG_WARN("Failed to get SSL certificate file");
   }
 
-  err = create_background_oss_clients();
+  err = create_background_obj_stores();
   if (err != 0) {
     LOG_ERROR(
-        "create_background_oss_clients failed, please check your oss config");
+        "create_background_obj_stores failed, please check your oss config");
     goto exit;
   }
 
@@ -505,53 +586,83 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
     goto exit;
   }
 
-  fs_options.mountpath = fuse_opts.mountpoint;
-  fs = new OssFileSystem::OssFs(fs_options, g_bg_vcpu_env);
-  if (fs == nullptr) {
-    LOG_ERROR("Failed to allocate OssFs object");
-    goto exit;
+  if (!FLAGS_disk_data_cache_dir.empty()) {
+    err = create_background_disk_cache(&fs_options);
+    if (err != 0) {
+      LOG_ERROR("Failed to initial disk cache, cache dir `, cache size `",
+                FLAGS_disk_data_cache_dir, FLAGS_disk_data_cache_size);
+      goto exit;
+    }
+    LOG_INFO("Enable disk cache, cache dir `, cache size `",
+             FLAGS_disk_data_cache_dir, FLAGS_disk_data_cache_size);
   }
 
-  err = fs->init();
-  if (err != 0) {
-    LOG_ERROR("Init OssFileSystem failed with error `", err);
-    completed = static_cast<char>(err);
-    goto exit;
+  {
+    auto oss_fs =
+        std::make_unique<OssFileSystem::OssFs>(fs_options, g_bg_vcpu_env);
+    auto t0 = std::chrono::steady_clock::now();
+    err = oss_fs->init();
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    LOG_INFO("[MountTiming] fs->init completed in ` us", elapsed);
+    if (err != 0) {
+      LOG_ERROR("Init OssFileSystem failed with error `", err);
+      completed = static_cast<char>(err);
+      goto exit;
+    }
+    fs = std::move(oss_fs);
   }
 
   if (FLAGS_metrics_port > 0) {
-    http_server_thread =
-        new std::thread([&]() { start_http_server(is_stopping); });
+    http_server_thread.reset(
+        new std::thread([&]() { start_http_server(is_stopping); }));
     LOG_INFO("http server started");
   }
 
   parse_fuse_options();
-  set_fuse_ll_fs(fs);
+  set_fuse_ll_fs(fs.get());
   fs_ops_ll = get_fuse_ll_oper();
 
-  if ((session = fuse_session_new(&args, fs_ops_ll,
-                                  sizeof(struct fuse_lowlevel_ops), fs)) ==
-      nullptr) {
-    LOG_ERROR("fuse_session_new failed with error: `", strerror(errno));
-    goto exit;
-  }
+  {
+    auto t0 = std::chrono::steady_clock::now();
+    if ((session = fuse_session_new(
+             &args, fs_ops_ll, sizeof(struct fuse_lowlevel_ops), fs.get())) ==
+        nullptr) {
+      LOG_ERROR("fuse_session_new failed with error: `", strerror(errno));
+      goto exit;
+    }
 
-  if (fuse_set_signal_handlers(session) != 0) {
-    LOG_ERROR("set_signal_handlers failed with error: `", strerror(errno));
-    goto sighandler_error;
-  }
-
-  if (FLAGS_enable_test_signal_handler) {
-    if (set_one_signal_handler(SIGUSR1, test_handler) != 0) {
-      LOG_ERROR("set_test_signal_handlers failed with error: `",
-                strerror(errno));
+    if (fuse_set_signal_handlers(session) != 0) {
+      LOG_ERROR("set_signal_handlers failed with error: `", strerror(errno));
       goto sighandler_error;
     }
+
+    if (FLAGS_enable_test_signal_handler) {
+      if (set_one_signal_handler(SIGUSR1, test_handler) != 0) {
+        LOG_ERROR("set_test_signal_handlers failed with error: `",
+                  strerror(errno));
+        goto sighandler_error;
+      }
+    }
+
+    if ((fuse_session_mount(session, fuse_opts.mountpoint)) != 0) {
+      LOG_ERROR("fuse_session_mount failed with error: `", strerror(errno));
+      goto mnt_error;
+    }
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    LOG_INFO("[MountTiming] fuse session setup and mount completed in ` us",
+             elapsed);
   }
 
-  if ((fuse_session_mount(session, fuse_opts.mountpoint)) != 0) {
-    LOG_ERROR("fuse_session_mount failed with error: `", strerror(errno));
-    goto mnt_error;
+  {
+    auto total_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - mount_start)
+                             .count();
+    LOG_INFO("[MountTiming] total mount time: ` us (from entry to mount ready)",
+             total_elapsed);
   }
 
   completed = 0;
@@ -564,7 +675,9 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
 
   err = fuse_session_loop_mt_with_photon(session, FLAGS_fuse_threads);
 
-  fuse_session_unmount(session);
+  if (FLAGS_fuse_device_fd < 0) {
+    fuse_session_unmount(session);
+  }
 
 mnt_error:
   fuse_remove_signal_handlers(session);
@@ -573,15 +686,13 @@ sighandler_error:
   fuse_session_destroy(session);
 
 exit:
-  if (fs) delete fs;
+  fs.reset();
   is_stopping = true;
 
-  if (http_server_thread) {
-    http_server_thread->join();
-    delete http_server_thread;
-  }
+  http_server_thread.reset();
 
-  if (g_bg_vcpu_env.bg_oss_client_env) delete g_bg_vcpu_env.bg_oss_client_env;
+  if (g_bg_vcpu_env.bg_obj_store_env) delete g_bg_vcpu_env.bg_obj_store_env;
+  if (g_bg_vcpu_env.bg_disk_cache_env) delete g_bg_vcpu_env.bg_disk_cache_env;
 
   if (!FLAGS_f) {
     write(pipefd, &completed, sizeof(completed));
@@ -605,11 +716,30 @@ static void log_exit_error(char r) {
   }
 
   if (!FLAGS_f) {
-    auto oss_path = join_paths(
-        FLAGS_oss_bucket, remove_prepend_backslash(FLAGS_oss_bucket_prefix));
+    auto oss_path = join_paths(FLAGS_oss_bucket, FLAGS_oss_bucket_prefix);
     printf("Mount oss://%s to %s successfully\n", oss_path.c_str(),
            g_mountpoint.c_str());
   }
+}
+
+// Check if a local directory is empty (contains only "." and "..").
+// Returns: 0 if empty, 1 if not empty, -1 on error (errno is set).
+static int check_dir_empty(const std::string &path) {
+  DIR *dh = opendir(path.c_str());
+  if (dh == nullptr) return -1;
+
+  int result = 0;
+  errno = 0;
+  struct dirent *ent;
+  while ((ent = readdir(dh)) != nullptr) {
+    if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+      result = 1;
+      break;
+    }
+  }
+  if (errno != 0) result = -1;
+  closedir(dh);
+  return result;
 }
 
 static int validate_log_dir(const std::string &mountpoint,
@@ -773,7 +903,7 @@ static void do_show_mount_help() {
 int main(int argc, char *argv[]) {
   int r = 0;
   bool stats_continue = false;
-  std::string mount_config = "", mountpoint, metrics_filter;
+  std::string mount_config, mountpoint, mountpoint_param, metrics_filter;
   bool show_version = false, show_mount_help = false;
   uint64_t pid = 0, interval = 1;
   CLI::App app("This is used to mount an OSS bucket to a local directory.");
@@ -790,8 +920,7 @@ int main(int argc, char *argv[]) {
 
   sub_mount->add_option("-c,--conf", mount_config, "Configure file path")
       ->check(CLI::ExistingFile);
-  sub_mount->add_option("MOUNTPOINT", mountpoint, "Directory to mount to")
-      ->check(CLI::ExistingDirectory);
+  sub_mount->add_option("MOUNTPOINT", mountpoint, "Directory to mount to");
   sub_mount->allow_extras();
   sub_mount->set_help_flag("--original-help",
                            "Print this help message and exit");
@@ -865,34 +994,78 @@ int main(int argc, char *argv[]) {
 
     gflags::ParseCommandLineFlags(&fuse_argc, &fuse_args, true);
     trim_mount_options();
-
-    struct fuse_cmdline_opts fuse_opts = {0};
-    struct fuse_args args = FUSE_ARGS_INIT(fuse_argc, fuse_args);
-    if (fuse_parse_cmdline(&args, &fuse_opts) != 0) return -1;
+    // Normalize prefix: strip one leading and one trailing slash.
+    {
+      std::string_view pfx = FLAGS_oss_bucket_prefix;
+      if (!pfx.empty() && pfx.front() == '/') pfx.remove_prefix(1);
+      if (!pfx.empty() && pfx.back() == '/') pfx.remove_suffix(1);
+      gflags::SetCommandLineOption("oss_bucket_prefix",
+                                   std::string(pfx).c_str());
+    }
 
     g_log_to_stdout =
         FLAGS_log_dir == DEV_STDOUT ||
         (gflags::GetCommandLineFlagInfoOrDie("log_dir").is_default && FLAGS_f);
 
-    if (validate_log_dir(mountpoint, FLAGS_log_dir) != 0) return -1;
+    if (FLAGS_fuse_device_fd < 0) {
+      // mountpoint was mounted by ossfs2 itself, so we can access mountpoint
+      // directory.
 
-    if (!FLAGS_nonempty) {
-      struct dirent *ent;
-      DIR *dh = opendir(mountpoint.c_str());
-      if (dh == NULL) {
-        fprintf(stderr, "ERROR: failed to open MOUNTPOINT: %s: %s\n",
-                mountpoint.c_str(), strerror(errno));
+      std::error_code ec;
+      if (!std::filesystem::is_directory(
+              std::filesystem::symlink_status(mountpoint, ec))) {
+        fprintf(stderr, "ERROR: MOUNTPOINT %s: %s\n", mountpoint.c_str(),
+                ec ? ec.message().c_str() : "not a directory");
         return -1;
       }
-      while ((ent = readdir(dh)) != NULL) {
-        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
-          closedir(dh);
+
+      if (validate_log_dir(mountpoint, FLAGS_log_dir) != 0) return -1;
+
+      if (!FLAGS_nonempty) {
+        int r = check_dir_empty(mountpoint);
+        if (r < 0) {
+          fprintf(stderr, "ERROR: failed to open MOUNTPOINT: %s: %s\n",
+                  mountpoint.c_str(), strerror(errno));
+          return -1;
+        }
+        if (r > 0) {
           fprintf(stderr, "ERROR: MOUNTPOINT directory %s is not empty.\n",
                   mountpoint.c_str());
           return -1;
         }
       }
-      closedir(dh);
+    } else {
+      // mountpoint was mounted by control program.
+
+      if (!is_valid_fd(FLAGS_fuse_device_fd)) {
+        fprintf(stderr, "ERROR: invalid fuse_device_fd %d\n",
+                FLAGS_fuse_device_fd);
+        return -1;
+      }
+
+      // If /dev/fuse was opened and mounted by the control program (e.g.
+      // unprivileged launch), pass the pre-opened fd path "/dev/fd/N" as
+      // mountpoint to fuse_parse_cmdline. Otherwise realpath() on the
+      // original mountpoint would block on FUSE mount, and in this case
+      // we can't open /dev/fuse and call sys_fuse_mount.
+      mountpoint_param = "/dev/fd/" + std::to_string(FLAGS_fuse_device_fd);
+      fuse_args[1] = const_cast<char *>(mountpoint_param.c_str());
+    }
+
+    const std::string &dir = FLAGS_disk_data_cache_dir;
+    if (!dir.empty() && check_dir_empty(dir) == 1) {
+      fprintf(stderr, "ERROR: disk cache directory %s is not empty\n",
+              dir.c_str());
+      return -1;
+    }
+
+    // Parse fuse options.
+    struct fuse_cmdline_opts fuse_opts = {0};
+    struct fuse_args args = FUSE_ARGS_INIT(fuse_argc, fuse_args);
+    if (fuse_parse_cmdline(&args, &fuse_opts) != 0) {
+      if (!args.allocated) free(args.argv);
+      fuse_opt_free_args(&args);
+      return -1;
     }
 
     if (FLAGS_d) {
@@ -910,7 +1083,12 @@ int main(int argc, char *argv[]) {
 
     fuse_opt_add_arg(&args, "-odefault_permissions");
     fuse_opt_add_arg(&args, "-osubtype=ossfs2");
-    fuse_opt_add_arg(&args, "-ofsname=ossfs2");
+    // fuse_opt_add_arg internally copies the string, so local std::string is
+    // safe.
+    std::string fsname_opt =
+        "-ofsname=" + build_fsname(FLAGS_oss_bucket, FLAGS_oss_endpoint,
+                                   FLAGS_oss_bucket_prefix);
+    fuse_opt_add_arg(&args, fsname_opt.c_str());
 
     int pipefd[2];
     if (pipe(pipefd)) return -1;

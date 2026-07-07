@@ -115,6 +115,7 @@ DECLARE_string(oss_access_key_id);
 DECLARE_string(oss_access_key_secret);
 DECLARE_string(ram_role);
 DECLARE_string(credential_process);
+DECLARE_uint64(credential_refresh_interval);
 
 // ==================== Caching options ====================
 DECLARE_uint64(attr_timeout);
@@ -130,6 +131,11 @@ DECLARE_uint64(oss_negative_cache_timeout);
 DECLARE_uint64(oss_negative_cache_size);
 DECLARE_string(cache_type);
 DECLARE_string(memory_data_cache_size);
+DECLARE_bool(share_fd_read_buffer);
+DECLARE_string(disk_data_cache_dir);
+DECLARE_string(disk_data_cache_size);
+DECLARE_string(disk_data_cache_io_engine);
+DECLARE_string(disk_available_space);
 
 // ==================== Oss Client Options ====================
 DECLARE_string(upload_buffer_size);
@@ -168,3 +174,4 @@ DECLARE_int32(metrics_port);
 DECLARE_string(metrics_ip);
 DECLARE_bool(enable_test_signal_handler);
 DECLARE_bool(enable_admin_server);
+DECLARE_int32(fuse_device_fd);

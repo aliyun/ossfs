@@ -31,13 +31,13 @@ static const uint64_t kMaxPrefetchSizePerRequest = 16 * 1024 * 1024;
 
 class OssFs;
 class FileInode;
-class OssAdapter;
+class IObjStore;
 
 // Derived Must be a subclass of Reader and provide:
 //  - size_t get_prefetch_alignment();
 //  - bool has_enough_space(size_t);
 //  - void try_expand_prefetch_window(size_t);
-//  - ssize_t bg_try_refill_range(OssAdapter*, off_t, size_t);
+//  - ssize_t bg_try_refill_range(IObjStore*, off_t, size_t);
 template <typename Derived>
 class EnableFilePrefetching {
  public:
@@ -66,11 +66,17 @@ class EnableFilePrefetching {
     return static_cast<Derived *>(this);
   }
 
-  ssize_t do_prefetch_range(OssAdapter *oss_client, off_t offset, size_t count);
+  ssize_t do_prefetch_range(IObjStore *obj_store, off_t offset, size_t count);
 
   void reset_prefetch(off_t remote_size, off_t offset);
   void adjust_next_prefetch_off(off_t remote_size, off_t offset);
   void schedule_prefetch(off_t remote_size);
+
+  uint64_t estimate_tasks_by_window_size() const {
+    return prefetch_window_size_ / 2 / prefetch_chunk_size_;
+  }
+
+  bool is_prefetch_too_far_ahead() const;
 
   static void *prefetch_tsk(void *args);
   static void *do_prefetch_tsk(void *args);
@@ -86,7 +92,7 @@ class EnableFilePrefetching {
 
   // For prefetching tasks.
   bool is_prefetching_scheduled_ = false;
-  size_t prefetch_window_size_ = 0;
+  std::atomic<size_t> prefetch_window_size_ = 0;
   size_t prefetch_chunk_size_ = 0;
   off_t next_prefetch_off_ = 0;
   size_t next_prefetch_size_ = 0;

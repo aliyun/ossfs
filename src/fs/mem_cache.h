@@ -16,20 +16,19 @@
 
 #pragma once
 
-#include <photon/common/range-lock.h>
 #include <photon/thread/thread.h>
-#include <sys/uio.h>
 
-#include <cstdint>
-#include <cstdlib>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
-#include "common/logger.h"
+#include "cache.h"
+#include "mem_pool.h"
+
+class BlockCacheStoreTest;
 
 namespace OssFileSystem {
 
@@ -87,81 +86,129 @@ struct BlockInfo {
   uint64_t generation = 0;
 };
 
-class BlockCache {
+class BlockCacheStore;
+struct BlockCacheHandle;
+
+class BlockCacheStore : public ICacheStore {
  public:
-  BlockCache(uint64_t block_size = 1048576) : block_size_(block_size) {
-    meta_store_ = std::make_unique<MetaStore>(this, block_size);
+  BlockCacheStore(uint64_t block_size = 1048576) : block_size_(block_size) {
+    meta_store_ = std::make_unique<MetaStore>(this);
   }
 
-  ssize_t pread(char *buf, off_t offset, size_t count);
-
-  // Try to allocate blocks for range [offset, offset + count) and
-  // lock it if successful.
-  int try_lock_blocks(uint64_t offset, uint64_t count,
-                      std::vector<iovec> &blocks);
-
-  // Unlock the block. If evict is true, the block will be evicted.
-  // Evict flag is used for the case that writing block data failed
-  // and we rollback metadata for those blocks.
-  void unlock_blocks(uint64_t offset, uint64_t count, bool evict = false);
+  ssize_t pread(char *buf, off_t offset, size_t count) override;
 
   // The pin operation returns a buffer pointer pointing to the
   // corresponding offset and increments the reference count to
   // prevent modification when success. If cache miss or the range
   // crosses the block boundary, -ENOENT will be returned.
-  ssize_t pin(off_t offset, size_t count, void **buf);
+  ssize_t pin(off_t offset, size_t count, void **buf) override;
 
   // Release the block and decrease the reference count.
-  void unpin(off_t offset);
+  void unpin(off_t offset) override;
 
   // Only collect memory blocks pointer which should be managed outside.
   void expand_blocks(const std::vector<char *> &blocks);
 
+  // Return total blocks managed by this cache (MetaStore + BlockPool
+  // free_list).
+  size_t total_blocks();
+
+  // Shrink and return up to 'count' blocks from cache.
+  // May return fewer blocks if not enough are available (free_list exhausted
+  // and no evictable blocks in MetaStore).
+  // Returns a pair: {memory blocks to deallocate, BlockInfo objects to delete}.
+  // The caller is responsible for freeing both outside of any locks.
+  std::pair<std::vector<char *>, std::vector<BlockInfo *>> shrink_blocks(
+      size_t count);
+
+  // Drain all blocks when ref_cnt reaches 0 (final cleanup).
+  // Returns a pair: {memory blocks to deallocate, BlockInfo objects to delete}.
+  // The caller is responsible for freeing both outside of any locks.
+  std::pair<std::vector<char *>, std::vector<BlockInfo *>> drain_all_blocks();
+
   // Query the range of blocks that need to be refilled.
   // Returns (start, end). (0, 0) means no need to refill.
-  std::pair<uint64_t, uint64_t> query_refill_range(off_t offset, size_t count);
+  std::pair<off_t, size_t> query_refill_range(off_t offset,
+                                              size_t count) override;
 
-  size_t block_size() {
-    return block_size_;
+  int acquire_write_buffer(RangeBuffer &range_buffer) override {
+    return try_lock_blocks(range_buffer.offset, range_buffer.count,
+                           range_buffer.buffer);
   }
 
-  void set_latest_read_off(off_t offset);
+  void release_write_buffer(const RangeBuffer &range_buffer,
+                            bool evict = false) override {
+    unlock_blocks(range_buffer.offset, range_buffer.count, evict);
+  }
+
+  void update_retention_range(BlockCacheHandle *h, off_t offset, size_t count);
+
+  void clear_retention_range(BlockCacheHandle *h) {
+    retention_manager_.remove_range(h);
+  }
 
   // Drop all existing cache blocks by incrementing the generation number,
   // which causes subsequent accesses to reload the data.
-  void drop() {
+  void drop() override {
     increment_generation();
   }
 
  private:
+  struct RetentionManager {
+    struct Range {
+      uint64_t start;
+      uint64_t end;
+      BlockCacheHandle *h;
+    };
+
+    photon::spinlock lock;
+    std::vector<Range> ranges;
+
+    size_t size();
+    void update_range(BlockCacheHandle *h, uint64_t start, uint64_t end);
+    void remove_range(BlockCacheHandle *h);
+    std::optional<uint64_t> get_max_covered_end(uint64_t current_point);
+    uint64_t get_min_start();
+    uint64_t get_max_end();
+  };
+
   class MetaStore {
    public:
-    MetaStore(BlockCache *cache, uint64_t block_size)
-        : cache_(cache), block_size_(block_size) {}
+    MetaStore(BlockCacheStore *cache) : cache_(cache) {}
     ~MetaStore();
     void get_locked_block(uint64_t block_id, BlockInfo **info);
     int get_and_lock_block(uint64_t block_id, BlockInfo **info,
                            BlockLockType lock_type,
                            std::function<int(BlockInfo **)> alloc_fn = nullptr);
-    int evict_one_lock_held(BlockInfo **info, uint64_t latest_read_block_id);
+    int evict_one_lock_held(BlockInfo **info);
 
    private:
-    BlockCache *cache_ = nullptr;
+    BlockCacheStore *cache_ = nullptr;
 
     std::map<uint64_t, BlockInfo *> data_;
     photon::spinlock lock_;
 
-    const uint64_t block_size_ = 0;
-
     uint64_t generation_ = 1;
 
-    friend class BlockCache;
+    friend class BlockCacheStore;
   };
 
   class BlockPool {
    public:
     int alloc_one_block(char **ptr);
     void expand(const std::vector<char *> &blocks);
+
+    // Get the number of free blocks in the pool.
+    size_t get_free_block_count() {
+      SCOPED_LOCK(lock_);
+      return free_list_.size();
+    }
+
+    // Extract up to 'count' free blocks from the pool.
+    std::vector<char *> extract_free_blocks(size_t count);
+
+    // Clear and return all free blocks from the pool.
+    std::vector<char *> clear_all();
 
    private:
     photon::spinlock lock_;
@@ -173,54 +220,85 @@ class BlockCache {
 
   void increment_generation();
 
+  // Try to allocate blocks for range [offset, offset + count) and
+  // lock it if successful.
+  int try_lock_blocks(uint64_t offset, uint64_t count, IOVector &blocks);
+
+  // Unlock the block. If evict is true, the block will be evicted.
+  // Evict flag is used for the case that writing block data failed
+  // and we rollback metadata for those blocks.
+  void unlock_blocks(uint64_t offset, uint64_t count, bool evict = false);
+
   BlockPool block_pool_;
   std::unique_ptr<MetaStore> meta_store_;
+  RetentionManager retention_manager_;
 
-  std::atomic<uint64_t> latest_read_block_id_ = {0};
   const uint64_t block_size_ = 0;
+
+  friend class BlockCacheHandle;
+  friend class ::BlockCacheStoreTest;
 };
 
-// BlockCacheManager provides a centralized management mechanism for block
+struct BlockCacheHandle : public CacheHandle {
+ public:
+  BlockCacheHandle(BlockCacheStore *cache_store, RangeLock *range_lock)
+      : CacheHandle(cache_store, range_lock) {}
+
+  ~BlockCacheHandle() {
+    static_cast<BlockCacheStore *>(cache_store)->clear_retention_range(this);
+  }
+
+  void on_read_success(off_t offset, size_t prefetch_buffer_size) override {
+    static_cast<BlockCacheStore *>(cache_store)
+        ->update_retention_range(this, offset, prefetch_buffer_size);
+  }
+
+ private:
+  int64_t retention_index = -1;
+
+  friend class BlockCacheStore::RetentionManager;
+};
+
+// BlockCache provides a centralized management mechanism for block
 // caches, including allocation/deallocation of cache blocks, reference counting
 // for cache lifecycle management, and thread-safe access control. It supports
 // dynamic expansion  of cache capacity and integrates with external memory
 // pools for memory block management.
-class BlockCacheManager {
+class BlockCache : public ICache {
  public:
-  BlockCacheManager(size_t block_size) : block_size_(block_size){};
-  ~BlockCacheManager();
+  BlockCache(std::shared_ptr<FixedBlockMemoryPool> block_pool)
+      : block_pool_(std::move(block_pool)) {}
+  ~BlockCache();
+
+  size_t block_size() const override {
+    return block_pool_->block_size();
+  }
 
   // Get the cache instance and increase the reference count.
-  std::pair<BlockCache *, RangeLock *> get();
+  CacheHandle *get(std::string_view name = "", std::string_view etag = "",
+                   off_t actual_size = 0) override;
 
-  // Try to expand cache blocks by allocating 'count' blocks via alloc_cb
-  // callback, and the total number of blocks should not exceed 'max_capacity'
+  // Try to expand cache blocks by allocating 'count' blocks in buffer_pool_,
+  // and the total number of blocks should not exceed 'max_capacity'
   // after expansion. Returns the number of blocks actually allocated.
-  size_t try_expand_blocks(
-      std::function<std::vector<char *>(uint64_t)> alloc_cb, uint64_t count,
-      uint64_t max_capacity);
+  size_t try_expand_blocks(uint64_t count, uint64_t max_capacity,
+                           bool ignore_limit = false) override;
 
   // Decrease the reference count and release the cache instance if
   // the reference count is 0.
-  void release(std::function<void(const std::vector<char *> &)> release_cb,
-               uint64_t count);
+  void release(CacheHandle *h, uint64_t count) override;
 
   // Return total block count.
-  size_t capacity();
-
-  size_t block_size() const {
-    return block_size_;
-  }
+  size_t capacity() override;
 
  private:
-  const size_t block_size_ = 1048576;
   RangeLock range_lock_;
 
   std::mutex mtx_;
-  BlockCache *cache_ = nullptr;
-  std::vector<char *> blocks_;
-  size_t num_used_blocks_ = 0;
+  BlockCacheStore *cache_store_ = nullptr;
   uint64_t ref_cnt_ = 0;
+
+  std::shared_ptr<FixedBlockMemoryPool> block_pool_;
 };
 
 }  // namespace OssFileSystem

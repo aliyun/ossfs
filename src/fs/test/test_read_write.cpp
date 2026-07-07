@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "fs/disk_cache.h"
 #include "test_suite.h"
 
 class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
@@ -615,7 +616,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     ret = file->pwrite(random_data.c_str(), random_data.size(), st.st_size);
     ASSERT_EQ(ret, static_cast<ssize_t>(random_data.size()));
 
-    r = fs_->release(nodeid, file);
+    r = fs_->release(nodeid2, file);
     ASSERT_EQ(r, 0);
 
     r = fs_->open(nodeid2, O_RDONLY, &handle, &unused);
@@ -1425,10 +1426,12 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     }
   }
 
-  void verify_close_to_open_with_inode_cache() {
+  void verify_close_to_open_with_cache() {
     fs_->options_.close_to_open = true;
     for (int i = 0; i < 10; i++) {
-      fs_->options_.bind_cache_to_inode = i % 2;
+      if (fs_->options_.cache_type == CacheType::kFhCache) {
+        fs_->options_.share_fd_read_buffer = i % 2;
+      }
 
       uint64_t parent = get_test_dir_parent();
       DEFER(fs_->forget(parent, 1));
@@ -1805,6 +1808,204 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     }
   }
 
+  void verify_refill_with_remote_shrink() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    auto parent_path = nodeid_to_path(parent);
+
+    std::string filename = "testfile";
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    struct stat st;
+
+    // Create file first
+    int r = fs_->creat(parent, filename.c_str(), CREATE_BASE_FLAGS | O_APPEND,
+                       0777, 0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+
+    // Step 1: Upload a 30MB file
+    const uint64_t large_size = 30ULL << 20;  // 30MB
+    std::string local_file = join_paths(test_path_, "tmpfile");
+    create_random_file(local_file, 30);
+    r = upload_file(local_file, join_paths(parent_path, filename),
+                    FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
+    unlink(local_file.c_str());
+
+    // Update metadata so inode knows about the large file
+    r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    fs_->forget(nodeid, 1);
+    ASSERT_EQ(st.st_size, static_cast<off_t>(large_size));
+
+    // Step 2: Open a reader handle (remote_size_ = 30MB)
+    void *reader_handle = nullptr;
+    bool unused;
+    r = fs_->open(nodeid, O_RDONLY, &reader_handle, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(reader_handle)));
+
+    // Step 3: Wait for attr_timeout to expire, then upload the tiny file.
+    // This ensures the next lookup will do a fresh HEAD request.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // Upload a 1-byte file to replace the 30MB file on remote.
+    // The handle still has cached remote_size_ = 30MB, and inode_->attr.size
+    // is also still 30MB (nobody has refreshed since attr expired).
+    {
+      std::ofstream tmpfile("tmpfile_tiny", std::ios::out | std::ios::trunc);
+      tmpfile << "x";
+      tmpfile.close();
+    }
+    r = upload_file("tmpfile_tiny", join_paths(parent_path, filename),
+                    FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
+    unlink("tmpfile_tiny");
+
+    // Step 4: Enable FI and start reader at 10MB offset.
+    // Reader's pin_rlocked -> refresh_attr: inode_->attr.size(30MB) ==
+    // remote_size_(30MB), so NO refresh. Reader enters do_refill_range -> FI
+    // sleep 1s.
+    g_fault_injector->set_injection(FaultInjectionId::FI_Do_Refill_Range_Delay);
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_Do_Refill_Range_Delay));
+
+    std::atomic<ssize_t> read_result{-999};
+    std::thread reader_thread([&]() {
+      INIT_PHOTON();
+      char buf[IO_SIZE];
+      read_result = read_from_handle(reader_handle, buf, IO_SIZE, 10ULL << 20);
+    });
+
+    // Step 5: Immediately do lookup. Since attr_timeout has expired,
+    // this triggers a HEAD request -> discovers size=1 -> inode_->attr.size=1.
+    r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    fs_->forget(nodeid, 1);
+    ASSERT_EQ(st.st_size, 1);
+
+    // Step 6: A concurrent read on the same handle triggers
+    // refresh_attr_if_needed_and_invoke() in pin_rlocked(), which detects
+    // inode_->attr.size(1) != remote_size_(30MB) and updates remote_size_ = 1.
+    std::thread refresh_thread([&]() {
+      INIT_PHOTON();
+      char buf[1];
+      read_from_handle(reader_handle, buf, 1, 0);
+    });
+
+    // Step 7: Wait for reader thread to wake and finish.
+    reader_thread.join();
+    refresh_thread.join();
+
+    // The read returns 0 (early exit, no crash/underflow)
+    ASSERT_EQ(read_result.load(), 0);
+  }
+
+  void verify_refill_with_remote_shrink_concurrent() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    auto parent_path = nodeid_to_path(parent);
+
+    std::string filename = "testfile_concurrent";
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    struct stat st;
+
+    // Create file first
+    int r = fs_->creat(parent, filename.c_str(), CREATE_BASE_FLAGS | O_APPEND,
+                       0777, 0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+
+    // Upload a 30MB file
+    const uint64_t large_size = 30ULL << 20;
+    std::string local_file = join_paths(test_path_, "tmpfile_c");
+    create_random_file(local_file, 30);
+    r = upload_file(local_file, join_paths(parent_path, filename),
+                    FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
+    unlink(local_file.c_str());
+
+    // Update metadata
+    r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    fs_->forget(nodeid, 1);
+    ASSERT_EQ(st.st_size, static_cast<off_t>(large_size));
+
+    // Open a single reader handle
+    void *reader_handle = nullptr;
+    bool unused;
+    r = fs_->open(nodeid, O_RDONLY, &reader_handle, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(reader_handle)));
+
+    // Wait for attr_timeout to expire, then upload the tiny file.
+    // This ensures the later lookup will do a fresh HEAD request.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // Upload tiny file to replace 30MB on remote
+    {
+      std::ofstream tmpfile("tmpfile_tiny", std::ios::out | std::ios::trunc);
+      tmpfile << "x";
+      tmpfile.close();
+    }
+    r = upload_file("tmpfile_tiny", join_paths(parent_path, filename),
+                    FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
+    unlink("tmpfile_tiny");
+
+    // Enable FI
+    g_fault_injector->set_injection(FaultInjectionId::FI_Do_Refill_Range_Delay);
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_Do_Refill_Range_Delay));
+
+    // Launch 4 reader threads at different offsets
+    constexpr int kNumReaders = 4;
+    std::atomic<ssize_t> results[kNumReaders];
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kNumReaders; i++) {
+      results[i].store(-999);
+      threads.emplace_back([&, i]() {
+        INIT_PHOTON();
+        char buf[IO_SIZE];
+        uint64_t off = (5ULL + i * 5) << 20;
+        results[i] = read_from_handle(reader_handle, buf, IO_SIZE, off);
+      });
+    }
+
+    // Wait for all threads to enter do_refill_range FI sleep
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Update inode attr via lookup (file is now 1 byte)
+    r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    fs_->forget(nodeid, 1);
+    ASSERT_EQ(st.st_size, 1);
+
+    // A concurrent read triggers refresh_attr -> remote_size_ = 1
+    std::thread refresh_thread([&]() {
+      INIT_PHOTON();
+      char buf[1];
+      read_from_handle(reader_handle, buf, 1, 0);
+    });
+
+    // Join all threads
+    for (auto &t : threads) {
+      t.join();
+    }
+    refresh_thread.join();
+
+    // All reads should return 0 (early exit) - no crash, no underflow
+    for (int i = 0; i < kNumReaders; i++) {
+      ASSERT_EQ(results[i].load(), 0) << "Reader " << i << " did not return 0";
+    }
+  }
+
   void verify_random_read_range() {
     uint64_t parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
@@ -1877,6 +2078,12 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       tasks.push_back(std::move(task));
     }
     for (auto &task : tasks) task.wait();
+
+    if (fs_->get_cache_type() == CacheType::kDiskCache) {
+      // After all reads are done, the buffer should be released for disk cache.
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      ASSERT_EQ(fs_->download_buffers_->used_blocks(), 0ULL);
+    }
   }
 
   void verify_random_read_write_and_truncate() {
@@ -1943,6 +2150,510 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
                   meta["X-Oss-Hash-Crc64ecma"]);
       }
     }
+  }
+
+  void verify_multipart_complete_with_immutable() {
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::string filepath = "testfile_race";
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = fs_->creat(parent, filepath.c_str(), CREATE_BASE_FLAGS, 0777, 0, 0,
+                       0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto file = get_file_from_handle(handle);
+
+    char *buf = new char[1048576];
+    DEFER(delete[] buf);
+    memset(buf, 'A', 1048576);
+
+    const size_t upload_buf_size = fs_->options_.upload_buffer_size;
+
+    // Phase 1: Write enough data to trigger multipart upload (no injection
+    // yet).
+    size_t off = 0;
+    for (int i = 0; i < 3; i++) {
+      write_to_file_handle(handle, buf, upload_buf_size, off);
+      off += upload_buf_size;
+    }
+
+    // Wait for initial uploads to complete successfully
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Phase 2: Enable dual-point fault injection for deterministic race
+    // reproduction.
+    //
+    // Timeline:
+    //   T=0:     Main thread calls fsync -> complete_upload -> line 540 check
+    //              (immutable_=false)
+    //   T=0:     Main thread enters do_upload_last_part -> hits
+    //              FI_Complete_Multipart_Delay (500ms)
+    //   T=0:     bg thread starts upload_part -> hits FI_OssError_Call_Timeout
+    //   T=200ms: bg thread upload_part fails -> immutable_=true
+    //   T=500ms: Main thread delay ends -> do_complete_multipart() ->
+    //              RELEASE_ASSERT(!immutable_) -> CRASH!
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Call_Timeout);
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Timeout));
+
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_Complete_Multipart_Delay);
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_Complete_Multipart_Delay));
+
+    // Write one more full buffer to schedule a new bg upload thread (will be
+    // delayed+fail)
+    write_to_file_handle(handle, buf, upload_buf_size, off);
+
+    // Phase 3: Immediately flush. The race window is now deterministic:
+    // - Main thread passes line 540 check (bg thread still in 200ms delay,
+    // immutable_=false)
+    // - Main thread hits 500ms delay before do_complete_multipart
+    // - bg thread's 200ms delay ends, upload_part fails, sets immutable_=true
+    // - Main thread's 500ms delay ends, calls do_complete_multipart
+    // - RELEASE_ASSERT(!immutable_) fires (immutable_ is now true)
+    //
+    // Before fix: deterministic RELEASE_ASSERT crash
+    // After fix: should return error gracefully
+    r = fsync_file_handle(handle);
+
+    // After fix, fsync or release should report error (not crash)
+    int release_r = fs_->release(nodeid, file);
+    ASSERT_TRUE(r != 0 || release_r != 0);
+  }
+
+  // Simple immutable behavior: inject error → fsync fail → immutable sticky
+  // Covers: multiple write+fsync success cycles, then failure, repeated fsync
+  // fails, pwrite blocked, release reports error
+  void verify_immutable_writer_behavior() {
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::string filepath = "testfile_immutable_behavior";
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = fs_->creat(parent, filepath.c_str(), CREATE_BASE_FLAGS, 0777, 0, 0,
+                       0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto file = get_file_from_handle(handle);
+
+    const size_t buf_size = 1048576;  // 1MB
+    char *buf = new char[buf_size];
+    DEFER(delete[] buf);
+
+    // Phase 1: Multiple successful write+fsync cycles
+    off_t off = 0;
+    for (int i = 0; i < 5; i++) {
+      memset(buf, 'A' + i, buf_size);
+      auto w = write_to_file_handle(handle, buf, buf_size, off);
+      ASSERT_EQ(w, static_cast<ssize_t>(buf_size));
+      off += buf_size;
+
+      r = fsync_file_handle(handle);
+      ASSERT_EQ(r, 0);
+    }
+
+    // Phase 2: Write more, then inject error → fsync fails → immutable
+    memset(buf, 'Z', buf_size);
+    auto w = write_to_file_handle(handle, buf, buf_size, off);
+    ASSERT_EQ(w, static_cast<ssize_t>(buf_size));
+
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Call_Timeout);
+    int r1 = fsync_file_handle(handle);
+    g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Timeout);
+    ASSERT_NE(r1, 0);
+
+    // Phase 3: Immutable is sticky - all operations fail
+    for (int i = 0; i < 5; i++) {
+      int ri = fsync_file_handle(handle);
+      ASSERT_NE(ri, 0);
+    }
+
+    // pwrite blocked with -EIO at various offsets
+    for (int i = 0; i < 5; i++) {
+      w = write_to_file_handle(handle, buf, 1024, i * 1024);
+      ASSERT_EQ(w, -EIO);
+    }
+
+    // Release should report failure (dirty data lost)
+    int release_r = fs_->release(nodeid, file);
+    ASSERT_NE(release_r, 0);
+  }
+
+  void verify_merge_remote_data_download_failure() {
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::string filepath = "testfile_merge_fail";
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+
+    // Step 1: Create file and write initial data successfully
+    int r = fs_->creat(parent, filepath.c_str(), CREATE_BASE_FLAGS, 0777, 0, 0,
+                       0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+
+    auto file = get_file_from_handle(handle);
+
+    char *buf = new char[1048576];
+    DEFER(delete[] buf);
+    memset(buf, 'F', 1048576);
+
+    write_to_file_handle(handle, buf, 1048576, 0);
+    r = fsync_file_handle(handle);
+    ASSERT_EQ(r, 0);
+
+    // Release and re-open
+    fs_->release(nodeid, file);
+    fs_->forget(nodeid, 1);
+
+    // Step 2: Re-open the existing file and write again (triggers merge)
+    handle = nullptr;
+    r = fs_->lookup(parent, filepath.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    bool unused = false;
+    r = fs_->open(nodeid, O_WRONLY, &handle, &unused);
+    ASSERT_EQ(r, 0);
+
+    file = get_file_from_handle(handle);
+
+    // Step 3: Enable download failure injection for merge_remote_data
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_Download_Failed_During_Merge_Remote_Data);
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_Download_Failed_During_Merge_Remote_Data));
+
+    // Write new data at end of file (append) - will trigger
+    // merge_remote_data on fsync since file has existing remote data
+    memset(buf, 'G', 1048576);
+    write_to_file_handle(handle, buf, 1048576, st.st_size);
+
+    // fsync triggers merge_remote_data which fails -> immutable
+    r = fsync_file_handle(handle);
+    ASSERT_NE(r, 0);
+
+    // Verify immutable state
+    auto w = write_to_file_handle(handle, buf, 1024, 0);
+    ASSERT_EQ(w, -EIO);
+
+    fs_->release(nodeid, file);
+  }
+
+  // Consolidated mixed read-write test (without immutable):
+  // 1) Multiple write + fsync + read-back cycles with data verification
+  // 2) Release + reopen + read existing + append + reopen read-only verify
+  void verify_mixed_read_write() {
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::string filepath = "testfile_mixed_rw";
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+
+    const size_t chunk = 524288;  // 512KB
+    const int num_rounds = 6;
+    char *buf = new char[chunk];
+    DEFER(delete[] buf);
+    char *read_buf = new char[chunk * num_rounds];
+    DEFER(delete[] read_buf);
+
+    // Phase 1: Create file, do multiple write+fsync+read-back cycles
+    int r = fs_->creat(parent, filepath.c_str(), CREATE_BASE_FLAGS, 0777, 0, 0,
+                       0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+
+    auto file = get_file_from_handle(handle);
+
+    for (int i = 0; i < num_rounds; i++) {
+      char fill = 'A' + i;
+      memset(buf, fill, chunk);
+      auto w = write_to_file_handle(handle, buf, chunk, i * chunk);
+      ASSERT_EQ(w, static_cast<ssize_t>(chunk));
+
+      r = fsync_file_handle(handle);
+      ASSERT_EQ(r, 0);
+
+      // Read back all data written so far and verify
+      size_t total = (i + 1) * chunk;
+      auto rd = read_from_handle(handle, read_buf, total, 0);
+      ASSERT_EQ(rd, static_cast<ssize_t>(total));
+      for (int j = 0; j <= i; j++) {
+        char expected = 'A' + j;
+        ASSERT_EQ(read_buf[j * chunk], expected)
+            << "Round " << i << " chunk " << j << " start mismatch";
+        ASSERT_EQ(read_buf[j * chunk + chunk - 1], expected)
+            << "Round " << i << " chunk " << j << " end mismatch";
+      }
+    }
+
+    // Phase 2: Release, reopen O_RDWR, read existing, append more
+    fs_->release(nodeid, file);
+    fs_->forget(nodeid, 1);
+
+    handle = nullptr;
+    r = fs_->lookup(parent, filepath.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+
+    bool unused = false;
+    r = fs_->open(nodeid, O_RDWR, &handle, &unused);
+    ASSERT_EQ(r, 0);
+    file = get_file_from_handle(handle);
+
+    // Read all existing data
+    size_t existing_size = num_rounds * chunk;
+    auto rd = read_from_handle(handle, read_buf, existing_size, 0);
+    ASSERT_EQ(rd, static_cast<ssize_t>(existing_size));
+    for (int j = 0; j < num_rounds; j++) {
+      ASSERT_EQ(read_buf[j * chunk], 'A' + j);
+    }
+
+    // Append 2 more chunks at file end
+    for (int i = 0; i < 2; i++) {
+      char fill = 'a' + i;
+      memset(buf, fill, chunk);
+      auto w = write_to_file_handle(handle, buf, chunk, st.st_size + i * chunk);
+      ASSERT_EQ(w, static_cast<ssize_t>(chunk));
+    }
+
+    r = fsync_file_handle(handle);
+    ASSERT_EQ(r, 0);
+
+    fs_->release(nodeid, file);
+    fs_->forget(nodeid, 1);
+
+    // Phase 3: Reopen read-only, verify full content
+    handle = nullptr;
+    r = fs_->lookup(parent, filepath.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    r = fs_->open(nodeid, O_RDONLY, &handle, &unused);
+    ASSERT_EQ(r, 0);
+    file = get_file_from_handle(handle);
+
+    size_t total_size = (num_rounds + 2) * chunk;
+    char *final_buf = new char[total_size];
+    DEFER(delete[] final_buf);
+    rd = read_from_handle(handle, final_buf, total_size, 0);
+    ASSERT_EQ(rd, static_cast<ssize_t>(total_size));
+
+    for (int j = 0; j < num_rounds; j++) {
+      ASSERT_EQ(final_buf[j * chunk], 'A' + j)
+          << "Final verify chunk " << j << " mismatch";
+    }
+    ASSERT_EQ(final_buf[num_rounds * chunk], 'a');
+    ASSERT_EQ(final_buf[(num_rounds + 1) * chunk], 'b');
+
+    fs_->release(nodeid, file);
+  }
+
+  // Consolidated mixed read-write test with immutable:
+  // 1) Multiple write + fsync success cycles building up data
+  // 2) Append + inject error + fsync fail -> immutable
+  // 3) Same handle: pread still works for persisted data, pwrite -EIO
+  // 4) Reopen read-only: all persisted data still readable
+  void verify_mixed_read_write_with_immutable() {
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::string filepath = "testfile_mixed_rw_immutable";
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+
+    const size_t chunk = 524288;  // 512KB
+    const int num_success_rounds = 5;
+    char *buf = new char[chunk];
+    DEFER(delete[] buf);
+    char *read_buf = new char[chunk * num_success_rounds];
+    DEFER(delete[] read_buf);
+
+    // Phase 1: Create, multiple write+fsync success cycles
+    int r = fs_->creat(parent, filepath.c_str(), CREATE_BASE_FLAGS, 0777, 0, 0,
+                       0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+
+    auto file = get_file_from_handle(handle);
+
+    for (int i = 0; i < num_success_rounds; i++) {
+      char fill = 'A' + i;
+      memset(buf, fill, chunk);
+      auto w = write_to_file_handle(handle, buf, chunk, i * chunk);
+      ASSERT_EQ(w, static_cast<ssize_t>(chunk));
+
+      r = fsync_file_handle(handle);
+      ASSERT_EQ(r, 0);
+    }
+
+    // Verify all written data is readable (file is clean after fsyncs)
+    size_t persisted_size = num_success_rounds * chunk;
+    auto rd = read_from_handle(handle, read_buf, persisted_size, 0);
+    ASSERT_EQ(rd, static_cast<ssize_t>(persisted_size));
+    for (int j = 0; j < num_success_rounds; j++) {
+      ASSERT_EQ(read_buf[j * chunk], 'A' + j);
+    }
+
+    // Phase 2: Append more data, inject error, fsync fails -> immutable
+    memset(buf, 'Z', chunk);
+    auto w = write_to_file_handle(handle, buf, chunk, persisted_size);
+    ASSERT_EQ(w, static_cast<ssize_t>(chunk));
+
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Call_Timeout);
+    r = fsync_file_handle(handle);
+    ASSERT_NE(r, 0);
+    g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Timeout);
+
+    // Phase 3: Same handle - persisted data still readable
+    memset(read_buf, 0, persisted_size);
+    rd = file->pread(read_buf, persisted_size, 0);
+    ASSERT_EQ(rd, static_cast<ssize_t>(persisted_size));
+    for (int j = 0; j < num_success_rounds; j++) {
+      ASSERT_EQ(read_buf[j * chunk], 'A' + j)
+          << "Post-immutable read mismatch at chunk " << j;
+    }
+
+    // Write returns -EIO (immutable) at multiple offsets
+    for (int i = 0; i < 5; i++) {
+      w = write_to_file_handle(handle, buf, 1024,
+                               persisted_size + chunk + i * 1024);
+      ASSERT_EQ(w, -EIO);
+    }
+
+    // Repeated fsync also fails
+    for (int i = 0; i < 3; i++) {
+      r = fsync_file_handle(handle);
+      ASSERT_NE(r, 0);
+    }
+
+    fs_->release(nodeid, file);
+    fs_->forget(nodeid, 1);
+
+    // Phase 4: Reopen read-only, verify all persisted data intact
+    handle = nullptr;
+    r = fs_->lookup(parent, filepath.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    bool unused = false;
+    r = fs_->open(nodeid, O_RDONLY, &handle, &unused);
+    ASSERT_EQ(r, 0);
+    file = get_file_from_handle(handle);
+
+    memset(read_buf, 0, persisted_size);
+    rd = read_from_handle(handle, read_buf, persisted_size, 0);
+    ASSERT_EQ(rd, static_cast<ssize_t>(persisted_size));
+    for (int j = 0; j < num_success_rounds; j++) {
+      char expected = 'A' + j;
+      // Check first and last byte of each chunk
+      ASSERT_EQ(read_buf[j * chunk], expected)
+          << "Reopen verify chunk " << j << " start";
+      ASSERT_EQ(read_buf[j * chunk + chunk - 1], expected)
+          << "Reopen verify chunk " << j << " end";
+    }
+
+    fs_->release(nodeid, file);
+  }
+
+  // Verify block cache retention for small file when one handle closes while
+  // another handle still active. Ensures cache is not completely evicted in
+  // multi-handle scenario.
+  void verify_small_file_block_cache_after_release() {
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::string filepath = "testfile_small_cache_retention";
+    uint64_t nodeid = 0;
+    const size_t file_size = 512 * 1024;
+
+    void *handle_write = nullptr;
+    int r = create_and_flush(parent, filepath.c_str(), CREATE_BASE_FLAGS, 0777,
+                             0, 0, 0, &nodeid, &st, &handle_write);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto file_write = get_file_from_handle(handle_write);
+    char *write_buf = new char[file_size];
+    DEFER(delete[] write_buf);
+    for (size_t i = 0; i < file_size; i++) {
+      write_buf[i] = 'A' + (i % 26);
+    }
+
+    ssize_t written = file_write->pwrite(write_buf, file_size, 0);
+    ASSERT_EQ(written, static_cast<ssize_t>(file_size));
+
+    r = fsync_file_handle(handle_write);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->release(nodeid, file_write);
+    ASSERT_EQ(r, 0);
+
+    // Open handle1 and read entire file to establish cache
+    void *handle1 = nullptr;
+    bool unused = false;
+    r = fs_->open(nodeid, O_RDONLY, &handle1, &unused);
+    ASSERT_EQ(r, 0);
+
+    auto file1 = get_file_from_handle(handle1);
+
+    // Use pin to populate cache
+    void *pin_buf1 = nullptr;
+    ssize_t pin_ret1 = file1->pin(0, file_size, &pin_buf1);
+    ASSERT_EQ(pin_ret1, static_cast<ssize_t>(file_size));
+
+    for (size_t i = 0; i < file_size; i++) {
+      ASSERT_EQ(((char *)pin_buf1)[i], write_buf[i]);
+    }
+    file1->unpin(0);
+
+    // Open handle2 and pin first half
+    void *handle2 = nullptr;
+    r = fs_->open(nodeid, O_RDONLY, &handle2, &unused);
+    ASSERT_EQ(r, 0);
+
+    auto file2 = get_file_from_handle(handle2);
+
+    const size_t half_size = file_size / 2;
+    void *pin_buf2_first = nullptr;
+    ssize_t pin_ret2_first = file2->pin(0, half_size, &pin_buf2_first);
+    ASSERT_EQ(pin_ret2_first, static_cast<ssize_t>(half_size));
+
+    for (size_t i = 0; i < half_size; i++) {
+      ASSERT_EQ(((char *)pin_buf2_first)[i], write_buf[i]);
+    }
+    file2->unpin(0);
+
+    // Release handle1, cache should retain at least 1 block
+    r = fs_->release(nodeid, file1);
+    ASSERT_EQ(r, 0);
+
+    // Verify cache retention via pin on second half
+    void *pin_buf2_second = nullptr;
+    ssize_t pin_ret2_second =
+        file2->pin(half_size, file_size - half_size, &pin_buf2_second);
+    ASSERT_EQ(pin_ret2_second, static_cast<ssize_t>(file_size - half_size));
+
+    for (size_t i = half_size; i < file_size; i++) {
+      ASSERT_EQ(((char *)pin_buf2_second)[i - half_size], write_buf[i]);
+    }
+    file2->unpin(half_size);
+
+    r = fs_->release(nodeid, file2);
+    ASSERT_EQ(r, 0);
   }
 
  private:
@@ -2183,30 +2894,30 @@ TEST_F(Ossfs2ReadWriteTest, verify_specified_prefetch_chunks) {
   verify_prefetch_chunks(4);
 }
 
-TEST_F(Ossfs2ReadWriteTest, verify_inode_cache) {
+TEST_F(Ossfs2ReadWriteTest, verify_share_fd_read_buffer) {
   INIT_PHOTON();
   OssFsOptions opts;
-  opts.bind_cache_to_inode = true;
+  opts.share_fd_read_buffer = true;
   init(opts, 100, "", true);
 
   verify_concurrent_write_and_read("ALL_FILES_PER_WORKER", 53, 32);
 }
 
-TEST_F(Ossfs2ReadWriteTest, verify_inode_cache_random_select) {
+TEST_F(Ossfs2ReadWriteTest, verify_share_fd_read_buffer_random_select) {
   INIT_PHOTON();
   OssFsOptions opts;
-  opts.bind_cache_to_inode = true;
+  opts.share_fd_read_buffer = true;
   init(opts, 100, "", true);
 
   verify_concurrent_write_and_read("RANDOM", 25, 16);
 }
 
-TEST_F(Ossfs2ReadWriteTest, verify_close_to_open_with_inode_cache) {
+TEST_F(Ossfs2ReadWriteTest, verify_close_to_open_with_share_fd_read_buffer) {
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
 
-  verify_close_to_open_with_inode_cache();
+  verify_close_to_open_with_cache();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_open_with_append_flag) {
@@ -2243,6 +2954,24 @@ TEST_F(Ossfs2ReadWriteTest, verify_remote_change_with_existing_fh_parallel) {
   verify_remote_change_with_existing_fh_parallel();
 }
 
+TEST_F(Ossfs2ReadWriteTest, verify_refill_with_remote_shrink) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  init(opts);
+
+  verify_refill_with_remote_shrink();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_refill_with_remote_shrink_concurrent) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  init(opts);
+
+  verify_refill_with_remote_shrink_concurrent();
+}
+
 TEST_F(Ossfs2ReadWriteTest, verify_random_read_range) {
   INIT_PHOTON();
   OssFsOptions opts;
@@ -2257,4 +2986,189 @@ TEST_F(Ossfs2ReadWriteTest, verify_random_read_write_and_truncate) {
   init(opts);
 
   verify_random_read_write_and_truncate();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_multipart_complete_with_immutable) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.upload_buffer_size = 131072;  // Small buffer to trigger more parts
+  init(opts);
+  verify_multipart_complete_with_immutable();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_immutable_writer_behavior) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_immutable_writer_behavior();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_merge_remote_data_download_failure) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_merge_remote_data_download_failure();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_mixed_read_write) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_mixed_read_write();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_mixed_read_write_with_immutable) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_mixed_read_write_with_immutable();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_small_file_block_cache_after_release) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.prefetch_concurrency = 1;
+  opts.share_fd_read_buffer = true;
+  init(opts, -1, "", true);
+  verify_small_file_block_cache_after_release();
+}
+
+TEST_F(Ossfs2ReadWriteTest,
+       verify_small_file_block_cache_after_release_no_share) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.prefetch_concurrency = 1;
+  opts.share_fd_read_buffer = false;
+  init(opts, -1, "", true);
+  verify_small_file_block_cache_after_release();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_concurrent_write_and_read("ALL_FILES_PER_WORKER", 13, 8);
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_disk_cache_random_select) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_concurrent_write_and_read("RANDOM", 17, 8);
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_read_write_with_disk_cache_init_failed) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  g_fault_injector->set_injection(FaultInjectionId::FI_DiskCache_Init_Failure);
+  DEFER(g_fault_injector->clear_injection(
+      FaultInjectionId::FI_DiskCache_Init_Failure));
+
+  verify_concurrent_write_and_read("RANDOM", 3, 4);
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_read_out_of_range_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.upload_buffer_size = 1048576 * 2;
+  opts.prefetch_chunk_size = 1048576 * 2;
+  opts.attr_timeout = 30;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_read_out_of_range();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_close_to_open_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_close_to_open_with_cache();
+}
+
+TEST_F(Ossfs2ReadWriteTest,
+       verify_random_read_write_and_truncate_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_random_read_write_and_truncate();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_fd_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+  verify_read_dirty_fd();
+}
+
+TEST_F(Ossfs2ReadWriteTest,
+       verify_local_change_with_existing_fh_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_local_change_with_existing_fh();
+}
+
+TEST_F(Ossfs2ReadWriteTest,
+       verify_remote_change_with_existing_fh_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_remote_change_with_existing_fh();
+}
+
+TEST_F(Ossfs2ReadWriteTest,
+       verify_remote_change_with_existing_fh_parallel_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_remote_change_with_existing_fh_parallel();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_random_read_range_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+
+  verify_random_read_range();
+}
+
+// Psync tests: force psync IO engine.
+TEST_F(Ossfs2ReadWriteTest, verify_disk_cache_psync) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts, -1, "", false, photon::fs::ioengine_psync);
+
+  verify_concurrent_write_and_read("ALL_FILES_PER_WORKER", 9, 4);
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_disk_cache_psync_random_read) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts, -1, "", false, photon::fs::ioengine_psync);
+
+  verify_random_read_range();
 }

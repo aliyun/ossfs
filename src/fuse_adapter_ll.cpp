@@ -160,7 +160,7 @@ static void ossfs2_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
 }
 
 static void ossfs2_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup) {
-  LOG_DEBUG("FORGET. pid: `, parent: `, nlookup: `", get_pid(req), ino,
+  LOG_DEBUG("FORGET. pid: `, nodeid: `, nlookup: `", get_pid(req), ino,
             nlookup);
 
   DECLARE_METRIC_LATENCY(forget, MetricsType::kFsMetrics);
@@ -616,8 +616,6 @@ int fuse_session_loop_mt_with_photon(struct fuse_session *se, int threads,
 
   for (int i = 0; i < threads; ++i) {
     pthread_t thread_id;
-
-    int res;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     res = pthread_create(&thread_id, &attr, fuse_do_work, &ctx);

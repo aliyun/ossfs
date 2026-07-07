@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 
-project(ossfs2 VERSION 2.0.7)
+project(ossfs2 VERSION 2.0.8)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 include(FindPackageHandleStandardArgs)
@@ -83,10 +83,11 @@ set(GFLAGS_SOURCE "file://${DEPS_SOURCE_DIR}/gflags-2.2.2.tar.gz" CACHE STRING "
 set(GOOGLETEST_SOURCE "file://${DEPS_SOURCE_DIR}/googletest-1.12.1.tar.gz" CACHE STRING "")
 set(OPENSSL_SOURCE "file://${DEPS_SOURCE_DIR}/openssl-1.1.1w.tar.gz" CACHE STRING "")
 set(AIO_SOURCE "file://${DEPS_SOURCE_DIR}/libaio-0.3.113.tar.gz" CACHE STRING "")
+set(CITYHASH_SOURCE "file://${DEPS_SOURCE_DIR}/cityhash-1.1.1.tar.gz" CACHE STRING "")
 
 message("patching PhotonLibOS with fault injections")
 find_program(TAR_EXECUTABLE tar REQUIRED)
-set(PHOTON_TARBALL "${CMAKE_SOURCE_DIR}/dependencies/src/PhotonLibOS-0.9.3.tar.gz")
+set(PHOTON_TARBALL "${CMAKE_SOURCE_DIR}/dependencies/src/PhotonLibOS-${PHOTONLIBOS_REF}-src.tar.gz")
 set(PATCH_FILE     "${CMAKE_SOURCE_DIR}/dependencies/patches/photon_injections.patch")
 set(PHOTON_PATCHED_SRC_DIR "${CMAKE_BINARY_DIR}/PhotonLibOS-patched")
 
@@ -111,7 +112,7 @@ add_custom_target(photon_patched
   DEPENDS ${PHOTON_PATCHED_SRC_DIR}/.patched
 )
 
-set(deps openssl gflags aio)
+set(deps openssl gflags aio cityhash)
 if (ENABLE_TESTING)
   list(APPEND deps googletest)
 endif ()
@@ -141,7 +142,8 @@ include_directories(
   ${OPENSSL_INCLUDE_DIRS}
   ${GFLAGS_INCLUDE_DIRS}
   ${CLI11_INCLUDE_DIRS}
-  ${AIO_INCLUDE_DIRS})
+  ${AIO_INCLUDE_DIRS}
+  ${CITYHASH_INCLUDE_DIRS})
 
 file(GLOB_RECURSE ossfs2_common_srcs RELATIVE "${PROJECT_SOURCE_DIR}"
   src/common/*.cpp
@@ -161,7 +163,8 @@ set(static_deps
   ${PHOTONLIBOS_LIBRARIES}
   ${OPENSSL_LIBRARIES}
   ${GFLAGS_LIBRARIES}
-  ${AIO_LIBRARIES})
+  ${AIO_LIBRARIES}
+  ${CITYHASH_LIBRARIES})
 
 add_library(ossfs2_common STATIC ${ossfs2_common_srcs})
 
@@ -295,7 +298,9 @@ if(CPACK_GENERATOR MATCHES "RPM")
   set(CPACK_RPM_DEBUGINFO_PACKAGE_REQUIRES 
     "${CPACK_PACKAGE_NAME} = ${CPACK_PACKAGE_VERSION}-${CPACK_RPM_PACKAGE_RELEASE}")
   set(CPACK_COMPONENT_DEBUGINFO_DESCRIPTION "${CPACK_PACKAGE_DEBUGINFO_DESCRIPTION}")
-elseif(CPACK_GENERATOR MATCHES "DEB")
+endif()
+
+if(CPACK_GENERATOR MATCHES "DEB")
   set(CPACK_DEB_COMPONENT_INSTALL ON)
 
   set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6 (>= 2.17), ca-certificates")

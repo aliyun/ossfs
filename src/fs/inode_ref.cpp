@@ -197,10 +197,7 @@ static void dequeue_path(LockQueueElement **head_ptr, LockQueueElement *qe) {
 static int wait_path(LockQueueElement **head_ptr, LockQueueElement *qe,
                      std::unique_lock<std::mutex> &l) {
   queue_path(head_ptr, qe);
-  do {
-    qe->cv.wait(l);
-  } while (!qe->done);
-
+  qe->cv.wait(l, [&] { return qe->done; });
   dequeue_path(head_ptr, qe);
   return qe->err;
 }

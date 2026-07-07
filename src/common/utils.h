@@ -57,3 +57,5 @@ bool is_valid_fd(int fd);
 
 std::vector<std::string_view> split_string(std::string_view str,
                                            std::string_view delimiter);
+
+std::string cityhash128_base64url(std::string_view data);

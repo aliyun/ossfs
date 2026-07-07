@@ -15,6 +15,9 @@
  */
 
 #include <photon/ecosystem/simple_dom.h>
+#include <photon/thread/thread.h>
+
+#include <chrono>
 
 #include "common/logger.h"
 #include "common/utils.h"
@@ -45,51 +48,120 @@ time_t CredentialsParser::expiration_to_time(std::string_view expiration) {
 
 CredentialsProvider::CredentialsInfo CredentialsProvider::refresh_credentials(
     CredentialsValidator validator) {
-  const auto interval = std::chrono::microseconds(15ULL * 1000 * 1000);
-  const int expire_margin_in_sec = 60 * 20;
-
-  // Should not be refreshed parallel.
-  static time_t expiration = 0;
-
-  if (expiration >= time(nullptr) + expire_margin_in_sec) {
-    return {nullptr, interval.count()};
+  if (refresh_interval_sec_ > 0) {
+    return refresh_with_fixed_interval(validator);
   }
 
-  OssCredentials creds;
+  // Expiration-based refresh mode.
+  const auto poll_interval = std::chrono::microseconds(15ULL * 1000 * 1000);
+  const int expire_margin_in_sec = 60 * 20;
+
+  if (current_expiration_ >= time(nullptr) + expire_margin_in_sec) {
+    return {nullptr, poll_interval.count()};
+  }
+
+  ObjCredentials new_creds;
   time_t new_expiration = 0;
   const int max_retry = 3;
   int r = 0;
   for (int i = 0; i < max_retry; i++) {
-    r = get_credentials(creds, new_expiration);
+    auto t0 = std::chrono::steady_clock::now();
+    r = get_credentials(new_creds, new_expiration);
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    LOG_INFO("get_credentials attempt ` completed in ` us, r: `", i + 1,
+             elapsed, r);
     if (r == 0) break;
     photon::thread_usleep(100000);
   }
 
   if (r != 0) {
-    // Retry after 15s.
     return {nullptr, kRetryIntervalInUsec};
   }
 
-  if (!validator(creds)) {
-    // Force refresh next time.
-    expiration = 0;
+  if (is_credentials_changed(new_creds, new_expiration) &&
+      !validator(new_creds)) {
+    current_expiration_ = 0;
     return {nullptr, kRetryIntervalInUsec};
   }
+
+  current_creds_ = new_creds;
+  current_expiration_ = new_expiration;
 
   if (new_expiration == -1) {
-    return {std::make_shared<OssCredentials>(creds), -1};
+    // Never expires, no auto refresh.
+    return {std::make_shared<ObjCredentials>(current_creds_), -1};
+  }
+  return {std::make_shared<ObjCredentials>(current_creds_),
+          poll_interval.count()};
+}
+
+CredentialsProvider::CredentialsInfo
+CredentialsProvider::refresh_with_fixed_interval(
+    CredentialsValidator validator) {
+  time_t now = time(nullptr);
+
+  time_t next_refresh_time = last_refresh_time_ + refresh_interval_sec_;
+  if (last_refresh_time_ > 0 && now < next_refresh_time) {
+    int64_t wait_sec = next_refresh_time - now;
+    return {nullptr, std::chrono::seconds(wait_sec).count() * 1000000};
   }
 
-  expiration = new_expiration;
-  return {std::make_shared<OssCredentials>(creds), interval.count()};
+  ObjCredentials new_creds;
+  time_t new_expiration = 0;
+  const int max_retry = 3;
+  int r = 0;
+  for (int i = 0; i < max_retry; i++) {
+    auto t0 = std::chrono::steady_clock::now();
+    r = get_credentials(new_creds, new_expiration);
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    LOG_INFO("get_credentials attempt ` completed in ` us, r: `", i + 1,
+             elapsed, r);
+    if (r == 0) break;
+    photon::thread_usleep(100000);
+  }
+
+  if (r != 0) {
+    return {nullptr, kRetryIntervalInUsec};
+  }
+
+  // Skip validation if credentials haven't changed.
+  // In fixed interval mode, force expiration to 0 so it won't trigger changed.
+  if (is_credentials_changed(new_creds, 0) && !validator(new_creds)) {
+    last_refresh_time_ = 0;
+    return {nullptr, kRetryIntervalInUsec};
+  }
+
+  current_creds_ = new_creds;
+  last_refresh_time_ = time(nullptr);
+
+  return {std::make_shared<ObjCredentials>(current_creds_),
+          std::chrono::seconds(refresh_interval_sec_).count() * 1000000};
+}
+
+bool CredentialsProvider::is_credentials_changed(
+    const ObjCredentials &new_creds, time_t new_expiration) const {
+  // Always return true when current_creds_.accessKeyId is empty.
+  if (current_creds_.accessKeyId.empty()) {
+    return true;
+  }
+
+  return current_creds_.accessKeyId != new_creds.accessKeyId ||
+         current_creds_.accessKeySecret != new_creds.accessKeySecret ||
+         current_creds_.securityToken != new_creds.securityToken ||
+         current_expiration_ != new_expiration;
 }
 
 CredentialsProvider *new_ram_role_creds_provider(std::string_view ram_role) {
   return new RamRoleCredentialsProvider(ram_role);
 }
 
-CredentialsProvider *new_process_creds_provider(std::string_view process_cmd) {
-  return new ProcessCredentialsProvider(process_cmd);
+CredentialsProvider *new_process_creds_provider(std::string_view process_cmd,
+                                                uint64_t refresh_interval_sec) {
+  return new ProcessCredentialsProvider(process_cmd, refresh_interval_sec);
 }
 
 };  // namespace OssFileSystem

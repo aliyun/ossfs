@@ -63,6 +63,25 @@ function(build_from_src [dep])
     )
     set(AIO_INCLUDE_DIRS ${BINARY_DIR}/include PARENT_SCOPE)
     set(AIO_LIBRARIES ${BINARY_DIR}/lib/libaio.a PARENT_SCOPE)
+
+  elseif (dep STREQUAL "cityhash")
+    set(BINARY_DIR ${PROJECT_BINARY_DIR}/cityhash-build)
+    ExternalProject_Add(
+            cityhash
+            URL ${CITYHASH_SOURCE}
+            URL_MD5 ec209861c0f4d7520174ef2a40b64deb
+            UPDATE_DISCONNECTED ON
+            BUILD_IN_SOURCE ON
+            PATCH_COMMAND touch aclocal.m4 configure Makefile.in src/Makefile.in config.h.in
+            CONFIGURE_COMMAND ./configure --build=${ARCH}-unknown-linux-gnu --prefix=${BINARY_DIR} --disable-shared
+            BUILD_COMMAND $(MAKE) all CXXFLAGS=-g\ -O3\ -fPIC
+            INSTALL_COMMAND $(MAKE) install
+            LOG_CONFIGURE ON
+            LOG_BUILD ON
+            LOG_INSTALL ON
+    )
+    set(CITYHASH_INCLUDE_DIRS ${BINARY_DIR}/include PARENT_SCOPE)
+    set(CITYHASH_LIBRARIES ${BINARY_DIR}/lib/libcityhash.a PARENT_SCOPE)
   endif ()
 
   list(APPEND actually_built ${dep})

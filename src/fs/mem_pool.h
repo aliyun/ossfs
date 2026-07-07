@@ -46,6 +46,12 @@ class FixedBlockMemoryPool {
 
   size_t used_blocks();
 
+  size_t block_size() const {
+    return block_size_;
+  }
+
+  double get_usage_ratio();
+
   FixedBlockMemoryPool(const FixedBlockMemoryPool &) = delete;
   FixedBlockMemoryPool &operator=(const FixedBlockMemoryPool &) = delete;
   FixedBlockMemoryPool(FixedBlockMemoryPool &&) = delete;

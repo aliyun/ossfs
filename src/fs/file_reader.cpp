@@ -21,28 +21,25 @@
 #include "error_codes.h"
 #include "file.h"
 #include "fs.h"
+#include "mem_cache.h"
 #include "metric/metrics.h"
 
 namespace OssFileSystem {
 
 OssCachedReader::OssCachedReader(OssFs *fs, std::string_view path,
-                                 FileInode *inode)
+                                 FileInode *inode,
+                                 std::shared_ptr<ICache> cache,
+                                 CacheHandle *cache_handle)
     : EnableFilePrefetching<OssCachedReader>::EnableFilePrefetching(fs),
+      cache_(std::move(cache)),
+      cache_handle_(cache_handle),
       remote_size_(inode->attr.size),
       mtime_(inode->attr.mtime),
       inode_(inode),
       path_(path) {
-  const size_t block_size = fs_->options_.cache_block_size;
+  const size_t block_size = cache_->block_size();
   size_t init_num_blocks =
       (fs_->options_.cache_refill_unit + block_size - 1) / block_size;
-
-  if (inode_->cache_manager) {
-    cache_manager_ = inode_->cache_manager;
-  } else {
-    cache_manager_ = std::make_shared<BlockCacheManager>(block_size);
-  }
-
-  std::tie(cache_, range_lock_) = cache_manager_->get();
 
   // Only allow min_reserved_buffer_size_per_file to be set to 0 or 1 MB
   // currently.
@@ -58,11 +55,7 @@ OssCachedReader::OssCachedReader(OssFs *fs, std::string_view path,
 OssCachedReader::~OssCachedReader() {
   wait_prefetch_done();
 
-  cache_manager_->release(
-      [this](const std::vector<char *> &blocks) {
-        fs_->download_buffers_->deallocate(blocks);
-      },
-      total_blocks_);
+  cache_->release(cache_handle_, total_blocks_);
 
   fs_->active_file_handles_.fetch_sub(1);
 }
@@ -103,8 +96,8 @@ ssize_t OssCachedReader::do_pread(void *buf, size_t count, off_t offset,
 again:
   ssize_t r = 0;
   {
-    ScopedRangeLock rl(*range_lock_, offset, count);
-    r = cache_->pread(static_cast<char *>(buf), offset, count);
+    ScopedRangeLock rl(*range_lock(), offset, count);
+    r = cache_handle_->pread(static_cast<char *>(buf), offset, count);
   }
 
   if (r > 0) {
@@ -116,7 +109,7 @@ again:
   auto refill_end = align_up(offset + count, refill_unit);
   auto refill_size =
       std::min(get_remote_size() - refill_offset, refill_end - refill_offset);
-  r = GET_BACKGROUND_OSS_CLIENT_AND_DO_SYNC_FUNC(
+  r = GET_BACKGROUND_OBJ_STORE_AND_PERFORM(
       fs_, do_refill_range, refill_offset, refill_size, count,
       static_cast<char *>(buf), offset, false);
   if (r == -EAGAIN) {
@@ -126,7 +119,7 @@ again:
     // Fall back to reading from OSS directly.
     iovec iov{buf, count};
     IOVector input(&iov, 1);
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_get_object_range, path_,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, get_object_range, path_,
                                        input.iovec(), input.iovcnt(), offset);
     if (r < 0) {
       LOG_ERROR("fail to read ` from oss, offset:`, size:`, r: `", path_,
@@ -163,7 +156,8 @@ ssize_t OssCachedReader::pread(void *buf, size_t count, off_t offset) {
 
   auto ret = do_pread(buf, count, offset, fs_->options_.cache_refill_unit);
   if (ret > 0) {
-    set_latest_read_off(offset);
+    cache_handle_->on_read_success(
+        offset, get_prefetch_buffer_size(prefetch_window_size_));
   }
   return ret;
 }
@@ -171,7 +165,7 @@ ssize_t OssCachedReader::pread(void *buf, size_t count, off_t offset) {
 ssize_t OssCachedReader::pin_rlocked(off_t offset, size_t count, void **buf) {
   // Fallback to pread().
   if (inode_->is_dirty) return -ENOTSUP;
-  if (refresh_attr_if_needed_and_invoke([&]() { cache_->drop(); })) {
+  if (refresh_attr_if_needed_and_invoke([&]() { cache_handle_->drop(); })) {
     return -ENOENT;
   }
   return -E_CONTINUE_PIN;
@@ -186,20 +180,21 @@ ssize_t OssCachedReader::pin(off_t offset, size_t count, void **buf) {
   count = std::min(count, (size_t)remote_size - offset);
   do_prefetch(remote_size, offset, count);
 
-  ssize_t ret = cache_->pin(offset, count, buf);
+  ssize_t ret = cache_handle_->pin(offset, count, buf);
   if (ret > 0) {
-    set_latest_read_off(offset);
+    cache_handle_->on_read_success(
+        offset, get_prefetch_buffer_size(prefetch_window_size_));
   }
 
   return ret;
 }
 
 void OssCachedReader::unpin(off_t offset) {
-  cache_->unpin(offset);
+  cache_handle_->unpin(offset);
 }
 
-ssize_t OssCachedReader::bg_try_refill_range(OssAdapter *oss_client,
-                                             off_t offset, size_t count) {
+ssize_t OssCachedReader::bg_try_refill_range(IObjStore *obj_store, off_t offset,
+                                             size_t count) {
   auto remote_size = get_remote_size();
   if (offset >= remote_size) return 0;
   if (offset + static_cast<off_t>(count) > remote_size) {
@@ -207,10 +202,10 @@ ssize_t OssCachedReader::bg_try_refill_range(OssAdapter *oss_client,
   }
 
 again:
-  auto res = cache_->query_refill_range(offset, count);
+  auto res = cache_handle_->query_refill_range(offset, count);
   if (0 == res.second) return count;
 
-  ssize_t ret = do_refill_range(oss_client, res.first, res.second, count,
+  ssize_t ret = do_refill_range(obj_store, res.first, res.second, count,
                                 nullptr, 0, true);
   if (ret == -EAGAIN) {
     AUTO_USLEEP(100);
@@ -225,14 +220,20 @@ again:
   return ret;
 }
 
-ssize_t OssCachedReader::do_refill_range(OssAdapter *oss_client,
+ssize_t OssCachedReader::do_refill_range(IObjStore *obj_store,
                                          uint64_t refill_off,
                                          uint64_t refill_size, size_t count,
                                          char *input, off_t offset,
                                          bool from_bg_prefetch) {
   ssize_t ret = 0;
+  FAULT_INJECTION(FaultInjectionId::FI_Do_Refill_Range_Delay,
+                  []() { AUTO_USLEEP(1'000'000); });
   off_t remote_size = get_remote_size();
-  if (refill_off + refill_size > static_cast<uint64_t>(remote_size)) {
+  if (refill_off >= static_cast<uint64_t>(remote_size)) {
+    LOG_DEBUG("refill_off(`) >= remote_size(`), skip refill", refill_off,
+              remote_size);
+    return 0;
+  } else if (refill_off + refill_size > static_cast<uint64_t>(remote_size)) {
     refill_size = remote_size - refill_off;
   }
 
@@ -241,22 +242,23 @@ ssize_t OssCachedReader::do_refill_range(OssAdapter *oss_client,
     if (!from_bg_prefetch) fs_->prefetch_sem_->signal(1);
   });
 
-  ret = range_lock_->try_lock_wait(refill_off, refill_size);
+  ret = range_lock()->try_lock_wait(refill_off, refill_size);
   if (ret < 0) return -EAGAIN;
 
-  DEFER({ range_lock_->unlock(refill_off, refill_size); });
+  DEFER({ range_lock()->unlock(refill_off, refill_size); });
 
-  std::vector<iovec> blocks;
-  ret = cache_->try_lock_blocks(refill_off, refill_size, blocks);
-  if (ret < 0) {
-    return ret;
-  }
+  RangeBuffer range_buffer;
+  range_buffer.offset = refill_off;
+  range_buffer.count = refill_size;
+  ret = cache_handle_->acquire_write_buffer(range_buffer);
+  if (ret < 0) return ret;
 
   DECLARE_METRIC_LATENCY(refill_range, Metric::kInternalMetrics);
 
+  auto &buffer = range_buffer.buffer;
   auto start_time = std::chrono::steady_clock::now();
-  ret = oss_client->oss_get_object_range(path_, &blocks[0], blocks.size(),
-                                         refill_off);
+  ret = obj_store->get_object_range(path_, buffer.iovec(), buffer.iovcnt(),
+                                    refill_off);
   auto end_time = std::chrono::steady_clock::now();
 
   uint64_t lat = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -265,7 +267,7 @@ ssize_t OssCachedReader::do_refill_range(OssAdapter *oss_client,
   fs_->update_max_oss_rw_lat(lat);
 
   if (ret < 0) {
-    cache_->unlock_blocks(refill_off, refill_size, true);
+    cache_handle_->release_write_buffer(range_buffer, true);
     // clang-format off
     LOG_ERROR(
         "src file ` read failed, read : `, expectRead : `, remote_size : `, offset : `, r: `",
@@ -275,38 +277,53 @@ ssize_t OssCachedReader::do_refill_range(OssAdapter *oss_client,
   }
 
   if (input) {
-    RELEASE_ASSERT(offset >= (off_t)refill_off);
+    RELEASE_ASSERT(offset >= static_cast<off_t>(refill_off));
 
-    // Find the first block.
-    int i = 0;
-    size_t block_off = offset - refill_off;
-    while (block_off > 0) {
-      if (blocks[i].iov_len <= block_off) {
-        block_off -= blocks[i].iov_len;
-        i++;
-      } else {
-        break;
-      }
-    }
-
-    size_t read = 0;
-    while (read < count) {
-      size_t read_size = std::min(blocks[i].iov_len - block_off, count - read);
-      memcpy(input + read, static_cast<char *>(blocks[i].iov_base) + block_off,
-             read_size);
-
-      block_off = 0;
-      read += read_size;
-      i++;
-    }
+    iovector_view tail_buffer;
+    tail_buffer.iovcnt = 0;
+    size_t tail_size = refill_size - (offset - refill_off);
+    buffer.slice(tail_size, offset - refill_off, &tail_buffer);
+    ret = tail_buffer.memcpy_to(input, count);
+    RELEASE_ASSERT(ret == static_cast<ssize_t>(count));
   }
 
-  cache_->unlock_blocks(refill_off, refill_size);
+  cache_handle_->release_write_buffer(range_buffer);
   return count;
 }
 
 bool OssCachedReader::has_enough_space(size_t size) {
-  return cache_manager_->capacity() * cache_->block_size() >= size;
+  size_t block_size = cache_->block_size();
+  return cache_->capacity() >= (size + block_size - 1) / block_size;
+}
+
+// Memory-aware prefetch control based on pool usage.
+// Layer 1 (0 - low):    Full window, aggressive expansion (2x)
+// Layer 2 (low - high): Reduced window, moderate expansion (1.5x)
+// Layer 3 (high+):      Minimum window, conservative expansion (1.25x)
+size_t OssCachedReader::get_dynamic_max_window(size_t configured_max,
+                                               double pool_usage) const {
+  if (pool_usage < kPoolUsageLowThreshold) {
+    return configured_max;
+  } else if (pool_usage < kPoolUsageHighThreshold) {
+    // Linear reduction: low -> 100%, high -> kMinWindowRatio
+    double ratio =
+        1.0 - (pool_usage - kPoolUsageLowThreshold) /
+                  (kPoolUsageHighThreshold - kPoolUsageLowThreshold) *
+                  (1.0 - kMinWindowRatio);
+    return static_cast<size_t>(configured_max * ratio);
+  } else {
+    return prefetch_chunk_size_ * 4;
+  }
+}
+
+double OssCachedReader::get_dynamic_expansion_factor(double pool_usage) const {
+  if (pool_usage < kPoolUsageLowThreshold) {
+    return kExpansionFactorAtLowUsage;
+  } else if (pool_usage < kPoolUsageHighThreshold) {
+    return kExpansionFactorAtMedUsage;
+  } else {
+    return kExpansionFactorAtHighUsage;
+  }
 }
 
 // By default, each file handle attempts to allocate prefetch chunk memory from
@@ -314,16 +331,25 @@ bool OssCachedReader::has_enough_space(size_t size) {
 // is insufficient. This allocated memory is released when the file handle is
 // closed. File handles that cannot obtain sufficient prefetch chunk memory will
 // experience degraded performance due to the lack of prefetching capabilities.
-void OssCachedReader::try_expand_prefetch_window(off_t remote_size) {
+void OssCachedReader::try_expand_prefetch_window(off_t remain_prefetch_size) {
+  if (is_prefetch_too_far_ahead()) return;
+
   const size_t block_size = cache_->block_size();
-  auto max_prefetch_window_size =
-      align_up(std::min(fs_->max_prefetch_window_size_per_handle_,
-                        static_cast<size_t>(remote_size)),
-               block_size);
+
+  auto pool_usage = fs_->download_buffers_->get_usage_ratio();
+  auto configured_max_window =
+      std::min(fs_->max_prefetch_window_size_per_handle_,
+               static_cast<size_t>(remain_prefetch_size));
+  auto max_prefetch_window_size = align_up(
+      get_dynamic_max_window(configured_max_window, pool_usage), block_size);
 
   if (prefetch_window_size_ < max_prefetch_window_size) {
-    auto target_prefetch_windows_size =
-        std::min(prefetch_window_size_ * 2, max_prefetch_window_size);
+    double expansion_factor = get_dynamic_expansion_factor(pool_usage);
+
+    auto target_prefetch_windows_size = align_up(
+        std::min(static_cast<size_t>(prefetch_window_size_ * expansion_factor),
+                 max_prefetch_window_size),
+        block_size);
     if (target_prefetch_windows_size == 0) {
       target_prefetch_windows_size =
           std::min(prefetch_chunk_size_ * 4, max_prefetch_window_size);
@@ -331,20 +357,20 @@ void OssCachedReader::try_expand_prefetch_window(off_t remote_size) {
 
     size_t target_total_buffer_size =
         get_prefetch_buffer_size(target_prefetch_windows_size);
-    target_total_buffer_size =
-        std::min(target_total_buffer_size, static_cast<size_t>(remote_size));
+    target_total_buffer_size = std::min(
+        target_total_buffer_size, static_cast<size_t>(remain_prefetch_size));
     size_t target_total_blocks =
         (target_total_buffer_size + block_size - 1) / block_size;
     target_total_blocks = std::max(target_total_blocks, total_blocks_);
 
     auto allocated_blocks = try_realloc_cache_blocks(target_total_blocks, true);
     if (allocated_blocks > 0) {
-      auto old = prefetch_window_size_;
+      auto old = prefetch_window_size_.load();
       prefetch_window_size_ =
           std::min(get_prefetch_window_size(total_blocks_ * block_size),
                    max_prefetch_window_size);
       LOG_DEBUG("[file=`] ` expand prefetch_window_size: ` to `", this, path_,
-                old, prefetch_window_size_);
+                old, prefetch_window_size_.load());
     }
   }
 }
@@ -352,17 +378,13 @@ void OssCachedReader::try_expand_prefetch_window(off_t remote_size) {
 size_t OssCachedReader::try_realloc_cache_blocks(uint64_t new_total_blocks,
                                                  bool from_bg_prefetch) {
   RELEASE_ASSERT(new_total_blocks >= total_blocks_);
-  const size_t block_size = cache_manager_->block_size();
+  const size_t block_size = cache_->block_size();
   uint64_t new_num_blocks = new_total_blocks - total_blocks_;
   if (new_num_blocks == 0) return 0;
 
   uint64_t max_blocks = (get_remote_size() + block_size - 1) / block_size;
-  size_t allocated_blocks = cache_manager_->try_expand_blocks(
-      [this, from_bg_prefetch](uint64_t num_blocks) {
-        return fs_->download_buffers_->try_allocate(num_blocks,
-                                                    !from_bg_prefetch);
-      },
-      new_num_blocks, max_blocks);
+  size_t allocated_blocks =
+      cache_->try_expand_blocks(new_num_blocks, max_blocks, !from_bg_prefetch);
   total_blocks_ += allocated_blocks;
   return allocated_blocks;
 }
@@ -445,10 +467,6 @@ ssize_t OssCachedReader::read_from_dirty_inode(void *buf, size_t count,
   return read;
 }
 
-void OssCachedReader::set_latest_read_off(off_t offset) {
-  cache_->set_latest_read_off(offset);
-}
-
 int OssCachedReader::close() {
   wait_prefetch_done();
   return 0;
@@ -478,8 +496,8 @@ ssize_t OssDirectReader::pread(void *buf, size_t count, off_t offset) {
 
   iovec iov{buf, count};
   IOVector input(&iov, 1);
-  ssize_t ret = DO_SYNC_BACKGROUND_OSS_REQUEST(
-      fs_, oss_get_object_range, path_, input.iovec(), input.iovcnt(), offset);
+  ssize_t ret = PERFORM_BACKGROUND_OBJ_REQUEST(
+      fs_, get_object_range, path_, input.iovec(), input.iovcnt(), offset);
   if (ret < 0) {
     LOG_ERROR("fail to read ` from oss, offset:`, size:`, ret: `", path_,
               offset, count, ret);
@@ -492,10 +510,17 @@ std::unique_ptr<IReader> create_oss_reader(OssFs *fs, std::string_view path,
                                            FileInode *inode,
                                            bool cache_enabled) {
   if (cache_enabled) {
-    return std::make_unique<OssCachedReader>(fs, path, inode);
-  } else {
-    return std::make_unique<OssDirectReader>(fs, path, inode);
+    auto cache = inode->cache;
+    if (cache == nullptr) {
+      cache = std::make_shared<BlockCache>(fs->get_download_buffers());
+    }
+    auto cache_handle = cache->get(path, inode->etag, inode->attr.size);
+    if (cache_handle) {
+      return std::make_unique<OssCachedReader>(fs, path, inode,
+                                               std::move(cache), cache_handle);
+    }
   }
+  return std::make_unique<OssDirectReader>(fs, path, inode);
 }
 
 }  // namespace OssFileSystem

@@ -293,7 +293,7 @@ std::string get_metrics_string(size_t interval_sec) {
   if (metrics.empty()) return "";
   std::stringstream frontend_ss, backend_ss;
   auto print_kv = [](std::stringstream &ss, std::string_view s, uint64_t v) {
-    std::string unit = "";
+    std::string unit;
     if (s == "bw: ") {
       static const std::vector<std::string> kUnits = {"B/s", "KB/s", "MB/s",
                                                       "GB/s"};

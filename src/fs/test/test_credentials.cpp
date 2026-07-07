@@ -180,3 +180,41 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_refresh) {
   // refresh time should not change
   EXPECT_TRUE(parse_iso8601_time(read_file("timestamp.txt")) == refresh_time_2);
 }
+
+TEST_F(Ossfs2CredentialsTest, verify_credential_fixed_interval_refresh) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  opts.credential_refresh_interval = 3;  // 3 seconds interval.
+
+  std::ofstream cred_file("ossfs2_test_creds_process_file");
+  DEFER(unlink("ossfs2_test_creds_process_file"));
+  DEFER(unlink("timestamp.txt"));
+
+  // Write initial credentials with real AK/SK
+  cred_file << format_creds(FLAGS_oss_access_key_id,
+                            FLAGS_oss_access_key_secret, "", "");
+  cred_file.close();
+
+  opts.credential_process =
+      "/bin/bash -c '/bin/echo $(date -u +\"%Y-%m-%dT%H:%M:%SZ\") > "
+      "timestamp.txt && /bin/cat "
+      "ossfs2_test_creds_process_file'";
+  EXPECT_EQ(do_init(opts), 0);
+
+  time_t first_refresh = parse_iso8601_time(read_file("timestamp.txt"));
+
+  // Wait for fixed interval (3 seconds) + some buffer
+  sleep(5);
+
+  // check timestamp - should have refreshed
+  time_t refresh_time_1 = parse_iso8601_time(read_file("timestamp.txt"));
+  EXPECT_TRUE(refresh_time_1 > first_refresh);
+
+  // Wait another interval
+  sleep(5);
+
+  // check timestamp - should have refreshed again
+  time_t refresh_time_2 = parse_iso8601_time(read_file("timestamp.txt"));
+  EXPECT_TRUE(refresh_time_2 > refresh_time_1);
+}

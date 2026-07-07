@@ -24,3 +24,9 @@ uint64_t cal_crc64(uint64_t crc, void *buf, size_t len);
 uint64_t cal_crc64(uint64_t crc, void *buf, size_t len, bool little);
 
 std::string read_file(const std::string &filename);
+
+void write_file(const std::string &filename, const std::string &content);
+
+void remove_file(const std::string &filename);
+
+bool file_exists(const std::string &filename);

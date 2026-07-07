@@ -117,7 +117,7 @@ class Ossfs2FilenameTest : public Ossfs2TestSuite {
 
     auto parent_path = nodeid_to_path(parent);
     std::vector<std::string> list_results;
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants,
                                        join_paths(parent_path, "testdir"),
                                        list_results);
     ASSERT_EQ(r, 0);
@@ -127,13 +127,13 @@ class Ossfs2FilenameTest : public Ossfs2TestSuite {
     ASSERT_EQ(r, 0);
 
     list_results.clear();
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants,
                                        join_paths(parent_path, "testdir"),
                                        list_results);
     ASSERT_EQ(r, 0);
     ASSERT_SIZE_EQ(list_results.size(), 0);
 
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_list_dir_descendants,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants,
                                        join_paths(parent_path, "testdir_new"),
                                        list_results);
     ASSERT_EQ(r, 0);

@@ -153,23 +153,13 @@ ssize_t OssFileHandle::pin(off_t offset, size_t count, void **buf) {
 
 IFileHandleFuseLL *create_oss_file_handle(OssFs *fs, const std::string &path,
                                           FileInode *inode, int flags) {
-  OssFileHandle *file = nullptr;
   std::unique_ptr<IWriter> writer;
-  std::unique_ptr<IReader> reader;
   if ((flags & O_ACCMODE) != O_RDONLY) {
     writer = create_oss_writer(fs, path, inode, flags);
   }
-  switch (fs->get_cache_type()) {
-    case CacheType::kFhCache:
-      reader = create_oss_reader(fs, path, inode, fs->enable_prefetching());
-      file = new OssFileHandle(fs, path, inode, std::move(reader),
-                               std::move(writer));
-      break;
-    default:
-      std::abort();
-      break;
-  }
-  return file;
+  auto reader = create_oss_reader(fs, path, inode, fs->enable_prefetching());
+  return new OssFileHandle(fs, path, inode, std::move(reader),
+                           std::move(writer));
 }
 
 };  // namespace OssFileSystem

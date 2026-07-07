@@ -25,7 +25,7 @@
 
 namespace OssFileSystem {
 
-int BlockCache::BlockPool::alloc_one_block(char **ptr) {
+int BlockCacheStore::BlockPool::alloc_one_block(char **ptr) {
   SCOPED_LOCK(lock_);
   if (free_list_.empty()) {
     return -ENOSPC;
@@ -36,13 +36,192 @@ int BlockCache::BlockPool::alloc_one_block(char **ptr) {
   return 0;
 }
 
-void BlockCache::BlockPool::expand(const std::vector<char *> &blocks) {
+void BlockCacheStore::BlockPool::expand(const std::vector<char *> &blocks) {
   SCOPED_LOCK(lock_);
   free_list_.insert(free_list_.end(), blocks.begin(), blocks.end());
 }
 
-void BlockCache::MetaStore::get_locked_block(uint64_t block_id,
-                                             BlockInfo **info) {
+std::vector<char *> BlockCacheStore::BlockPool::extract_free_blocks(
+    size_t count) {
+  SCOPED_LOCK(lock_);
+  size_t take = std::min(count, free_list_.size());
+  if (take == 0) {
+    return {};
+  }
+  auto start_it = free_list_.end() - take;
+  std::vector<char *> blocks(start_it, free_list_.end());
+  free_list_.erase(start_it, free_list_.end());
+  return blocks;
+}
+
+std::vector<char *> BlockCacheStore::BlockPool::clear_all() {
+  std::vector<char *> blocks;
+  SCOPED_LOCK(lock_);
+  free_list_.swap(blocks);
+  return blocks;
+}
+
+size_t BlockCacheStore::RetentionManager::size() {
+  SCOPED_LOCK(lock);
+  return ranges.size();
+}
+
+void BlockCacheStore::RetentionManager::update_range(BlockCacheHandle *h,
+                                                     uint64_t start,
+                                                     uint64_t end) {
+  SCOPED_LOCK(lock);
+  if (unlikely(h->retention_index == -1)) {
+    h->retention_index = ranges.size();
+    ranges.push_back({start, end, h});
+  } else {
+    RELEASE_ASSERT(h->retention_index >= 0 &&
+                   static_cast<size_t>(h->retention_index) < ranges.size());
+    ranges[h->retention_index] = {start, end, h};
+  }
+}
+
+void BlockCacheStore::RetentionManager::remove_range(BlockCacheHandle *h) {
+  SCOPED_LOCK(lock);
+
+  int64_t index = h->retention_index;
+  if (index == -1) return;
+
+  RELEASE_ASSERT(ranges.size() >= 1 && static_cast<int64_t>(ranges.size()) <=
+                                           std::numeric_limits<int64_t>::max());
+  int64_t last = static_cast<int64_t>(ranges.size()) - 1;
+  if (index != last) {
+    ranges[index] = ranges[last];
+    ranges[index].h->retention_index = index;
+  }
+  ranges.pop_back();
+  h->retention_index = -1;
+}
+
+std::optional<uint64_t> BlockCacheStore::RetentionManager::get_max_covered_end(
+    uint64_t current_point) {
+  SCOPED_LOCK(lock);
+
+  if (ranges.empty()) {
+    return std::nullopt;
+  }
+
+  uint64_t max_end = 0;
+  bool covered = false;
+  bool changed = true;
+
+  // Counter to track the number of comparison steps in this query.
+  // Used for adaptive optimization to detect worst-case scenarios.
+  uint64_t current_scan_steps = 0;
+
+  // --- Algorithm: Iterative Expansion (BFS-like on 1D ranges) ---
+  // Since we cannot merge ranges from different owners (to support O(1) removal
+  // by owner), overlapping ranges from different owners may exist as separate
+  // entries. We must iteratively expand the coverage window [current_point,
+  // max_end] until no further ranges can extend it.
+  //
+  // Complexity Analysis:
+  // - Best Case (Sorted Ranges): O(N). The loop runs once because all connected
+  //   ranges are adjacent in the vector. We scan linearly and break early.
+  // - Worst Case (Reverse Sorted Chain): O(N^2). If ranges form a chain [N,
+  // N+1], [N-1, N]...
+  //   stored in reverse order, we might need N passes, each scanning up to N
+  //   elements.
+  // - Practical Case (N <= 64): Even in the theoretical worst case, 64^2 = 4096
+  // operations
+  //   is negligible (< 1 microsecond) on modern CPUs due to cache locality.
+  while (changed) {
+    changed = false;
+    for (const auto &r : ranges) {
+      current_scan_steps++;
+
+      if (!covered) {
+        // Phase 1: Find the initial range that strictly covers the query point.
+        if (r.start <= current_point && r.end >= current_point) {
+          covered = true;
+          max_end = r.end;
+          changed = true;
+        }
+      } else {
+        // Phase 2: Expand the current coverage window.
+        // Check if the current range 'r' overlaps or touches the known
+        // [current_point, max_end].
+        if (r.start <= max_end + 1 && r.end > max_end) {
+          max_end = r.end;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  // --- Adaptive Strategy with Lower Bound ---
+  // Formula: threshold = max(Min_Cost_Limit, N^2 / 4)
+  //
+  // Reasoning:
+  // 1. Min_Cost_Limit (e.g., 256):
+  //    Sorting has a fixed overhead (~300ns). For small N (e.g., N=8), the
+  //    query is already fast (~50ns). Triggering sort would be 6x slower than
+  //    just running the "slow" query! We only want to sort when the saved query
+  //    time > sort cost.
+  //
+  // 2. N^2 / 4:
+  //    For larger N, we want to be proactive. If steps exceed ~25% of
+  //    worst-case, it indicates significant disorder.
+
+  const size_t n = ranges.size();
+  // Use a conservative lower bound. 256 steps is roughly the break-even point
+  // where the cost of sorting equals the cumulative savings of optimized
+  // queries.
+  constexpr uint64_t kMinSortThreshold = 256;
+
+  uint64_t dynamic_threshold = (n * n) / 4;
+  uint64_t threshold = (dynamic_threshold > kMinSortThreshold)
+                           ? dynamic_threshold
+                           : kMinSortThreshold;
+
+  if (current_scan_steps >= threshold) {
+    auto now = std::chrono::steady_clock::now();
+    std::sort(ranges.begin(), ranges.end(),
+              [](const Range &a, const Range &b) { return a.start < b.start; });
+
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      ranges[i].h->retention_index = static_cast<int64_t>(i);
+    }
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - now)
+                       .count();
+    LOG_DEBUG(
+        "[`] Sorted retention ranges due to high scan steps (`), cost ` ns",
+        this, current_scan_steps, elapsed);
+  }
+
+  return covered ? std::optional<uint64_t>(max_end) : std::nullopt;
+}
+
+uint64_t BlockCacheStore::RetentionManager::get_min_start() {
+  SCOPED_LOCK(lock);
+  uint64_t min_start = std::numeric_limits<uint64_t>::max();
+  for (const auto &r : ranges) {
+    if (r.start < min_start) {
+      min_start = r.start;
+    }
+  }
+  return min_start;
+}
+
+uint64_t BlockCacheStore::RetentionManager::get_max_end() {
+  SCOPED_LOCK(lock);
+  uint64_t max_end = 0;
+  for (const auto &r : ranges) {
+    if (r.end > max_end) {
+      max_end = r.end;
+    }
+  }
+  return max_end;
+}
+
+void BlockCacheStore::MetaStore::get_locked_block(uint64_t block_id,
+                                                  BlockInfo **info) {
   SCOPED_LOCK(lock_);
   auto it = data_.find(block_id);
   RELEASE_ASSERT(it != data_.end());
@@ -50,7 +229,7 @@ void BlockCache::MetaStore::get_locked_block(uint64_t block_id,
   RELEASE_ASSERT(it->second->lock.is_locked());
 }
 
-int BlockCache::MetaStore::get_and_lock_block(
+int BlockCacheStore::MetaStore::get_and_lock_block(
     uint64_t block_id, BlockInfo **info, BlockLockType lock_type,
     std::function<int(BlockInfo **)> alloc_fn) {
   SCOPED_LOCK(lock_);
@@ -60,7 +239,7 @@ int BlockCache::MetaStore::get_and_lock_block(
     if (lock_type == WRITE) {
       assert(alloc_fn);
       if (alloc_fn(info) != 0) {
-        if (evict_one_lock_held(info, cache_->latest_read_block_id_) != 0) {
+        if (evict_one_lock_held(info) != 0) {
           return -ENOSPC;
         }
       }
@@ -89,52 +268,180 @@ int BlockCache::MetaStore::get_and_lock_block(
   return 0;
 }
 
-BlockCache::MetaStore::~MetaStore() {
+BlockCacheStore::MetaStore::~MetaStore() {
   for (auto &it : data_) {
     delete it.second;
   }
 }
 
-int BlockCache::MetaStore::evict_one_lock_held(BlockInfo **info,
-                                               uint64_t latest_read_block_id) {
-  // Simple evict strategy:
-  // 1. try find the first block in [0, latest_read_block_id).
-  // 2. if there is no useable block in step 1, find the last
-  //    block in [latest_read_block_id, max_blocks).
-  auto it = data_.begin();
-  while (it != data_.end() && it->first < latest_read_block_id) {
-    // we only lock block under lock_, so no one can lock it here.
-    if (!it->second->lock.is_locked()) {
-      *info = it->second;
-      data_.erase(it);
-      return 0;
+int BlockCacheStore::MetaStore::evict_one_lock_held(BlockInfo **info) {
+  // Eviction Strategy (4-Level Priority):
+  //
+  // We maintain a set of retention ranges. Blocks outside these ranges are
+  // evicted first. Within retention ranges, we prefer evicting blocks not
+  // covered by any active range, falling back to covered ones only when
+  // necessary.
+  //
+  // Block ID Space Layout:
+  // 0 ........... min_start ............. max_end .......... INF
+  // |                 |                      |                |
+  // |  [Priority 1]   |   [Priority 3/4]     | [Priority 2]   |
+  // |  Left Side      |   Retention Window   |  Right Side    |
+  // |  (Evict First)  |                      | (Evict Second) |
+  //                   |                      |
+  //                   |                      |
+  //               min_start               max_end
+  //          (min of all ranges)     (max of all ranges)
+  //
+  // Detailed Priority Order:
+  //
+  // P1: [0, min_start) - Left of all retention ranges
+  //     Traverse from beginning, evict first unlocked block.
+  //
+  // P2: [max_end, INF) - Right of all retention ranges
+  //     Traverse from end, evict first unlocked block.
+  //
+  // P3: [min_start, max_end) - Inside retention window, NOT covered
+  //     For each unlocked block, check coverage via get_max_covered_end().
+  //     If not covered (nullopt), evict immediately.
+  //     Optimization: Skip to upper_bound(covered_end) to avoid checking
+  //     multiple blocks within the same retention range.
+  //
+  // P4: Fallback - Inside retention window, covered but unlocked
+  //     If P3 finds no candidate, evict the first covered block we saw.
+  //     This is a last resort as it may impact active operations.
+  //
+  // Returns: 0 on success (block evicted), -ENOSPC if no evictable block found.
+  auto &retention_mgr = cache_->retention_manager_;
+
+  auto lit = data_.begin();
+  if (retention_mgr.size() > 0) {
+    auto min_start = retention_mgr.get_min_start();
+    while (lit != data_.end() && lit->first < min_start) {
+      if (!lit->second->lock.is_locked()) {
+        *info = lit->second;
+        data_.erase(lit);
+        return 0;
+      }
+
+      ++lit;
     }
 
-    ++it;
+    if (lit == data_.end()) return -ENOSPC;
   }
 
-  if (it == data_.end()) return -ENOSPC;
-
   auto rit = data_.rbegin();
-  while (rit != data_.rend() && rit->first >= latest_read_block_id) {
-    // we only lock block under lock_, so no one can lock it here.
+  auto max_end = retention_mgr.get_max_end();
+  while (rit != data_.rend() && rit->first > max_end) {
     if (!rit->second->lock.is_locked()) {
       *info = rit->second;
-      data_.erase(rit->first);
+      data_.erase(std::prev(rit.base()));
       return 0;
     }
 
     ++rit;
   }
 
+  std::optional<uint64_t> fallback_candidate;
+  auto upper_it = rit.base();
+  auto it = lit;
+  while (it != data_.end() && it != upper_it) {
+    if (upper_it != data_.end() && it->first >= upper_it->first) {
+      break;
+    }
+
+    if (it->second->lock.is_locked()) {
+      ++it;
+      continue;
+    }
+
+    auto max_covered_end = retention_mgr.get_max_covered_end(it->first);
+    if (!max_covered_end.has_value()) {
+      *info = it->second;
+      data_.erase(it);
+      return 0;
+    }
+
+    if (!fallback_candidate.has_value()) {
+      fallback_candidate = std::optional<uint64_t>(it->first);
+    }
+
+    it = data_.upper_bound(max_covered_end.value());
+  }
+
+  if (fallback_candidate.has_value()) {
+    auto it = data_.find(fallback_candidate.value());
+    *info = it->second;
+    data_.erase(it);
+    return 0;
+  }
+
   return -ENOSPC;
 }
 
-void BlockCache::expand_blocks(const std::vector<char *> &blocks) {
+void BlockCacheStore::expand_blocks(const std::vector<char *> &blocks) {
   block_pool_.expand(blocks);
 }
 
-int BlockCache::alloc_block(BlockInfo **info) {
+size_t BlockCacheStore::total_blocks() {
+  SCOPED_LOCK(meta_store_->lock_);
+  return meta_store_->data_.size() + block_pool_.get_free_block_count();
+}
+
+std::pair<std::vector<char *>, std::vector<BlockInfo *>>
+BlockCacheStore::shrink_blocks(size_t count) {
+  std::vector<char *> blocks_to_free;
+  std::vector<BlockInfo *> infos_to_delete;
+
+  auto free_blocks = block_pool_.extract_free_blocks(count);
+  size_t taken = free_blocks.size();
+  blocks_to_free.insert(blocks_to_free.end(), free_blocks.begin(),
+                        free_blocks.end());
+
+  if (taken < count) {
+    size_t need_evict = count - taken;
+    blocks_to_free.reserve(count);
+    infos_to_delete.reserve(need_evict);
+    SCOPED_LOCK(meta_store_->lock_);
+    BlockInfo *info = nullptr;
+    for (size_t i = 0; i < need_evict; ++i) {
+      if (meta_store_->evict_one_lock_held(&info) != 0) {
+        break;
+      }
+      blocks_to_free.push_back(info->mem);
+      infos_to_delete.push_back(info);
+    }
+  }
+
+  return {blocks_to_free, infos_to_delete};
+}
+
+std::pair<std::vector<char *>, std::vector<BlockInfo *>>
+BlockCacheStore::drain_all_blocks() {
+  std::vector<char *> blocks_to_free;
+  std::vector<BlockInfo *> infos_to_delete;
+
+  blocks_to_free.reserve(meta_store_->data_.size() +
+                         block_pool_.get_free_block_count());
+  infos_to_delete.reserve(meta_store_->data_.size());
+
+  // Collect all BlockInfo from MetaStore.
+  for (auto &it : meta_store_->data_) {
+    RELEASE_ASSERT(!it.second->lock.is_locked());
+    blocks_to_free.push_back(it.second->mem);
+    infos_to_delete.push_back(it.second);
+  }
+  meta_store_->data_.clear();
+
+  // Add all free blocks from BlockPool.
+  auto free_blocks = block_pool_.clear_all();
+  blocks_to_free.insert(blocks_to_free.end(), free_blocks.begin(),
+                        free_blocks.end());
+
+  return {blocks_to_free, infos_to_delete};
+}
+
+int BlockCacheStore::alloc_block(BlockInfo **info) {
   char *block_buf = nullptr;
   int r = block_pool_.alloc_one_block(&block_buf);
   if (r == 0) {
@@ -147,7 +454,7 @@ int BlockCache::alloc_block(BlockInfo **info) {
   return -ENOSPC;
 }
 
-ssize_t BlockCache::pread(char *buf, off_t offset, size_t count) {
+ssize_t BlockCacheStore::pread(char *buf, off_t offset, size_t count) {
   size_t read = 0;
   uint64_t block_id = offset / block_size_;
   uint64_t block_off = offset % block_size_;
@@ -181,7 +488,7 @@ ssize_t BlockCache::pread(char *buf, off_t offset, size_t count) {
   return read;
 }
 
-ssize_t BlockCache::pin(off_t offset, size_t count, void **buf) {
+ssize_t BlockCacheStore::pin(off_t offset, size_t count, void **buf) {
   uint64_t block_id = offset / block_size_;
   uint64_t block_off = offset % block_size_;
   BlockInfo *block_info = nullptr;
@@ -201,7 +508,7 @@ ssize_t BlockCache::pin(off_t offset, size_t count, void **buf) {
   return count;
 }
 
-void BlockCache::unpin(off_t offset) {
+void BlockCacheStore::unpin(off_t offset) {
   uint64_t block_id = offset / block_size_;
   BlockInfo *block_info = nullptr;
 
@@ -209,8 +516,8 @@ void BlockCache::unpin(off_t offset) {
   block_info->lock.unlock_read();
 }
 
-void BlockCache::rollback_locked_block_range(uint64_t start_block_id,
-                                             int count) {
+void BlockCacheStore::rollback_locked_block_range(uint64_t start_block_id,
+                                                  int count) {
   BlockInfo *block_info = nullptr;
   for (int i = 0; i < count; i++) {
     meta_store_->get_locked_block(start_block_id + i, &block_info);
@@ -219,8 +526,8 @@ void BlockCache::rollback_locked_block_range(uint64_t start_block_id,
   }
 }
 
-int BlockCache::try_lock_blocks(uint64_t offset, uint64_t count,
-                                std::vector<iovec> &blocks) {
+int BlockCacheStore::try_lock_blocks(uint64_t offset, uint64_t count,
+                                     IOVector &blocks) {
   BlockInfo *block_info = nullptr;
   size_t written = 0;
   uint64_t block_id = offset / block_size_;
@@ -250,7 +557,8 @@ int BlockCache::try_lock_blocks(uint64_t offset, uint64_t count,
   return 0;
 }
 
-void BlockCache::unlock_blocks(uint64_t offset, uint64_t count, bool evict) {
+void BlockCacheStore::unlock_blocks(uint64_t offset, uint64_t count,
+                                    bool evict) {
   BlockInfo *block_info = nullptr;
 
   size_t written = 0;
@@ -272,16 +580,21 @@ void BlockCache::unlock_blocks(uint64_t offset, uint64_t count, bool evict) {
   }
 }
 
-void BlockCache::set_latest_read_off(off_t offset) {
-  latest_read_block_id_ = offset / block_size_;
+void BlockCacheStore::update_retention_range(BlockCacheHandle *h, off_t offset,
+                                             size_t count) {
+  if (count > 0) {
+    uint64_t start_block_id = offset / block_size_;
+    uint64_t end_block_id = (offset + count - 1) / block_size_;
+    retention_manager_.update_range(h, start_block_id, end_block_id);
+  }
 }
 
-void BlockCache::increment_generation() {
+void BlockCacheStore::increment_generation() {
   SCOPED_LOCK(meta_store_->lock_);
   meta_store_->generation_++;
 }
 
-std::pair<uint64_t, uint64_t> BlockCache::query_refill_range(off_t offset,
+std::pair<off_t, size_t> BlockCacheStore::query_refill_range(off_t offset,
                                                              size_t count) {
   size_t read = 0;
   uint64_t block_id = offset / block_size_;
@@ -330,88 +643,88 @@ std::pair<uint64_t, uint64_t> BlockCache::query_refill_range(off_t offset,
       (right_refill_block_id - left_refill_block_id + 1) * block_size_);
 }
 
-BlockCacheManager::~BlockCacheManager() {
+BlockCache::~BlockCache() {
   RELEASE_ASSERT(ref_cnt_ == 0);
-  RELEASE_ASSERT(cache_ == nullptr);
-  RELEASE_ASSERT(num_used_blocks_ == 0);
+  RELEASE_ASSERT(cache_store_ == nullptr);
 }
 
-std::pair<BlockCache *, RangeLock *> BlockCacheManager::get() {
+CacheHandle *BlockCache::get(std::string_view /* name */,
+                             std::string_view /* etag */,
+                             off_t /* actual_size */) {
   std::lock_guard<std::mutex> l(mtx_);
-  if (cache_ == nullptr) {
-    cache_ = new BlockCache(block_size_);
+  if (cache_store_ == nullptr) {
+    cache_store_ = new BlockCacheStore(block_pool_->block_size());
   }
   ++ref_cnt_;
-  return {cache_, &range_lock_};
+  return new BlockCacheHandle(cache_store_, &range_lock_);
 }
 
-size_t BlockCacheManager::try_expand_blocks(
-    std::function<std::vector<char *>(uint64_t)> alloc_cb, uint64_t count,
-    uint64_t max_capacity) {
-  RELEASE_ASSERT(cache_ != nullptr);
+size_t BlockCache::try_expand_blocks(uint64_t count, uint64_t max_capacity,
+                                     bool ignore_limit) {
+  RELEASE_ASSERT(block_pool_ != nullptr);
+  RELEASE_ASSERT(cache_store_ != nullptr);
 
-  size_t allocated_blocks = 0;
   std::lock_guard<std::mutex> l(mtx_);
-  if (num_used_blocks_ >= max_capacity) return 0;
+  size_t curr_total = cache_store_->total_blocks();
+  if (curr_total >= max_capacity) return 0;
 
-  // Allocate from the unused blocks.
-  RELEASE_ASSERT(blocks_.size() >= num_used_blocks_);
-  auto free = blocks_.size() - num_used_blocks_;
-  if (free >= count) {
-    num_used_blocks_ += count;
-    return count;
+  size_t need_blocks = std::min(count, max_capacity - curr_total);
+  auto new_blocks = block_pool_->try_allocate(need_blocks, ignore_limit);
+
+  if (new_blocks.size() > 0) {
+    cache_store_->expand_blocks(new_blocks);
   }
 
-  count -= free;
-  allocated_blocks += free;
-  num_used_blocks_ += free;
-
-  // This occurs when someone expanded the blocks_ with a larger max_capacity
-  // before, skip expansion.
-  if (max_capacity <= blocks_.size()) return allocated_blocks;
-
-  // Allocate from the alloc_cb.
-  if (count > 0) {
-    count = std::min(count, max_capacity - blocks_.size());
-    auto new_blocks = alloc_cb(count);
-    if (new_blocks.size() > 0) {
-      cache_->expand_blocks(new_blocks);
-      blocks_.insert(blocks_.end(), new_blocks.begin(), new_blocks.end());
-      allocated_blocks += new_blocks.size();
-      num_used_blocks_ += new_blocks.size();
-    }
-  }
-
-  return allocated_blocks;
+  return new_blocks.size();
 }
 
-void BlockCacheManager::release(
-    std::function<void(const std::vector<char *> &)> release_cb,
-    uint64_t count) {
-  BlockCache *cache_ptr = nullptr;
-  std::vector<char *> old_blocks;
+void BlockCache::release(CacheHandle *h, uint64_t count) {
+  RELEASE_ASSERT(block_pool_ != nullptr);
+
+  delete h;
+
+  BlockCacheStore *cache_ptr = nullptr;
+  std::vector<char *> blocks_to_dealloc;
+  std::vector<BlockInfo *> infos_to_delete;
+
   {
     std::lock_guard<std::mutex> l(mtx_);
     RELEASE_ASSERT(ref_cnt_ > 0);
-    RELEASE_ASSERT(cache_ != nullptr);
-    RELEASE_ASSERT(num_used_blocks_ >= count);
-    num_used_blocks_ -= count;
+    RELEASE_ASSERT(cache_store_ != nullptr);
+
     if (--ref_cnt_ == 0) {
-      cache_ptr = cache_;
-      cache_ = nullptr;
-      blocks_.swap(old_blocks);
+      cache_ptr = cache_store_;
+      cache_store_ = nullptr;
+    } else {
+      // Reserve at least 1 block when multiple handles share the cache.
+      size_t total_blocks = cache_store_->total_blocks();
+      size_t actual_shrink =
+          std::min(count, total_blocks > 1 ? total_blocks - 1 : 0);
+      if (actual_shrink > 0) {
+        std::tie(blocks_to_dealloc, infos_to_delete) =
+            cache_store_->shrink_blocks(actual_shrink);
+      }
     }
   }
 
   if (cache_ptr != nullptr) {
+    std::tie(blocks_to_dealloc, infos_to_delete) =
+        cache_ptr->drain_all_blocks();
     delete cache_ptr;
-    release_cb(old_blocks);
+  }
+
+  for (auto *info : infos_to_delete) {
+    delete info;
+  }
+
+  if (!blocks_to_dealloc.empty()) {
+    block_pool_->deallocate(blocks_to_dealloc);
   }
 }
 
-size_t BlockCacheManager::capacity() {
+size_t BlockCache::capacity() {
   std::lock_guard<std::mutex> l(mtx_);
-  return blocks_.size();
+  return cache_store_ ? cache_store_->total_blocks() : 0;
 }
 
 }  // namespace OssFileSystem

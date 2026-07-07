@@ -58,8 +58,8 @@ class IFileHandleFuseLL {
 
 class IFileSystemFuseLL {
  public:
-  IFileSystemFuseLL() {}
-  virtual ~IFileSystemFuseLL() {}
+  IFileSystemFuseLL() = default;
+  virtual ~IFileSystemFuseLL() = default;
 
   void set_fuse_session(struct fuse_session *fuse_se) {
     fuse_se_ = fuse_se;

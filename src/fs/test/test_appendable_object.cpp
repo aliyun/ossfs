@@ -907,6 +907,17 @@ TEST_F(Ossfs2AppendableObjectTest, verify_random_read_write_appendable_object) {
 }
 
 TEST_F(Ossfs2AppendableObjectTest,
+       verify_random_read_write_appendable_object_with_disk_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.enable_appendable_object = true;
+  opts.upload_buffer_size = 1048576;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+  verify_random_read_write_appendable_object();
+}
+
+TEST_F(Ossfs2AppendableObjectTest,
        verify_oss_error_during_append_appendable_object) {
   INIT_PHOTON();
   OssFsOptions opts;

@@ -31,14 +31,14 @@ namespace Admin {
 
 static void set_enabled_metrics_to_uds_server(const std::string &uds_path,
                                               const std::string &filter) {
-  std::string output = "";
+  std::string output;
   send_uds_request(uds_path, "set-metrics", filter, output);
   std::cout << output << std::endl;
 }
 
 static void print_stats_from_uds_server(const std::string &uds_path,
                                         size_t interval) {
-  std::string output = "";
+  std::string output;
   send_uds_request(uds_path, "stats", std::to_string(interval), output);
   std::cout << output << std::endl;
 }

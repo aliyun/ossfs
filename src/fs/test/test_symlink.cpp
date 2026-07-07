@@ -27,9 +27,9 @@ class Ossfs2SymlinkTest : public Ossfs2TestSuite {
     auto parent_path = nodeid_to_path(parent);
 
     auto background_env =
-        bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next();
+        bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next();
     auto run_test = [&]() {
-      auto oss_client = background_env.oss_client;
+      auto obj_store = background_env.obj_store;
 
       auto do_verify = [&](const std::string &src, const std::string &target) {
         std::filesystem::path src_path(src.substr(1));
@@ -40,11 +40,11 @@ class Ossfs2SymlinkTest : public Ossfs2TestSuite {
         LOG_INFO("` -> ` expected_target: `", src, target,
                  normalized_target.string());
 
-        ssize_t r = oss_client->oss_put_symlink(src, target);
+        ssize_t r = obj_store->put_symlink(src, target);
         ASSERT_TRUE(r > 0);
 
         std::string oss_target;
-        r = oss_client->oss_get_symlink(src, oss_target);
+        r = obj_store->get_symlink(src, oss_target);
         ASSERT_EQ(r, 0);
 
         std::filesystem::path oss_target_path(oss_target);
@@ -88,13 +88,12 @@ class Ossfs2SymlinkTest : public Ossfs2TestSuite {
                 "../test_dir/subdir/file");
 
       // invalid cases
-      ASSERT_EQ(oss_client->oss_put_symlink(
-                    join_paths(parent_path, "test_symlink"), "/a/b/c"),
+      ASSERT_EQ(obj_store->put_symlink(join_paths(parent_path, "test_symlink"),
+                                       "/a/b/c"),
                 -EINVAL);
-      ASSERT_EQ(
-          oss_client->oss_put_symlink(join_paths(parent_path, "test_symlink"),
-                                      "../../../../../a"),
-          -EINVAL);
+      ASSERT_EQ(obj_store->put_symlink(join_paths(parent_path, "test_symlink"),
+                                       "../../../../../a"),
+                -EINVAL);
     };
 
     background_env.executor->perform(run_test);

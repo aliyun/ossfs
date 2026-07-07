@@ -17,44 +17,46 @@
 #pragma once
 
 #include <photon/common/executor/executor.h>
+#include <photon/io/aio-wrapper.h>
 
-#include "oss/oss_adapter.h"
+#include "fs/disk_cache_env.h"
+#include "oss/obj_store.h"
 
 namespace OssFileSystem {
 
 //
-// A structure that binds each OSS client to a specific vCPU.
+// A structure that binds each object store backend to a specific vCPU.
 //
-// This structure manages a collection of OSS clients where each client is
-// associated with a particular vCPU.
+// This structure manages a collection of object store backends where each
+// backend is associated with a particular vCPU.
 //
-struct VCpuOssClientEnv {
-  std::vector<OssAdapter *> oss_clients;
+struct VCpuObjStoreEnv {
+  std::vector<IObjStore *> obj_stores;
   std::unordered_map<photon::vcpu_base *, int> vcpu_map;
 
-  OssAdapter *get_oss_client() {
-    return oss_clients[vcpu_map[photon::get_vcpu()]];
+  IObjStore *get_obj_store() {
+    return obj_stores[vcpu_map[photon::get_vcpu()]];
   }
 };
 
 //
-// A background vCPU environment for OSS clients management.
+// A background vCPU environment for object store backends management.
 //
-// This structure extends VCpuOssClientEnv to provide a background execution
-// environment where each OSS client is bound to a specific vCPU. It uses
-// photon::Executor to manage vCPU-specific execution contexts and provides
-// round-robin access to these contexts.
+// This structure extends VCpuObjStoreEnv to provide a background execution
+// environment where each object store backend is bound to a specific vCPU.
+// It uses photon::Executor to manage vCPU-specific execution contexts and
+// provides round-robin access to these contexts.
 //
-struct BGVCpuOssClientEnv : public VCpuOssClientEnv {
-  BGVCpuOssClientEnv() : vcpu_id(0) {}
+struct BGVCpuObjStoreEnv : public VCpuObjStoreEnv {
+  BGVCpuObjStoreEnv() : vcpu_id(0) {}
 
-  ~BGVCpuOssClientEnv() {
+  ~BGVCpuObjStoreEnv() {
     for (int i = 0; i < vcpu_num; i++) {
       auto e = executors[i];
       if (!e) continue;
 
       if (destroy_executor) {
-        e->perform([&]() { delete oss_clients[i]; });
+        e->perform([&]() { delete obj_stores[i]; });
         delete e;
       }
     }
@@ -62,7 +64,7 @@ struct BGVCpuOssClientEnv : public VCpuOssClientEnv {
 
   struct EnvContext {
     photon::Executor *executor;
-    OssAdapter *oss_client;
+    IObjStore *obj_store;
     photon::vcpu_base *vcpu;
   };
 
@@ -72,22 +74,22 @@ struct BGVCpuOssClientEnv : public VCpuOssClientEnv {
   std::atomic<uint64_t> vcpu_id;
   int vcpu_num = 0;
 
-  EnvContext get_oss_client_env_next() {
+  EnvContext get_obj_store_env_next() {
     auto next_id = vcpu_id.fetch_add(1) % vcpu_num;
-    return get_oss_client_env(next_id);
+    return get_obj_store_env(next_id);
   }
 
-  EnvContext get_oss_client_env(int vcpu_id) {
+  EnvContext get_obj_store_env(int vcpu_id) {
     EnvContext env;
     env.executor = executors[vcpu_id];
-    env.oss_client = oss_clients[vcpu_id];
+    env.obj_store = obj_stores[vcpu_id];
     env.vcpu = vcpu_list[vcpu_id];
     return env;
   }
 
-  void add_oss_client_env(photon::Executor *executor, OssAdapter *oss_client) {
+  void add_obj_store_env(photon::Executor *executor, IObjStore *obj_store) {
     executors.push_back(executor);
-    oss_clients.push_back(oss_client);
+    obj_stores.push_back(obj_store);
     executor->perform([&]() {
       auto vcpu = photon::get_vcpu();
       vcpu_map[vcpu] = executors.size() - 1;
@@ -102,21 +104,78 @@ struct BGVCpuOssClientEnv : public VCpuOssClientEnv {
     return vcpu_list[next_id];
   }
 
-  std::vector<OssAdapter *> get_all_oss_clients() {
-    return oss_clients;
+  std::vector<IObjStore *> get_all_obj_stores() {
+    return obj_stores;
   }
 
   std::vector<EnvContext> get_all_env_cxts() {
     std::vector<EnvContext> ctxs;
     for (int i = 0; i < vcpu_num; i++) {
-      ctxs.emplace_back(get_oss_client_env(i));
+      ctxs.emplace_back(get_obj_store_env(i));
     }
     return ctxs;
   }
 };
 
+//
+// A background vCPU environment for disk cache operations.
+//
+struct BGVCpuDiskCacheEnv {
+  int init(const OssFileSystem::DiskCacheOptions &opts) {
+    if (executor == nullptr) {
+      return -1;
+    }
+    io_engine_type_ = opts.io_engine_type;
+    return executor->perform([&]() {
+      if (io_engine_type_ == photon::fs::ioengine_libaio) {
+        photon::libaio_wrapper_init();
+      }
+      disk_cache_env = new OssFileSystem::DiskCacheEnv(opts);
+      int r = disk_cache_env->init();
+      if (r != 0) {
+        delete disk_cache_env;
+        disk_cache_env = nullptr;
+      }
+      return r;
+    });
+  }
+
+  ~BGVCpuDiskCacheEnv() {
+    if (executor) {
+      executor->perform([&]() {
+        delete disk_cache_env;
+        if (io_engine_type_ == photon::fs::ioengine_libaio) {
+          photon::libaio_wrapper_fini();
+        }
+      });
+      delete executor;
+    }
+  }
+
+  int io_engine_type_ = photon::fs::ioengine_libaio;
+  OssFileSystem::DiskCacheEnv *disk_cache_env = nullptr;
+  photon::Executor *executor = nullptr;
+
+  void set_executor(photon::Executor *executor) {
+    this->executor = executor;
+  }
+
+  photon::Executor *get_executor() const {
+    return executor;
+  }
+
+  photon::fs::ICachePool *get_disk_cache_pool() const {
+    return disk_cache_env->cache_fs->get_pool();
+  }
+
+  photon::fs::IFileSystemXAttr *get_disk_cache_xattr_fs() const {
+    return disk_cache_env->local_xattr_fs;
+  }
+};
+
 struct BackgroundVCpuEnv {
-  BGVCpuOssClientEnv *bg_oss_client_env = nullptr;
+  BGVCpuObjStoreEnv *bg_obj_store_env = nullptr;
+  BGVCpuDiskCacheEnv *bg_disk_cache_env = nullptr;
 };
 
 };  // namespace OssFileSystem

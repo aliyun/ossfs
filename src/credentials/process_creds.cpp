@@ -21,15 +21,16 @@
 
 namespace OssFileSystem {
 
-ProcessCredentialsProvider::ProcessCredentialsProvider(std::string_view cmd)
-    : cmd_(cmd) {
+ProcessCredentialsProvider::ProcessCredentialsProvider(
+    std::string_view cmd, uint64_t refresh_interval_sec)
+    : CredentialsProvider(refresh_interval_sec), cmd_(cmd) {
   int r = split_command_tokens(cmd_, args_);
   if (r != 0) {
     LOG_ERROR("Failed to split command ` with r `", cmd_, r);
   }
 }
 
-int ProcessCredentialsProvider::get_credentials(OssCredentials &out_creds,
+int ProcessCredentialsProvider::get_credentials(ObjCredentials &out_creds,
                                                 time_t &expiration) {
   if (args_.empty()) return -EINVAL;
 

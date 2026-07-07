@@ -26,10 +26,11 @@ namespace OssFileSystem {
 
 class ProcessCredentialsProvider : public CredentialsProvider {
  public:
-  ProcessCredentialsProvider(std::string_view cmd);
+  ProcessCredentialsProvider(std::string_view cmd,
+                             uint64_t refresh_interval_sec = 0);
 
  private:
-  int get_credentials(OssCredentials &out_creds, time_t &expiration) override;
+  int get_credentials(ObjCredentials &out_creds, time_t &expiration) override;
 
   const std::string cmd_;
   std::vector<std::string> args_;

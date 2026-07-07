@@ -19,6 +19,7 @@
 class Ossfs2BasicTest;
 class Ossfs2TestSuite;
 class Ossfs2ReadWriteTest;
+class Ossfs2DiskCacheTest;
 class Ossfs2CRC64Test;
 class Ossfs2RenameTest;
 class Ossfs2AppendableObjectTest;
@@ -33,11 +34,13 @@ class Ossfs2FilenameTest;
 class Ossfs2MetricsTest;
 class Ossfs2CredentialsTest;
 class Ossfs2SymlinkTest;
+class Ossfs2PrefetchWindowTest;
 
 #define DECLARE_TEST_FRIENDS_CLASSES         \
   friend class ::Ossfs2BasicTest;            \
   friend class ::Ossfs2TestSuite;            \
   friend class ::Ossfs2ReadWriteTest;        \
+  friend class ::Ossfs2DiskCacheTest;        \
   friend class ::Ossfs2CRC64Test;            \
   friend class ::Ossfs2RenameTest;           \
   friend class ::Ossfs2AppendableObjectTest; \
@@ -51,4 +54,5 @@ class Ossfs2SymlinkTest;
   friend class ::Ossfs2FilenameTest;         \
   friend class ::Ossfs2MetricsTest;          \
   friend class ::Ossfs2CredentialsTest;      \
-  friend class ::Ossfs2SymlinkTest;
+  friend class ::Ossfs2SymlinkTest;          \
+  friend class ::Ossfs2PrefetchWindowTest;

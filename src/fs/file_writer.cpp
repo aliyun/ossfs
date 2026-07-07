@@ -31,107 +31,6 @@ static constexpr size_t kOssMaxAppendableObjectSize = 5368709120ULL;  // 5GB
 
 namespace OssFileSystem {
 
-class OssWriter : public IWriter {
- public:
-  OssWriter(OssFs *fs, std::string_view path, FileInode *inode, int flags)
-      : fs_(fs), inode_(inode), upload_path_(path), open_flags_(flags) {}
-
-  ~OssWriter();
-
-  int open() override;
-
-  ssize_t pwrite(size_t count, off_t offset, const void *buf,
-                 struct fuse_bufvec *bufv, std::string *wpath) override;
-
-  int flush() override;
-
-  bool get_is_dirty() override {
-    return is_dirty_;
-  }
-
-  bool get_is_immutable() override {
-    return immutable_;
-  }
-
-  // The following functions need inode's rlock.
-  ssize_t pread_from_upload_buffer(void *buf, size_t count,
-                                   off_t offset) override;
-  size_t calc_remote_size() override;
-
- private:
-  struct AppendableStatus {
-    bool is_appendable_object = false;
-    off_t valid_buffer_offset = 0;
-  };
-
-  struct MultipartContext {
-    OssWriter *writer;
-    char *buf;
-    size_t part_number;
-  };
-
-  static void *do_multipart_upload(void *args);
-  static void *do_multipart_copy(void *args);
-
-  // The following functions need inode's wlock.
-  inline int check_writing_permission();
-  inline void mark_dirty();
-  inline void mark_clean();
-
-  int complete_upload();
-  int upload_empty_file();
-  int complete_or_abort_multipart();
-  int schedule_multipart_upload(size_t part_number);
-
-  int merge_remote_data(off_t offset, size_t count);
-  int switch_object_type_normal_to_appendable();
-  int merge_remote_data_of_normal_object();
-
-  int do_append_upload(size_t part_number);
-
-  char *get_buffer();
-  void free_buffer(char *ptr);
-
-  bool verify_crc64();
-
-  OssFs *fs_ = nullptr;
-  FileInode *inode_ = nullptr;
-
-  bool is_dirty_ = false;
-
-  // We will delay updating current offset until the write actually happens,
-  // -1 means not yet written. This is used for operation patterns like
-  // open, truncate, write, close.
-  off_t write_off_ = -1;
-
-  char *buffer_ = nullptr;
-  size_t buffer_size_ = 0;
-  // Current buffer index, used for calculating write offset or upload part
-  // number.
-  size_t buffer_index_ = 0;
-
-  // expected_crc64_ stores the crc64 of whole file.
-  uint64_t expected_crc64_ = 0;
-  bool has_crc64_ = true;
-
-  void *upload_context_ = nullptr;
-  std::atomic<uint64_t> running_upload_tasks_ = {0};
-
-  // On write failure, we cannot recover or safely continue I/O.
-  // Mark the file as immutable and reject all subsequent write, flush, and
-  // fsync operations.
-  std::atomic<bool> immutable_ = {false};
-
-  AppendableStatus appendable_status_;
-  bool already_head_ = false;
-
-  // If a file is renamed during writing, upload_path_ will be updated to the
-  // new path to ensure the file can be uploaded to the correct location.
-  std::string upload_path_;
-
-  int open_flags_ = 0;
-};
-
 static std::string random_string(int length) {
   static std::string charset =
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
@@ -225,15 +124,236 @@ static ssize_t fuse_bufvec_to_buf_copy(char *dst, struct fuse_bufvec *srcv,
   return copied;
 }
 
-OssWriter::~OssWriter() {
-  while (running_upload_tasks_.load() > 0) {
-    AUTO_USLEEP(1000);
+class OssWriter : public IWriter {
+ public:
+  OssWriter(OssFs *fs, std::string_view path, FileInode *inode, int flags)
+      : fs_(fs), inode_(inode), upload_path_(path), open_flags_(flags) {}
+
+  bool get_is_dirty() override {
+    return is_dirty_;
   }
 
+  bool get_is_immutable() override {
+    return immutable_;
+  }
+
+  ssize_t pread_from_upload_buffer(void *buf, size_t count,
+                                   off_t offset) override {
+    return -ENOTSUP;
+  }
+
+ protected:
+  inline void mark_dirty();
+  inline void mark_clean();
+
+  OssFs *fs_ = nullptr;
+  FileInode *inode_ = nullptr;
+
+  // If a file is renamed during writing, upload_path_ will be updated to the
+  // new path to ensure the file can be uploaded to the correct location.
+  std::string upload_path_;
+
+  int open_flags_ = 0;
+  bool is_dirty_ = false;
+
+  // On write failure, we cannot recover or safely continue I/O.
+  // Mark the file as immutable and reject all subsequent write, flush, and
+  // fsync operations.
+  std::atomic<bool> immutable_ = {false};
+};
+
+// Memory-buffered sequential writer (supports normal multipart and appendable
+// modes).
+class OssSeqWriter : public OssWriter {
+ public:
+  OssSeqWriter(OssFs *fs, std::string_view path, FileInode *inode, int flags)
+      : OssWriter(fs, path, inode, flags) {}
+
+  ~OssSeqWriter() override;
+
+  int open() override;
+  ssize_t pwrite(size_t count, off_t offset, const void *buf,
+                 struct fuse_bufvec *bufv, std::string *wpath) override;
+  int flush() override;
+
+ protected:
+  // The following functions need inode's wlock.
+  inline int check_writing_permission();
+  inline int check_and_update_write_offset(off_t &offset);
+
+  inline char *get_buffer();
+  inline void free_buffer(char *ptr);
+  inline void clear_current_buffer();
+  inline bool verify_crc64();
+
+  inline void waiting_upload_tasks();
+
+  int complete_upload();
+  int get_object_attributes_from_remote();
+  int prepare_merge_remote_data(off_t &offset);
+
+  virtual int check_file_size_limit(size_t count) = 0;
+
+  virtual int on_first_write(off_t &offset, size_t &count) = 0;
+  virtual void on_upload_fail_cleanup() = 0;
+
+  virtual int truncate_internal() = 0;
+  virtual int do_merge_remote_data() = 0;
+
+  virtual int do_upload_buffer() = 0;
+  virtual int do_upload_empty() = 0;
+  virtual int do_upload_last_part() = 0;
+
+  virtual int schedule_upload(size_t part_number) = 0;
+
+  virtual size_t get_fault_injection_buffer_index() {
+    return 0;
+  };
+
+  // We will delay updating current offset until the write actually happens,
+  // -1 means not yet written. This is used for operation patterns like
+  // open, truncate, write, close.
+  off_t write_off_ = -1;
+
+  char *buffer_ = nullptr;
+  size_t buffer_size_ = 0;
+  // Current buffer index, used for calculating write offset or upload part
+  // number.
+  size_t buffer_index_ = 0;
+
+  // expected_crc64_ stores the crc64 of whole file.
+  uint64_t expected_crc64_ = 0;
+  bool has_crc64_ = true;
+
+  std::atomic<uint64_t> running_upload_tasks_ = {0};
+
+  bool already_head_ = false;
+  std::string object_type_;
+};
+
+// Normal (Put/Multipart) object writer
+class OssNormalWriter : public OssSeqWriter {
+ public:
+  OssNormalWriter(OssFs *fs, std::string_view path, FileInode *inode, int flags)
+      : OssSeqWriter(fs, path, inode, flags) {}
+
+  ssize_t pread_from_upload_buffer(void *buf, size_t count,
+                                   off_t offset) override {
+    return -ENOTSUP;
+  }
+
+  size_t calc_remote_size() override {
+    return 0;
+  }
+
+ private:
+  int check_file_size_limit(size_t count) override;
+
+  int on_first_write(off_t &offset, size_t &count) override;
+  void on_upload_fail_cleanup() override;
+
+  int truncate_internal() override;
+  int do_merge_remote_data() override;
+
+  int do_upload_buffer() override;
+  int do_upload_empty() override;
+  int do_upload_last_part() override;
+
+  int schedule_upload(size_t part_number) override;
+
+  struct MultipartContext {
+    OssNormalWriter *writer;
+    char *buf;
+    size_t part_number;
+  };
+
+  static void *do_multipart_upload(void *args);
+  static void *do_multipart_copy(void *args);
+
+  int do_complete_multipart();
+  void do_abort_multipart();
+  int schedule_multipart_upload(size_t part_number);
+  int merge_remote_data_of_normal_object();
+
+  void *upload_context_ = nullptr;
+  friend class OssSeqWriter;
+};
+
+class OssAppendableWriter : public OssSeqWriter {
+ public:
+  OssAppendableWriter(OssFs *fs, std::string_view path, FileInode *inode,
+                      int flags)
+      : OssSeqWriter(fs, path, inode, flags) {}
+
+  ssize_t pread_from_upload_buffer(void *buf, size_t count,
+                                   off_t offset) override;
+  size_t calc_remote_size() override;
+
+ protected:
+  int check_file_size_limit(size_t count) override;
+
+  int on_first_write(off_t &offset, size_t &count) override;
+  void on_upload_fail_cleanup() override{};
+
+  int truncate_internal() override;
+  int do_merge_remote_data() override;
+
+  int do_upload_buffer() override;
+  int do_upload_empty() override;
+  int do_upload_last_part() override;
+
+  int schedule_upload(size_t part_number) override;
+
+  size_t get_fault_injection_buffer_index() override;
+
+ private:
+  int do_append_upload(size_t part_number);
+  int switch_object_type_normal_to_appendable();
+
+  off_t valid_buffer_offset = 0;
+  friend class OssSeqWriter;
+};
+
+void OssWriter::mark_dirty() {
+  if (!get_is_dirty()) {
+    LOG_INFO("file: `, nodeid: ` is marked to dirty", upload_path_,
+             inode_->nodeid);
+
+    inode_->is_dirty = true;
+    is_dirty_ = true;
+
+    fs_->add_dirty_nodeid(inode_->nodeid);
+  }
+}
+
+void OssWriter::mark_clean() {
+  if (get_is_dirty()) {
+    LOG_INFO("file: `, nodeid: `, size: ` is marked to clean", upload_path_,
+             inode_->nodeid, inode_->attr.size);
+
+    // Always reset flag after release().
+    inode_->invalidate_data_cache = true;
+
+    // After every write op, FUSE kernel will invalidate attr cache(see details
+    // in fuse_perfrom_write), so we only need to reset attr_time and delay
+    // updating until next getattr().
+    inode_->attr_time = 0;
+
+    is_dirty_ = false;
+    inode_->is_dirty = false;
+
+    RELEASE_ASSERT(inode_->dirty_fh != nullptr);
+    inode_->dirty_fh = nullptr;
+    fs_->erase_dirty_nodeid(inode_->nodeid);
+  }
+}
+
+OssSeqWriter::~OssSeqWriter() {
+  waiting_upload_tasks();
   RELEASE_ASSERT(buffer_ == nullptr);
 }
 
-int OssWriter::flush() {
+int OssSeqWriter::flush() {
   int r = complete_upload();
   FAULT_INJECTION(FI_Data_Sync_Failed, [&]() { r = -EIO; });
   if (r < 0) {
@@ -244,33 +364,7 @@ int OssWriter::flush() {
   return r;
 }
 
-size_t OssWriter::calc_remote_size() {
-  return inode_->attr.size -
-         (buffer_size_ - appendable_status_.valid_buffer_offset);
-}
-
-ssize_t OssWriter::pread_from_upload_buffer(void *buf, size_t count,
-                                            off_t offset) {
-  RELEASE_ASSERT(fs_->options_.enable_appendable_object);
-
-  if (unlikely(offset >= (int64_t)inode_->attr.size)) {
-    return 0;
-  }
-
-  RELEASE_ASSERT(buffer_ != nullptr);
-
-  size_t buffer_index = offset / fs_->options_.upload_buffer_size;
-  RELEASE_ASSERT(buffer_index == buffer_index_);
-
-  off_t buffer_offset = offset % fs_->options_.upload_buffer_size;
-  RELEASE_ASSERT(buffer_offset >= appendable_status_.valid_buffer_offset);
-
-  count = std::min(count, buffer_size_ - (size_t)buffer_offset);
-  memcpy(static_cast<char *>(buf), buffer_ + buffer_offset, count);
-  return count;
-}
-
-int OssWriter::check_writing_permission() {
+int OssSeqWriter::check_writing_permission() {
   // inode dirty, handle dirty : allow writing
   // inode clean, handle clean : allow writing
   // inode dirty, handle clean : don't allow writing
@@ -289,37 +383,46 @@ int OssWriter::check_writing_permission() {
   return 0;
 }
 
-void OssWriter::mark_dirty() {
-  if (!get_is_dirty()) {
-    LOG_INFO("file: `, nodeid: ` is marked to dirty", upload_path_,
-             inode_->nodeid);
-
-    inode_->is_dirty = true;
-    is_dirty_ = true;
-
-    fs_->add_dirty_nodeid(inode_->nodeid);
+int OssSeqWriter::check_and_update_write_offset(off_t &offset) {
+  if (write_off_ == -1) {
+    write_off_ = inode_->attr.size;
   }
+
+  if (offset != write_off_) {
+    if (open_flags_ & O_APPEND) {
+      // clang-format off
+      LOG_WARN("offset ` is not equal to file_end ` with O_APPEND, ignored. file: `, nodeid: `",
+               offset, write_off_, upload_path_, inode_->nodeid);
+      // clang-format on
+      offset = write_off_;
+    } else {
+      // clang-format off
+      LOG_ERROR("write not allow on append only file: `, nodeid: `, size: `, offset: `, file_end: `",
+                upload_path_, inode_->nodeid, inode_->attr.size, offset, write_off_);
+      // clang-format on
+      return -EINVAL;
+    }
+  }
+
+  return 0;
 }
 
-bool OssWriter::verify_crc64() {
+bool OssSeqWriter::verify_crc64() {
   return fs_->options_.enable_crc64 && has_crc64_;
 }
 
-int OssWriter::open() {
+void OssSeqWriter::waiting_upload_tasks() {
+  while (running_upload_tasks_ > 0) {
+    AUTO_USLEEP(1000);
+  }
+}
+
+int OssSeqWriter::open() {
   if (open_flags_ & O_CREAT) {
     mark_dirty();
   } else if (open_flags_ & O_TRUNC) {
-    // Appendable objects should be deleted before writing.
-    if (fs_->options_.enable_appendable_object) {
-      int r = fs_->truncate_inode_data(inode_, upload_path_, 0);
-      if (r < 0) {
-        LOG_ERROR("fail to truncate file `, nodeid `, r `", upload_path_,
-                  inode_->nodeid, r);
-        return r;
-      }
-    } else {
-      if (inode_->attr.size != 0) mark_dirty();
-    }
+    int r = truncate_internal();
+    if (r < 0) return r;
 
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
@@ -329,8 +432,8 @@ int OssWriter::open() {
   return 0;
 }
 
-ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
-                          struct fuse_bufvec *bufv, std::string *wpath) {
+ssize_t OssSeqWriter::pwrite(size_t count, off_t offset, const void *buf,
+                             struct fuse_bufvec *bufv, std::string *wpath) {
   ssize_t r = 0;
   if (immutable_) {
     LOG_ERROR("file: `, nodeid: ` is immutable!", upload_path_, inode_->nodeid);
@@ -357,29 +460,10 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
   }
 
   r = check_writing_permission();
-  if (r < 0) {
-    return r;
-  }
+  if (r < 0) return r;
 
-  if (write_off_ == -1) {
-    write_off_ = inode_->attr.size;
-  }
-
-  if (offset != write_off_) {
-    if (open_flags_ & O_APPEND) {
-      // clang-format off
-      LOG_WARN("offset ` is not equal to file_end ` with O_APPEND, ignored. file: `, nodeid: `",
-               offset, write_off_, upload_path_, inode_->nodeid);
-      // clang-format on
-      offset = write_off_;
-    } else {
-      // clang-format off
-      LOG_ERROR("write not allow on append only file: `, nodeid: `, size: `, offset: `, file_end: `",
-                upload_path_, inode_->nodeid, inode_->attr.size, offset, write_off_);
-      // clang-format on
-      return -EINVAL;
-    }
-  }
+  r = check_and_update_write_offset(offset);
+  if (r < 0) return r;
 
   if (!get_is_dirty()) {
     if (wpath == nullptr) {
@@ -393,33 +477,16 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
         upload_path_ = *wpath;
       }
     }
-  }
 
-  if (!get_is_dirty()) {
-    if (write_off_ != 0 || fs_->options_.enable_appendable_object) {
-      r = merge_remote_data(offset, count);
-      if (r < 0) {
-        return r;
-      }
-    }
-  } else if (write_off_ == 0 && fs_->options_.enable_appendable_object &&
-             open_flags_ & O_CREAT) {
-    // Use appendable object forcely when enable_appendable_object is true.
-    appendable_status_.is_appendable_object = true;
+    r = on_first_write(offset, count);
+    if (r < 0) return r;
   }
 
   uint64_t buffer_off = buffer_size_;
   const uint64_t upload_buffer_size = fs_->options_.upload_buffer_size;
 
-  if (!appendable_status_.is_appendable_object) {
-    // The count is always > 0 and buffer_index_ starts from 0.
-    size_t num_new_buffers = (buffer_off + count - 1) / upload_buffer_size;
-    if (kOssMaxPartNumber < buffer_index_ + 1 + num_new_buffers) {
-      LOG_ERROR("file: `, nodeid: ` has already reached the max part number: `",
-                upload_path_, inode_->nodeid, kOssMaxPartNumber);
-      return -EFBIG;
-    }
-  }
+  r = check_file_size_limit(count);
+  if (r < 0) return r;
 
   size_t written = 0;
   while (written < count) {
@@ -437,18 +504,14 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
       r = fuse_bufvec_to_buf_copy(buffer_ + buffer_off, bufv, write_size);
     }
 
-    if (r < 0) {
-      break;
-    }
+    if (r < 0) break;
 
     if (verify_crc64()) {
       expected_crc64_ = crc64ecma(buffer_ + buffer_off, r, expected_crc64_);
     }
 
     FAULT_INJECTION(FI_Modify_Write_Buffer, [&]() {
-      int index = 0;
-      if (appendable_status_.is_appendable_object)
-        index = appendable_status_.valid_buffer_offset;
+      size_t index = get_fault_injection_buffer_index();
       char old = '\0';
       do {
         old = buffer_[index];
@@ -472,15 +535,8 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
     }
 
     if (buffer_off == upload_buffer_size) {
-      if (appendable_status_.is_appendable_object) {
-        r = do_append_upload(++buffer_index_);
-      } else {
-        r = schedule_multipart_upload(++buffer_index_);
-      }
-
-      if (r < 0) {
-        break;
-      }
+      r = schedule_upload(++buffer_index_);
+      if (r < 0) break;
 
       buffer_size_ = 0;
       buffer_off = 0;
@@ -508,11 +564,121 @@ ssize_t OssWriter::pwrite(size_t count, off_t offset, const void *buf,
   return written;
 }
 
-int OssWriter::schedule_multipart_upload(size_t part_number) {
+int OssSeqWriter::complete_upload() {
+  int r = 0;
+
+  if (inode_->is_stale) {
+    LOG_ERROR("aborting upload for deleted file: `", upload_path_);
+    immutable_ = true;
+    goto cleanup;
+  }
+
+  if (immutable_) {
+    r = -EIO;
+    goto cleanup;
+  }
+
+  if ((write_off_ == -1 && inode_->attr.size == 0) && get_is_dirty()) {
+    write_off_ = 0;
+    return do_upload_empty();
+  }
+
+  // Upload remaining buffer and do final completion
+  r = do_upload_last_part();
+  if (r < 0) {
+    goto cleanup;
+  }
+
+  return 0;
+
+cleanup:
+  clear_current_buffer();
+  on_upload_fail_cleanup();
+  return r;
+}
+
+char *OssSeqWriter::get_buffer() {
+  // TODO: use dynamic buffer size to support large file
+  //       more intelligently.
+  return fs_->upload_buffers_->allocate(1).front();
+}
+
+void OssSeqWriter::free_buffer(char *ptr) {
+  std::vector<char *> ptr_vec{ptr};
+  fs_->upload_buffers_->deallocate(ptr_vec);
+}
+
+void OssSeqWriter::clear_current_buffer() {
+  if (buffer_) {
+    free_buffer(buffer_);
+    buffer_ = nullptr;
+    buffer_size_ = 0;
+  }
+}
+
+int OssSeqWriter::get_object_attributes_from_remote() {
+  ObjHeaderMeta obj_meta;
+  int r =
+      PERFORM_BACKGROUND_OBJ_REQUEST(fs_, head_object, upload_path_, obj_meta);
+  if (r < 0) {
+    LOG_ERROR("Failed to head file: `, nodeid: ` r: `", upload_path_,
+              inode_->nodeid, r);
+    return r;
+  }
+
+  // Archived objects not supported.
+  if (obj_meta.storage_class != "Standard" && obj_meta.storage_class != "IA") {
+    LOG_ERROR("File: `, nodeid: `, is unsupported storge class: `",
+              upload_path_, inode_->nodeid, obj_meta.storage_class);
+    return -ENOTSUP;
+  }
+
+  has_crc64_ = obj_meta.has_crc64();
+  expected_crc64_ = obj_meta.crc64;
+  FAULT_INJECTION(FI_OssError_No_Crc64, [&]() {
+    has_crc64_ = false;
+    expected_crc64_ = 0;
+  });
+  if (!has_crc64_) {
+    LOG_WARN("File: `, nodeid: `, has no crc64, will not check crc64",
+             upload_path_, inode_->nodeid);
+  }
+  already_head_ = true;
+
+  LOG_INFO(
+      "Trying to merge file: `, inode: `, size: `, remote_size: `, type: `",
+      upload_path_, inode_->nodeid, inode_->attr.size, obj_meta.size,
+      obj_meta.type);
+
+  inode_->attr.size = obj_meta.size;
+  write_off_ = obj_meta.size;
+
+  // Store object type for derived class to use
+  object_type_ = obj_meta.type;
+
+  // Symlink is not supported for both normal and appendable writers
+  if (object_type_ == kOssObjectTypeSymlink) {
+    return -ENOTSUP;
+  }
+
+  return 0;
+}
+
+int OssSeqWriter::prepare_merge_remote_data(off_t &offset) {
+  int r = 0;
+  if (!already_head_) {
+    r = get_object_attributes_from_remote();
+    if (r < 0) return r;
+  }
+
+  return check_and_update_write_offset(offset);
+}
+
+int OssNormalWriter::schedule_multipart_upload(size_t part_number) {
   int r = 0;
   if (upload_context_ == nullptr) {
-    r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_init_multipart_upload,
-                                       upload_path_, &upload_context_);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, init_multipart_upload, upload_path_,
+                                       &upload_context_);
     if (r < 0) {
       LOG_ERROR("Failed to init multipart upload: `, nodeid: ` r: `",
                 upload_path_, inode_->nodeid, r);
@@ -531,121 +697,21 @@ int OssWriter::schedule_multipart_upload(size_t part_number) {
 
   auto th = photon::thread_create(do_multipart_upload, ctx);
   photon::thread_migrate(th,
-                         fs_->bg_vcpu_env_.bg_oss_client_env->get_vcpu_next());
+                         fs_->bg_vcpu_env_.bg_obj_store_env->get_vcpu_next());
 
   return r;
 }
 
-int OssWriter::complete_upload() {
-  int r = 0;
-
-  if (inode_->is_stale) {
-    LOG_ERROR("aborting upload for deleted file: `", upload_path_);
-    immutable_ = true;
-    if (upload_context_) {
-      complete_or_abort_multipart();
-      upload_context_ = nullptr;
-    } else if (buffer_) {
-      free_buffer(buffer_);
-      buffer_ = nullptr;
-    }
-    return 0;
-  }
-
-  if ((write_off_ == -1 && inode_->attr.size == 0) && get_is_dirty()) {
-    write_off_ = 0;
-    return upload_empty_file();
-  }
-
-  if (immutable_) {
-    if (upload_context_) goto exit;
-    return -EIO;
-  }
-
-  if (buffer_ == nullptr && upload_context_ == nullptr) {
-    return 0;
-  }
-
-  if (buffer_ != nullptr) {
-    auto background_env =
-        fs_->bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next();
-
-    r = background_env.executor->perform([&]() -> ssize_t {
-      auto oss_client = background_env.oss_client;
-
-      iovec iov{buffer_, buffer_size_};
-      ssize_t ret = 0;
-      uint64_t *expected_crc64 = verify_crc64() ? &expected_crc64_ : nullptr;
-      if (upload_context_ != nullptr) {
-        ret = oss_client->oss_upload_part(upload_context_, &iov, 1,
-                                          ++buffer_index_);
-        if (ret < 0) {
-          LOG_ERROR("Failed to upload file: `, nodeid: `, part: ` r: `",
-                    upload_path_, inode_->nodeid, buffer_index_, ret);
-          immutable_ = true;
-        }
-
-        return 0;
-      }
-
-      if (appendable_status_.is_appendable_object) {
-        off_t off = appendable_status_.valid_buffer_offset +
-                    buffer_index_ * fs_->options_.upload_buffer_size;
-        char *buf = buffer_ + appendable_status_.valid_buffer_offset;
-        size_t upload_size =
-            buffer_size_ - appendable_status_.valid_buffer_offset;
-        iovec iov{buf, upload_size};
-        ret = oss_client->oss_append_object(upload_path_, &iov, 1, off,
-                                            expected_crc64);
-      } else {
-        ret = oss_client->oss_put_object(upload_path_, &iov, 1, expected_crc64);
-      }
-
-      if (ret < 0) {
-        LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
-                  inode_->nodeid, ret);
-        immutable_ = true;
-      } else {
-        ret = 0;
-      }
-
-      return ret;
-    });
-
-    free_buffer(buffer_);
-    buffer_ = nullptr;
-
-    // For an appendable object, we should store the next offset of valid data
-    // after uploading data to keep the offset of buffer mapped to the object
-    // data. For a normal object, we always download the last part of the object
-    // to the buffer, so buffer_size_ will be updated during remote-data-merge.
-    if (appendable_status_.is_appendable_object) {
-      appendable_status_.valid_buffer_offset = buffer_size_;
-    } else {
-      buffer_size_ = 0;
-    }
-  }
-
-exit:
-  if (upload_context_ != nullptr) {
-    r = complete_or_abort_multipart();
-    upload_context_ = nullptr;
-    buffer_index_ = 0;
-  }
-
-  return r;
-}
-
-void *OssWriter::do_multipart_upload(void *args) {
+void *OssNormalWriter::do_multipart_upload(void *args) {
   auto ctx = static_cast<MultipartContext *>(args);
-  thread_local auto oss_client =
-      ctx->writer->fs_->bg_vcpu_env_.bg_oss_client_env->get_oss_client();
+  thread_local auto obj_store =
+      ctx->writer->fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store();
 
   iovec iov;
   iov.iov_base = ctx->buf;
   iov.iov_len = ctx->writer->fs_->options_.upload_buffer_size;
-  int r = oss_client->oss_upload_part(ctx->writer->upload_context_, &iov, 1,
-                                      ctx->part_number);
+  int r = obj_store->upload_part(ctx->writer->upload_context_, &iov, 1,
+                                 ctx->part_number);
   if (r < 0) {
     LOG_ERROR("Failed to upload file: `, part: ` r: `",
               ctx->writer->inode_->nodeid, ctx->part_number, r);
@@ -660,182 +726,62 @@ void *OssWriter::do_multipart_upload(void *args) {
   return nullptr;
 }
 
-int OssWriter::complete_or_abort_multipart() {
-  auto background_env =
-      fs_->bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next();
-  return background_env.executor->perform([&]() {
-    int r = 0;
-    while (running_upload_tasks_.load() > 0) {
-      AUTO_USLEEP(1000);
-    }
+int OssNormalWriter::do_complete_multipart() {
+  RELEASE_ASSERT(upload_context_ != nullptr);
 
-    auto oss_client = background_env.oss_client;
-    if (!immutable_) {
-      r = oss_client->oss_complete_multipart_upload(
-          upload_context_, verify_crc64() ? &expected_crc64_ : nullptr);
-      if (r < 0) {
-        LOG_ERROR("Failed to complete multipart file: `, r: `", inode_->nodeid,
-                  r);
-        immutable_ = true;
-      }
-    } else {
-      int abort_r = oss_client->oss_abort_multipart_upload(upload_context_);
-      if (abort_r < 0) {
-        LOG_ERROR("Failed to abort multipart upload: ` r: `", inode_->nodeid,
-                  abort_r);
-      }
+  waiting_upload_tasks();
+  if (immutable_) {
+    return -EIO;
+  }
 
-      r = -EIO;
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(
+      fs_, complete_multipart_upload, upload_context_,
+      verify_crc64() ? &expected_crc64_ : nullptr);
+  if (r < 0) {
+    LOG_ERROR("Failed to complete multipart file: `, r: `", inode_->nodeid, r);
+    immutable_ = true;
+  }
 
-      if (buffer_) {
-        free_buffer(buffer_);
-        buffer_ = nullptr;
-      }
-    }
-
-    return r;
-  });
-}
-
-int OssWriter::upload_empty_file() {
-  auto background_env =
-      fs_->bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next();
-  int r = background_env.executor->perform([&]() {
-    auto oss_client = background_env.oss_client;
-
-    ssize_t ret = 0;
-    iovec iov{nullptr, 0};
-    if (fs_->options_.enable_appendable_object) {
-      ret = oss_client->oss_append_object(upload_path_, &iov, 1, 0,
-                                          &expected_crc64_);
-      if (ret == 0) appendable_status_.is_appendable_object = true;
-    } else {
-      ret = oss_client->oss_put_object(upload_path_, &iov, 1, &expected_crc64_);
-    }
-    if (ret < 0) {
-      LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
-                inode_->nodeid, ret);
-      immutable_ = true;
-    }
-    return ret;
-  });
-
+  upload_context_ = nullptr;
+  buffer_index_ = 0;
   return r;
 }
 
-char *OssWriter::get_buffer() {
-  // TODO: use dynamic buffer size to support large file
-  //       more intelligently.
-  return fs_->upload_buffers_->allocate(1).front();
+void OssNormalWriter::do_abort_multipart() {
+  RELEASE_ASSERT(immutable_);
+  RELEASE_ASSERT(upload_context_ != nullptr);
+
+  waiting_upload_tasks();
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, abort_multipart_upload,
+                                         upload_context_);
+  if (r < 0) {
+    LOG_ERROR("Failed to abort multipart upload: ` r: `", inode_->nodeid, r);
+  }
+
+  upload_context_ = nullptr;
+  buffer_index_ = 0;
 }
 
-void OssWriter::free_buffer(char *ptr) {
-  std::vector<char *> ptr_vec{ptr};
-  fs_->upload_buffers_->deallocate(ptr_vec);
+int OssNormalWriter::do_upload_empty() {
+  iovec iov{nullptr, 0};
+  ssize_t r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, put_object, upload_path_,
+                                             &iov, 1, &expected_crc64_);
+  if (r < 0) {
+    LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
+              inode_->nodeid, r);
+    immutable_ = true;
+    return r;
+  }
+
+  return 0;
 }
 
-void OssWriter::mark_clean() {
-  if (get_is_dirty()) {
-    LOG_INFO("file: `, nodeid: `, size: ` is marked to clean", upload_path_,
-             inode_->nodeid, inode_->attr.size);
-
-    // Always reset flag after release().
-    inode_->invalidate_data_cache = true;
-
-    // After every write op, FUSE kernel will invalidate attr cache(see details
-    // in fuse_perfrom_write), so we only need to reset attr_time and delay
-    // updating until next getattr().
-    inode_->attr_time = 0;
-
-    is_dirty_ = false;
-    inode_->is_dirty = false;
-
-    RELEASE_ASSERT(inode_->dirty_fh != nullptr);
-    inode_->dirty_fh = nullptr;
-    fs_->erase_dirty_nodeid(inode_->nodeid);
-  }
-}
-
-int OssWriter::merge_remote_data(off_t offset, size_t count) {
-  if (!already_head_) {
-    ObjectHeaderMeta obj_meta;
-    int r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_head_object, upload_path_,
-                                           obj_meta);
-    if (r < 0) {
-      LOG_ERROR("Failed to head file: `, nodeid: ` r: `", upload_path_,
-                inode_->nodeid, r);
-      return r;
-    }
-
-    // Archived objects not supported.
-    if (obj_meta.storage_class != "Standard" &&
-        obj_meta.storage_class != "IA") {
-      LOG_ERROR("File: `, nodeid: `, is unsupported storge class: `",
-                upload_path_, inode_->nodeid, obj_meta.storage_class);
-      return -ENOTSUP;
-    }
-
-    has_crc64_ = obj_meta.has_crc64();
-    expected_crc64_ = obj_meta.crc64;
-    FAULT_INJECTION(FI_OssError_No_Crc64, [&]() {
-      has_crc64_ = false;
-      expected_crc64_ = 0;
-    });
-    if (!has_crc64_) {
-      LOG_WARN("File: `, nodeid: `, has no crc64, will not check crc64",
-               upload_path_, inode_->nodeid);
-    }
-    already_head_ = true;
-
-    LOG_INFO(
-        "Trying to merge file: `, inode: `, size: `, remote_size: `, type: `",
-        upload_path_, inode_->nodeid, inode_->attr.size, obj_meta.size,
-        obj_meta.type);
-
-    inode_->attr.size = obj_meta.size;
-    write_off_ = obj_meta.size;
-
-    if (offset != write_off_) {
-      LOG_ERROR("append only file: `, size: `, offset: `, write_off_: `",
-                upload_path_, inode_->attr.size, offset, write_off_);
-      return -EINVAL;
-    }
-
-    if (fs_->options_.enable_appendable_object &&
-        obj_meta.type == kOssObjectTypeAppendable &&
-        offset + count <= kOssMaxAppendableObjectSize) {
-      appendable_status_.is_appendable_object = true;
-      appendable_status_.valid_buffer_offset =
-          obj_meta.size % fs_->options_.upload_buffer_size;
-      buffer_size_ = appendable_status_.valid_buffer_offset;
-      buffer_index_ = obj_meta.size / fs_->options_.upload_buffer_size;
-    } else if (obj_meta.type == "Symlink") {
-      return -ENOTSUP;
-    }
-  }
-
-  if (!fs_->options_.enable_appendable_object) {
-    return merge_remote_data_of_normal_object();
-  }
-
-  if (appendable_status_.is_appendable_object) {
-    return 0;
-  }
-
-  if (inode_->attr.size <=
-      fs_->options_.appendable_object_autoswitch_threshold) {
-    return switch_object_type_normal_to_appendable();
-  } else {
-    return -ENOTSUP;
-  }
-}
-
-int OssWriter::merge_remote_data_of_normal_object() {
+int OssNormalWriter::merge_remote_data_of_normal_object() {
   const size_t part_size = fs_->options_.upload_buffer_size;
   size_t copy_num_parts = inode_->attr.size / part_size;
   if (copy_num_parts > 0) {
     RELEASE_ASSERT(upload_context_ == nullptr && buffer_index_ == 0);
-    int r = DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_init_multipart_upload,
+    int r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, init_multipart_upload,
                                            upload_path_, &upload_context_);
     if (r < 0) {
       LOG_ERROR("Failed to init multipart upload: `, nodeid: ` r: `",
@@ -854,7 +800,7 @@ int OssWriter::merge_remote_data_of_normal_object() {
 
       auto th = photon::thread_create(do_multipart_copy, ctx);
       photon::thread_migrate(
-          th, fs_->bg_vcpu_env_.bg_oss_client_env->get_vcpu_next());
+          th, fs_->bg_vcpu_env_.bg_obj_store_env->get_vcpu_next());
     }
   }
 
@@ -868,9 +814,8 @@ int OssWriter::merge_remote_data_of_normal_object() {
   IOVector bufv(&iov, 1);
 
   off_t offset = copy_num_parts * part_size;
-  int r =
-      DO_SYNC_BACKGROUND_OSS_REQUEST(fs_, oss_get_object_range, upload_path_,
-                                     bufv.iovec(), bufv.iovcnt(), offset);
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, get_object_range, upload_path_,
+                                         bufv.iovec(), bufv.iovcnt(), offset);
   FAULT_INJECTION(FI_Download_Failed_During_Merge_Remote_Data,
                   [&]() { r = -EIO; });
 
@@ -888,17 +833,17 @@ int OssWriter::merge_remote_data_of_normal_object() {
   return r;
 }
 
-void *OssWriter::do_multipart_copy(void *args) {
+void *OssNormalWriter::do_multipart_copy(void *args) {
   auto ctx = static_cast<MultipartContext *>(args);
-  thread_local auto oss_client =
-      ctx->writer->fs_->bg_vcpu_env_.bg_oss_client_env->get_oss_client();
+  thread_local auto obj_store =
+      ctx->writer->fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store();
 
   off_t offset =
       (ctx->part_number - 1) * ctx->writer->fs_->options_.upload_buffer_size;
   size_t count = ctx->writer->fs_->options_.upload_buffer_size;
 
-  int r = oss_client->oss_upload_part_copy(ctx->writer->upload_context_, offset,
-                                           count, ctx->part_number);
+  int r = obj_store->upload_part_copy(ctx->writer->upload_context_, offset,
+                                      count, ctx->part_number);
   if (r < 0) {
     LOG_ERROR("Failed to upload file: `, part: ` r: `",
               ctx->writer->inode_->nodeid, ctx->part_number, r);
@@ -911,16 +856,244 @@ void *OssWriter::do_multipart_copy(void *args) {
   return nullptr;
 }
 
-int OssWriter::do_append_upload(size_t part_number) {
-  off_t off = appendable_status_.valid_buffer_offset +
+int OssNormalWriter::do_upload_buffer() {
+  iovec iov{buffer_, buffer_size_};
+  ssize_t r = 0;
+  uint64_t *expected_crc64 = verify_crc64() ? &expected_crc64_ : nullptr;
+
+  if (upload_context_ != nullptr) {
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, upload_part, upload_context_, &iov,
+                                       1, ++buffer_index_);
+    if (r < 0) {
+      LOG_ERROR("Failed to upload file: `, nodeid: `, part: ` r: `",
+                upload_path_, inode_->nodeid, buffer_index_, r);
+    }
+  } else {
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, put_object, upload_path_, &iov, 1,
+                                       expected_crc64);
+    if (r < 0) {
+      LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
+                inode_->nodeid, r);
+    }
+  }
+
+  if (r < 0) {
+    immutable_ = true;
+    return r;
+  }
+
+  return 0;
+}
+
+int OssNormalWriter::on_first_write(off_t &offset, size_t &count) {
+  if (write_off_ != 0) {
+    int r = prepare_merge_remote_data(offset);
+    if (r < 0) return r;
+
+    return do_merge_remote_data();
+  }
+  return 0;
+}
+
+int OssNormalWriter::truncate_internal() {
+  // Only mark dirty and overwrite during complete upload
+  if (inode_->attr.size != 0) mark_dirty();
+  return 0;
+}
+
+int OssNormalWriter::check_file_size_limit(size_t count) {
+  // Check if exceeds max part number (10000)
+  uint64_t buffer_off = buffer_size_;
+  const uint64_t upload_buffer_size = fs_->options_.upload_buffer_size;
+  size_t num_new_buffers = (buffer_off + count - 1) / upload_buffer_size;
+  if (kOssMaxPartNumber < buffer_index_ + 1 + num_new_buffers) {
+    LOG_ERROR("file: `, nodeid: ` has already reached the max part number: `",
+              upload_path_, inode_->nodeid, kOssMaxPartNumber);
+    return -EFBIG;
+  }
+  return 0;
+}
+
+int OssNormalWriter::schedule_upload(size_t part_number) {
+  return schedule_multipart_upload(part_number);
+}
+
+void OssNormalWriter::on_upload_fail_cleanup() {
+  if (upload_context_) {
+    do_abort_multipart();
+  }
+}
+
+int OssNormalWriter::do_upload_last_part() {
+  int r = 0;
+
+  if (buffer_ != nullptr) {
+    r = do_upload_buffer();
+    clear_current_buffer();
+    if (r < 0) {
+      return r;
+    }
+  }
+
+  if (upload_context_ != nullptr) {
+    FAULT_INJECTION(FaultInjectionId::FI_Complete_Multipart_Delay, [&]() {
+      photon::thread_usleep(500'000);  // 500ms delay
+    });
+    r = do_complete_multipart();
+  }
+
+  return r;
+}
+
+int OssNormalWriter::do_merge_remote_data() {
+  return merge_remote_data_of_normal_object();
+}
+
+int OssAppendableWriter::do_upload_buffer() {
+  off_t off =
+      valid_buffer_offset + buffer_index_ * fs_->options_.upload_buffer_size;
+  char *buf = buffer_ + valid_buffer_offset;
+  size_t upload_size = buffer_size_ - valid_buffer_offset;
+  iovec iov{buf, upload_size};
+
+  uint64_t *expected_crc64 = verify_crc64() ? &expected_crc64_ : nullptr;
+  ssize_t r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, append_object, upload_path_,
+                                             &iov, 1, off, expected_crc64);
+  if (r < 0) {
+    LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
+              inode_->nodeid, r);
+    immutable_ = true;
+    return r;
+  }
+
+  return 0;
+}
+
+int OssAppendableWriter::do_upload_empty() {
+  iovec iov{nullptr, 0};
+  ssize_t r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, append_object, upload_path_,
+                                             &iov, 1, 0, &expected_crc64_);
+  if (r < 0) {
+    LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
+              inode_->nodeid, r);
+    immutable_ = true;
+    return r;
+  }
+
+  return 0;
+}
+
+int OssAppendableWriter::on_first_write(off_t &offset, size_t &count) {
+  if (open_flags_ & O_CREAT) return 0;
+
+  int r = prepare_merge_remote_data(offset);
+  if (r < 0) return r;
+
+  return do_merge_remote_data();
+}
+
+int OssAppendableWriter::truncate_internal() {
+  // Appendable objects should be deleted before writing.
+  int r = fs_->truncate_inode_data(inode_, upload_path_, 0);
+  if (r < 0) {
+    LOG_ERROR("fail to truncate file `, nodeid `, r `", upload_path_,
+              inode_->nodeid, r);
+    return r;
+  }
+  return 0;
+}
+
+int OssAppendableWriter::check_file_size_limit(size_t count) {
+  // Check if exceeds max appendable object size (5GB)
+  if (inode_->attr.size + count > kOssMaxAppendableObjectSize) {
+    LOG_ERROR("file: `, nodeid: ` exceeds max appendable object size: `",
+              upload_path_, inode_->nodeid, kOssMaxAppendableObjectSize);
+    return -EFBIG;
+  }
+  return 0;
+}
+
+int OssAppendableWriter::schedule_upload(size_t part_number) {
+  return do_append_upload(part_number);
+}
+
+size_t OssAppendableWriter::get_fault_injection_buffer_index() {
+  return valid_buffer_offset;
+}
+
+int OssAppendableWriter::do_merge_remote_data() {
+  if (object_type_ == kOssObjectTypeAppendable) {
+    valid_buffer_offset = inode_->attr.size % fs_->options_.upload_buffer_size;
+    buffer_size_ = valid_buffer_offset;
+    buffer_index_ = inode_->attr.size / fs_->options_.upload_buffer_size;
+    return 0;
+  }
+
+  // Need to switch from normal to appendable
+  if (inode_->attr.size <=
+      fs_->options_.appendable_object_autoswitch_threshold) {
+    return switch_object_type_normal_to_appendable();
+  } else {
+    return -ENOTSUP;
+  }
+}
+
+int OssAppendableWriter::do_upload_last_part() {
+  int r = 0;
+
+  if (buffer_ != nullptr) {
+    r = do_upload_buffer();
+
+    free_buffer(buffer_);
+    buffer_ = nullptr;
+    if (r < 0) {
+      return r;
+    }
+
+    // For an appendable object, we should store the next offset of valid data
+    // after uploading data to keep the offset of buffer mapped to the object
+    // data. For a normal object, we always download the last part of the object
+    // to the buffer, so buffer_size_ will be updated during remote-data-merge.
+    valid_buffer_offset = buffer_size_;
+  }
+
+  return r;
+}
+
+size_t OssAppendableWriter::calc_remote_size() {
+  size_t dirty_size = buffer_size_ - valid_buffer_offset;
+  return inode_->attr.size - dirty_size;
+}
+
+ssize_t OssAppendableWriter::pread_from_upload_buffer(void *buf, size_t count,
+                                                      off_t offset) {
+  if (unlikely(offset >= (int64_t)inode_->attr.size)) {
+    return 0;
+  }
+
+  RELEASE_ASSERT(buffer_ != nullptr);
+
+  size_t buffer_index = offset / fs_->options_.upload_buffer_size;
+  RELEASE_ASSERT(buffer_index == buffer_index_);
+
+  off_t buffer_offset = offset % fs_->options_.upload_buffer_size;
+  RELEASE_ASSERT(buffer_offset >= valid_buffer_offset);
+
+  count = std::min(count, buffer_size_ - (size_t)buffer_offset);
+  memcpy(static_cast<char *>(buf), buffer_ + buffer_offset, count);
+  return count;
+}
+
+int OssAppendableWriter::do_append_upload(size_t part_number) {
+  off_t off = valid_buffer_offset +
               (part_number - 1) * fs_->options_.upload_buffer_size;
-  char *buf = buffer_ + appendable_status_.valid_buffer_offset;
-  size_t upload_size = buffer_size_ - appendable_status_.valid_buffer_offset;
-  appendable_status_.valid_buffer_offset = 0;
+  char *buf = buffer_ + valid_buffer_offset;
+  size_t upload_size = buffer_size_ - valid_buffer_offset;
+  valid_buffer_offset = 0;
 
   iovec iov{buf, upload_size};
-  int r = DO_SYNC_BACKGROUND_OSS_REQUEST(
-      fs_, oss_append_object, upload_path_, &iov, 1, off,
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(
+      fs_, append_object, upload_path_, &iov, 1, off,
       verify_crc64() ? &expected_crc64_ : nullptr);
   if (r < 0) {
     LOG_ERROR("Failed to do append upload file: `, nodeid: `, r: `",
@@ -930,7 +1103,7 @@ int OssWriter::do_append_upload(size_t part_number) {
   return r;
 }
 
-int OssWriter::switch_object_type_normal_to_appendable() {
+int OssAppendableWriter::switch_object_type_normal_to_appendable() {
   auto generate_hidden_object_name_fn = [&](std::string *out) {
     // prefix + "_" + object name + "_" + random string + "_" + unix timestamp
     const std::string prefix = ".ossfs_hidden_file";
@@ -962,9 +1135,9 @@ int OssWriter::switch_object_type_normal_to_appendable() {
   buffer_ = get_buffer();
 
   auto background_env =
-      fs_->bg_vcpu_env_.bg_oss_client_env->get_oss_client_env_next();
+      fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next();
   int r = background_env.executor->perform([&]() {
-    auto oss_client = background_env.oss_client;
+    auto obj_store = background_env.obj_store;
 
     // 1. Rename the remote file to the tmpfile.
     // TODO: add retry if oss return error FileAlreadyExists
@@ -975,8 +1148,8 @@ int OssWriter::switch_object_type_normal_to_appendable() {
     if (r < 0) return r;
 
     if (need_copy) {
-      r = oss_client->oss_copy_object(upload_path_, tmp_file_path,
-                                      false /*overwrite*/);
+      r = obj_store->copy_object(upload_path_, tmp_file_path,
+                                 false /*overwrite*/);
       if (r < 0) {
         LOG_ERROR("Failed to rename file: ` to `, nodeid: `, r: `",
                   upload_path_, tmp_file_path, inode_->nodeid, r);
@@ -985,7 +1158,7 @@ int OssWriter::switch_object_type_normal_to_appendable() {
     }
 
     // 2. Delete the old file.
-    r = oss_client->oss_delete_object(upload_path_);
+    r = obj_store->delete_object(upload_path_);
     if (r < 0) {
       LOG_ERROR("Failed to delete file: `, nodeid: `, r: `", upload_path_,
                 inode_->nodeid, r);
@@ -1007,8 +1180,8 @@ int OssWriter::switch_object_type_normal_to_appendable() {
       iovec iov{buffer_, copy_size};
       IOVector bufv(&iov, 1);
 
-      ssize_t ret = oss_client->oss_get_object_range(
-          tmp_file_path, bufv.iovec(), bufv.iovcnt(), i * part_size);
+      ssize_t ret = obj_store->get_object_range(tmp_file_path, bufv.iovec(),
+                                                bufv.iovcnt(), i * part_size);
       if (ret < 0) {
         // clang-format off
         LOG_ERROR(
@@ -1024,8 +1197,8 @@ int OssWriter::switch_object_type_normal_to_appendable() {
         crc64_ptr = &expected_crc64_;
       }
 
-      ret = oss_client->oss_append_object(upload_path_, &iov, 1, i * part_size,
-                                          crc64_ptr);
+      ret = obj_store->append_object(upload_path_, &iov, 1, i * part_size,
+                                     crc64_ptr);
       if (ret < 0) {
         LOG_ERROR("Failed to append upload file: `, nodeid: `, r: `",
                   upload_path_, inode_->nodeid, ret);
@@ -1035,15 +1208,14 @@ int OssWriter::switch_object_type_normal_to_appendable() {
 
     // 4. Delete the tmpfile and ignore error.
     if (need_copy) {
-      r = oss_client->oss_delete_object(tmp_file_path.c_str());
+      r = obj_store->delete_object(tmp_file_path.c_str());
       if (r < 0) {
         LOG_ERROR("Failed to delete tmpfile: `, nodeid: `, r: `", tmp_file_path,
                   inode_->nodeid, r);
       };
     }
 
-    appendable_status_.valid_buffer_offset = buffer_size_;
-    appendable_status_.is_appendable_object = true;
+    valid_buffer_offset = buffer_size_;
     buffer_index_ = inode_->attr.size / part_size;
     return 0;
   });
@@ -1060,7 +1232,11 @@ int OssWriter::switch_object_type_normal_to_appendable() {
 std::unique_ptr<IWriter> create_oss_writer(OssFs *fs, std::string_view path,
                                            FileInode *inode, int flags,
                                            bool is_dirty) {
-  return std::make_unique<OssWriter>(fs, path, inode, flags);
+  if (fs->get_options().enable_appendable_object) {
+    return std::make_unique<OssAppendableWriter>(fs, path, inode, flags);
+  } else {
+    return std::make_unique<OssNormalWriter>(fs, path, inode, flags);
+  }
 }
 
 }  // namespace OssFileSystem

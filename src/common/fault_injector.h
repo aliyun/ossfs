@@ -50,6 +50,11 @@ typedef enum {
   FI_Force_Flush_Dirty_Handle_Delay,
   FI_Lookup_Delay_Before_Getting_OSS_Response,
   FI_Lookup_Oss_Failure,
+  FI_Complete_Multipart_Delay,
+  FI_Oss_Missing_Object_Type,
+  FI_Do_Refill_Range_Delay,
+  FI_DiskCache_Init_Failure,
+  FI_DiskCache_Key_Collision,
   FI_Count,
 } FaultInjectionId;
 
@@ -86,6 +91,11 @@ static const std::string_view FaultInjectionName[] = {
     "FI_Force_Flush_Dirty_Handle_Delay",
     "FI_Lookup_Delay_Before_Getting_OSS_Response",
     "FI_Lookup_Oss_Failure",
+    "FI_Complete_Multipart_Delay",
+    "FI_Oss_Missing_Object_Type",
+    "FI_Do_Refill_Range_Delay",
+    "FI_DiskCache_Init_Failure",
+    "FI_DiskCache_Key_Collision",
 };
 
 static_assert(sizeof(FaultInjectionName) / sizeof(std::string_view) == FI_Count,
@@ -134,14 +144,14 @@ class FaultInjector {
   }
 
   void fault_injection(FaultInjectionId id, std::function<void()> executor) {
-    if (!is_injection_enabled(id)) return;
-    LOG_INFO("inject fault hit ` with params `", FaultInjectionName[id],
-             injection_map_[id].to_string());
     {
       std::lock_guard<std::mutex> l(lock_);
       auto iter = injection_map_.find(id);
       if (iter == injection_map_.end() || injection_map_[id].run_count == 0)
         return;
+
+      LOG_INFO("inject fault hit ` with params `", FaultInjectionName[id],
+               injection_map_[id].to_string());
 
       if (injection_map_[id].skip_count > 0) {
         injection_map_[id].skip_count--;

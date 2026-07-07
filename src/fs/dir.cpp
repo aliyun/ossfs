@@ -126,7 +126,7 @@ int OssDirHandle::next(bool *need_construct_inodes) {
 // Called every time when offset == 0.
 // Make sure the next get() will not return nullptr if
 // dirty_children_ is not empty or the list result is not empty.
-int OssDirHandle::refresh_dir(std::map<estring, OssDirent> &dirty_children) {
+int OssDirHandle::refresh_dir(std::map<estring, ObjDirent> &dirty_children) {
   dirty_children_.swap(dirty_children);
   dirty_child_iter_ = dirty_children_.begin();
   fill_cnt_ = 0;

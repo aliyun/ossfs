@@ -144,6 +144,44 @@ class FixedMemoryPoolTest : public Ossfs2TestSuite {
     std::this_thread::sleep_for(std::chrono::seconds(2));
     ASSERT_EQ(pool.cached_block_list_.size(), 0ULL);
   }
+
+  void verify_get_usage_ratio() {
+    const size_t block_size = 1024;
+    const size_t pool_capacity = 10;
+    const size_t max_cached_blocks = 5;
+
+    // Test empty pool
+    FixedBlockMemoryPool pool1(block_size, pool_capacity, max_cached_blocks, 0);
+    ASSERT_DOUBLE_EQ(pool1.get_usage_ratio(), 0.0);
+
+    // Test half-full pool
+    FixedBlockMemoryPool pool2(block_size, pool_capacity, max_cached_blocks, 0);
+    auto blocks = pool2.allocate(5);
+    ASSERT_EQ(pool2.used_blocks(), 5ULL);
+    ASSERT_DOUBLE_EQ(pool2.get_usage_ratio(), 0.5);
+    pool2.deallocate(blocks);
+
+    // Test full pool
+    FixedBlockMemoryPool pool3(block_size, pool_capacity, max_cached_blocks, 0);
+    auto blocks2 = pool3.allocate(pool_capacity);
+    ASSERT_EQ(pool3.used_blocks(), pool_capacity);
+    ASSERT_DOUBLE_EQ(pool3.get_usage_ratio(), 1.0);
+    pool3.deallocate(blocks2);
+
+    // Test pool with usage exceeding capacity
+    FixedBlockMemoryPool pool4(block_size, pool_capacity, max_cached_blocks, 0);
+    auto blocks3 = pool4.allocate(pool_capacity * 2);
+    ASSERT_EQ(pool4.used_blocks(), pool_capacity * 2);
+    ASSERT_DOUBLE_EQ(pool4.get_usage_ratio(), 2.0);
+    pool4.deallocate(blocks3);
+
+    // Test pool with zero capacity (unlimited)
+    FixedBlockMemoryPool pool5(block_size, std::numeric_limits<size_t>::max(),
+                               max_cached_blocks, 0);
+    auto blocks4 = pool5.allocate(5);
+    ASSERT_DOUBLE_EQ(pool5.get_usage_ratio(), 0.0);
+    pool5.deallocate(blocks4);
+  }
 };
 
 TEST_F(FixedMemoryPoolTest, verify_allocate) {
@@ -156,4 +194,8 @@ TEST_F(FixedMemoryPoolTest, verify_try_allocate) {
 
 TEST_F(FixedMemoryPoolTest, verify_purger) {
   verify_purger();
+}
+
+TEST_F(FixedMemoryPoolTest, verify_get_usage_ratio) {
+  verify_get_usage_ratio();
 }

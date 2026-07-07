@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include <string>
+
+#include "cache.h"
 #include "common/filesystem.h"
 #include "file_prefetching.h"
-#include "mem_cache.h"
 #include "test/class_declarations.h"
 
 namespace OssFileSystem {
@@ -47,7 +49,8 @@ class IReader {
 class OssCachedReader final : public IReader,
                               public EnableFilePrefetching<OssCachedReader> {
  public:
-  OssCachedReader(OssFs *fs, std::string_view path, FileInode *inode);
+  OssCachedReader(OssFs *fs, std::string_view path, FileInode *inode,
+                  std::shared_ptr<ICache> cache, CacheHandle *cache_handle);
 
   ssize_t pread_rlocked(void *buf, size_t count, off_t offset) override;
   ssize_t pread(void *buf, size_t count, off_t offset) override;
@@ -67,21 +70,31 @@ class OssCachedReader final : public IReader,
   }
 
  private:
-  ssize_t bg_try_refill_range(OssAdapter *oss_client, off_t offset,
-                              size_t count);
+  // Memory usage thresholds for prefetch window control.
+  static constexpr double kPoolUsageLowThreshold = 0.5;
+  static constexpr double kPoolUsageHighThreshold = 0.9;
+  static constexpr double kMinWindowRatio = 0.5;
+
+  static constexpr double kExpansionFactorAtLowUsage = 2.0;
+  static constexpr double kExpansionFactorAtMedUsage = 1.5;
+  static constexpr double kExpansionFactorAtHighUsage = 1.25;
+
+  ssize_t bg_try_refill_range(IObjStore *obj_store, off_t offset, size_t count);
 
   void try_expand_prefetch_window(off_t remote_size);
   bool has_enough_space(size_t size);
 
-  uint64_t get_prefetch_alignment();
+  // Memory-aware prefetch control based on pool usage.
+  size_t get_dynamic_max_window(size_t configured_max, double pool_usage) const;
+  double get_dynamic_expansion_factor(double pool_usage) const;
 
-  void set_latest_read_off(off_t offset);
+  uint64_t get_prefetch_alignment();
 
   // Returns the number of allocated blocks.
   size_t try_realloc_cache_blocks(uint64_t new_total_blocks,
                                   bool from_bg_prefetch = false);
 
-  ssize_t do_refill_range(OssAdapter *oss_client, uint64_t refill_off,
+  ssize_t do_refill_range(IObjStore *obj_store, uint64_t refill_off,
                           uint64_t refill_size, size_t count, char *input,
                           off_t offset, bool from_bg_prefetch);
 
@@ -95,12 +108,15 @@ class OssCachedReader final : public IReader,
 
   bool refresh_attr_if_needed_and_invoke(std::function<void()> &&callback);
 
-  std::shared_ptr<BlockCacheManager> cache_manager_;
-  BlockCache *cache_ = nullptr;
-  RangeLock *range_lock_ = nullptr;
+  RangeLock *range_lock() {
+    return cache_handle_->get_range_lock();
+  }
+
+  std::shared_ptr<ICache> cache_;
+  CacheHandle *cache_handle_ = nullptr;
 
   // Tracks the number of cache blocks allocated to this FileHandle.
-  // These blocks are returned to the cache_manager_ when the file is closed.
+  // These blocks are returned to the cache when the file is closed.
   // And the prefetch window size is determined by this value.
   uint64_t total_blocks_ = 0;
 

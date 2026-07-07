@@ -14,37 +14,62 @@
  * limitations under the License.
  */
 
-#include "common/shm_handle.h"
+#include "shm_handle.h"
+
+#include <sys/stat.h>
+
+#include <cstddef>
 
 namespace common {
 
-int ShmHandle::open(const std::string &shm_name, size_t size, int flags,
-                    std::unique_ptr<ShmHandle> &ptr) {
+int ShmHandle::open(const std::string &name, int flags,
+                    std::unique_ptr<ShmHandle> &shm_handle) {
+  flags &= ~O_CREAT;
+  return ShmHandle::open_internal(name, 0, flags, shm_handle);
+}
+
+int ShmHandle::create(const std::string &name, size_t trunc_size, int flags,
+                      std::unique_ptr<ShmHandle> &shm_handle) {
+  flags |= O_CREAT;
+  return ShmHandle::open_internal(name, trunc_size, flags, shm_handle);
+}
+
+int ShmHandle::open_internal(const std::string &shm_name, size_t trunc_size,
+                             int flags,
+                             std::unique_ptr<ShmHandle> &shm_handle) {
+  size_t shm_size = trunc_size;
   LOG_DEBUG("open shmem `", shm_name);
   int fd = shm_open(shm_name.c_str(), flags, kDefaultShmMode);
   if (fd == -1) {
     RETURN_IF_TRUE(errno == ENOENT, -ENOENT,
                    LOG_WARN("open shmem failed, shmem ` not found", shm_name));
-    LOG_ERROR_RETURN(0, -1, "open shmem failed, name: `, errr: `", shm_name,
+    LOG_ERROR_RETURN(0, -1, "open shmem failed, name: `, err: `", shm_name,
                      strerror(errno));
   }
   DEFER(::close(fd));
 
   if (flags & O_CREAT) {
-    if (ftruncate(fd, size) == -1) {
+    if (ftruncate(fd, trunc_size) == -1) {
       LOG_ERROR("ftruncate shmem failed, `", strerror(errno));
       return -1;
     }
+  } else {
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+      LOG_ERROR("stat failed, shm_name: `, err: `", shm_name, strerror(errno));
+      return -1;
+    }
+    shm_size = st.st_size;
   }
 
   void *mmap_ptr =
-      mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (mmap_ptr == MAP_FAILED) {
     LOG_ERROR("mmap failed, `", strerror(errno));
     return -1;
   }
 
-  ptr.reset(new ShmHandle(shm_name, size, mmap_ptr));
+  shm_handle.reset(new ShmHandle(shm_name, shm_size, mmap_ptr));
   return 0;
 }
 

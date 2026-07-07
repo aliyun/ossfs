@@ -41,6 +41,8 @@ using namespace OssFileSystem;
 
 #define EXECUTOR_QUEUE_OPTION \
   { 16, 1024 }
+#define LIBAIO_PHOTON_OPTION \
+  { 128 }
 
 DECLARE_string(oss_endpoint);
 DECLARE_string(oss_bucket);
@@ -50,6 +52,10 @@ DECLARE_string(oss_access_key_secret);
 DECLARE_uint64(oss_request_timeout_ms);
 DECLARE_bool(enable_locking_debug_logs);
 DECLARE_bool(write_with_fuse_bufvec);
+DECLARE_string(http_proxy);
+
+DECLARE_string(disk_cache_dir);
+DECLARE_string(disk_cache_io_engine);
 
 extern const std::string kOssMetaStorageClass;
 extern const std::string kOssSCStandard;
@@ -61,6 +67,7 @@ extern const std::string kOssSCDeepColdArchive;
 extern const std::string kUserAgentPrefix;
 
 std::string random_string(int length);
+int random_disk_cache_io_engine(int specified_engine);
 
 //
 // Base test suite class for OssFs filesystem tests.
@@ -91,8 +98,9 @@ class Ossfs2TestSuite : public ::testing::Test {
 
   class AuditableOssFs final : public OssFs {
    public:
-    AuditableOssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env)
-        : OssFs(options, bg_vcpu_env) {}
+    AuditableOssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env,
+                   std::unique_ptr<IIdManager> id_manager)
+        : OssFs(options, bg_vcpu_env, std::move(id_manager)) {}
 
     virtual ~AuditableOssFs() {}
 
@@ -144,10 +152,12 @@ class Ossfs2TestSuite : public ::testing::Test {
   };
 
   void init(OssFsOptions fs_opts, int max_list_ret = -1,
-            std::string bind_ips = "", bool preserve_input_options = false);
+            std::string bind_ips = "", bool preserve_input_options = false,
+            int disk_cache_io_engine = -1);
 
   int do_init(OssFsOptions fs_opts, int max_list_ret = -1,
-              std::string bind_ips = "", bool preserve_input_options = false);
+              std::string bind_ips = "", bool preserve_input_options = false,
+              int disk_cache_io_engine = -1);
 
   void destroy();
   void remount();
@@ -168,7 +178,7 @@ class Ossfs2TestSuite : public ::testing::Test {
   uint64_t root_nodeid_ = 1;
   std::string test_path_ = "/tmp/OssFs2Test/";
   std::string gtest_base_dir = "";
-  OssAdapterOptions oss_options_;
+  ObjStoreOptions oss_options_;
 
   // help functions
  protected:

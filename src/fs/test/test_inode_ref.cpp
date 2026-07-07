@@ -566,13 +566,15 @@ class Ossfs2InodeRefTest : public Ossfs2TestSuite {
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
 
+    uint64_t next_id = 2;
+
     auto create_child_inode = [&](int cur_level, int cur_index, bool is_dir) {
       std::string namestr(name_base_size, cur_level + '0');
       namestr.append("-").append(std::to_string(cur_index));
       InodeType type = is_dir ? InodeType::kDir : InodeType::kFile;
       Inode *child_inode =
-          fs_->create_new_inode(InodeManager::next(), namestr, 0, now, type,
-                                false, parent_inode->nodeid, nullptr, "");
+          fs_->create_new_inode(next_id++, namestr, 0, now, type, false,
+                                parent_inode->nodeid, nullptr, "");
       fs_->add_new_inode_to_global_map(child_inode);
       static_cast<DirInode *>(parent_inode)->add_child_node(child_inode);
       return child_inode;
