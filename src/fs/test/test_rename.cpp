@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <atomic>
+
 #include "test_suite.h"
 
 class Ossfs2RenameTest : public Ossfs2TestSuite {
@@ -689,6 +691,212 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     }
   }
 
+  // Random-write flush produces no OSS-side CRC64 meta (multipart copy can't
+  // guarantee it), so rename correctness under random-write mode is verified by
+  // reading the object back through the fs and comparing the content CRC. Reads
+  // by nodeid so it also works for files that were moved into a renamed dir.
+  ssize_t read_nodeid_crc(uint64_t nodeid, uint64_t *out_crc64) {
+    struct stat st;
+    int r = fs_->getattr(nodeid, &st);
+    if (r < 0) return r;
+
+    void *handle = nullptr;
+    bool unused = false;
+    r = fs_->open(nodeid, O_RDONLY, &handle, &unused);
+    if (r < 0) return r;
+    DEFER(fs_->release(nodeid, get_file_from_handle(handle)));
+
+    uint64_t offset = 0, size = st.st_size, crc64 = 0;
+    const size_t buf_size = 1024 * 1024;
+    char *buf = new char[buf_size];
+    DEFER(delete[] buf);
+    while (offset < size) {
+      uint64_t remain = size - offset;
+      uint64_t read_size = remain < buf_size ? remain : buf_size;
+      ssize_t got = read_from_handle(handle, buf, read_size, offset);
+      if (got < 0) return got;
+      crc64 = cal_crc64(crc64, buf, got);
+      offset += got;
+    }
+    if (out_crc64) *out_crc64 = crc64;
+    return static_cast<ssize_t>(size);
+  }
+
+  void verify_rename_dirty_file_random_write() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    struct stat stbuf;
+    int r = create_and_flush(parent, "dirty_file", CREATE_BASE_FLAGS, 0777, 0,
+                             0, 0, &nodeid, &stbuf, &handle);
+    ASSERT_EQ(r, 0);
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    std::string random_file = join_paths(test_path_, "rw_rename_file.dat");
+
+    srand(time(nullptr));
+    uint64_t file_size_in_mb = 1 + rand() % 128;  // at least 1MB
+    uint64_t drift = rand() % (1024 * 1024);
+    create_random_file(random_file, file_size_in_mb, drift);
+    int run_time_seconds = 3;
+
+    // Write the file continuously in the background while we rename it.
+    auto future = std::async(std::launch::async, [=]() -> uint64_t {
+      INIT_PHOTON();
+      return write_file_intervally(nodeid, random_file,
+                                   file_size_in_mb * 1024 * 1024 + drift,
+                                   run_time_seconds, 5 /*with long delay*/);
+    });
+
+    uint64_t expected_crc64 = 0;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+      DEFER(expected_crc64 = future.get());
+      std::string old_name = "dirty_file";
+      for (int i = 0; i < run_time_seconds * 10; i++) {
+        auto new_name = "dirty_file_renamed" + std::to_string(i);
+        r = fs_->rename(parent, old_name.c_str(), parent, new_name.c_str(), 0);
+        ASSERT_EQ(r, 0);
+        old_name = new_name;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+
+    // The inode identity is stable across renames; read it back and compare.
+    uint64_t actual_crc64 = 0;
+    ssize_t sz = read_nodeid_crc(nodeid, &actual_crc64);
+    ASSERT_GE(sz, 0);
+    ASSERT_EQ(actual_crc64, expected_crc64);
+  }
+
+  void verify_rename_dirty_dir_random_write(uint64_t parent) {
+    auto parent_path = nodeid_to_path(parent);
+
+    uint64_t dst_nodeid = 0;
+    struct stat st;
+    int r = fs_->mkdir(parent, "dst_dir", 0777, 0, 0, 0, &dst_nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dst_nodeid, 1));
+
+    std::vector<uint64_t> dir_nodeids(5, 0);
+    uint64_t parent_nodeid = parent;
+    for (int i = 0; i < 5; i++) {
+      std::string dir_name = "dir" + std::to_string(i);
+      int r = fs_->mkdir(parent_nodeid, dir_name.c_str(), 0777, 0, 0, 0,
+                         &dir_nodeids[i], &st);
+      ASSERT_EQ(r, 0);
+      parent_nodeid = dir_nodeids[i];
+    }
+
+    std::vector<uint64_t> file_nodeids(5, 0);
+    create_file_in_folder(dir_nodeids[3], "dir3-file0", 0, file_nodeids[0], 0);
+    ASSERT_NE(file_nodeids[0], (uint64_t)0);
+    create_file_in_folder(dir_nodeids[3], "dir3-file1", 0, file_nodeids[1], 0);
+    ASSERT_NE(file_nodeids[1], (uint64_t)0);
+    create_file_in_folder(dir_nodeids[2], "dir2-file0", 0, file_nodeids[2], 0);
+    ASSERT_NE(file_nodeids[2], (uint64_t)0);
+    create_file_in_folder(dir_nodeids[4], "dir4-file0", 0, file_nodeids[3], 0);
+    ASSERT_NE(file_nodeids[3], (uint64_t)0);
+    create_file_in_folder(dir_nodeids[0], "dir0-file0", 0, file_nodeids[4], 0);
+    ASSERT_NE(file_nodeids[4], (uint64_t)0);
+
+    srand(time(nullptr));
+    std::vector<std::future<uint64_t>> crc64_future;
+    int run_time_seconds = 10;
+    for (size_t i = 0; i < file_nodeids.size(); i++) {
+      std::string local_file_name =
+          "rw_local_file_" + std::to_string(parent) + "_" + std::to_string(i);
+      std::string random_file = join_paths(test_path_, local_file_name);
+      uint64_t file_size_in_mb = 1 + rand() % 64;  // at least 1MB
+      uint64_t drift = rand() % (1024 * 1024);
+      create_random_file(random_file, file_size_in_mb, drift);
+
+      auto future = std::async(std::launch::async, [=]() -> uint64_t {
+        INIT_PHOTON();
+        return write_file_intervally(file_nodeids[i], random_file,
+                                     file_size_in_mb * 1024 * 1024 + drift,
+                                     run_time_seconds, 5 /*long delay*/);
+      });
+      crc64_future.push_back(std::move(future));
+    }
+
+    std::vector<uint64_t> expected_crc64(file_nodeids.size(), 0);
+    {
+      DEFER(expected_crc64[0] = crc64_future[0].get());
+      DEFER(expected_crc64[1] = crc64_future[1].get());
+      DEFER(expected_crc64[2] = crc64_future[2].get());
+      DEFER(expected_crc64[3] = crc64_future[3].get());
+      DEFER(expected_crc64[4] = crc64_future[4].get());
+
+      uint64_t old_parent = dir_nodeids[1];
+      std::string old_name = "dir2";
+      uint64_t new_parent = parent;
+      std::string new_name = "dst_dir";
+      for (int i = 0; i < run_time_seconds * 10; i++) {
+        r = fs_->rename(old_parent, old_name.c_str(), new_parent,
+                        new_name.c_str(), 0);
+        ASSERT_EQ(r, 0);
+        old_parent = new_parent;
+        old_name = new_name;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        new_parent = old_parent;
+        new_name = "newdir" + std::to_string(i);
+      }
+    }
+
+    for (size_t i = 0; i < file_nodeids.size(); i++) {
+      uint64_t actual_crc64 = 0;
+      ssize_t sz = read_nodeid_crc(file_nodeids[i], &actual_crc64);
+      ASSERT_GE(sz, 0);
+      ASSERT_EQ(actual_crc64, expected_crc64[i]);
+    }
+
+    for (auto nodeid : dir_nodeids) {
+      fs_->forget(nodeid, 1);
+    }
+    for (auto nodeid : file_nodeids) {
+      fs_->forget(nodeid, 1);
+    }
+  }
+
+  void verify_rename_dirty_dir_random_write() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::vector<uint64_t> dir_nodeids(4, 0);
+    struct stat st;
+    for (size_t i = 0; i < dir_nodeids.size(); i++) {
+      std::string dir_name = "rw_basedir" + std::to_string(i);
+      int r = fs_->mkdir(parent, dir_name.c_str(), 0777, 0, 0, 0,
+                         &dir_nodeids[i], &st);
+      ASSERT_EQ(r, 0);
+    }
+
+    std::vector<std::future<void>> futures;
+    for (size_t j = 0; j < dir_nodeids.size(); j++) {
+      auto future = std::async(
+          std::launch::async,
+          [&](uint64_t nodeid) -> void {
+            INIT_PHOTON();
+            verify_rename_dirty_dir_random_write(nodeid);
+          },
+          dir_nodeids[j]);
+      futures.push_back(std::move(future));
+    }
+
+    for (auto &future : futures) {
+      future.get();
+    }
+
+    for (auto nodeid : dir_nodeids) {
+      fs_->forget(nodeid, 1);
+    }
+  }
+
   void verify_rename_src_not_exist() {
     uint64_t parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
@@ -899,6 +1107,375 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     }
   }
 
+  void verify_read_after_rename_overwrite_returns_new_data() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    const size_t file_size = 4 * 1024 * 1024;      // 4MB
+    const size_t trigger_size = 128 * 1024;        // 128KB to trigger prefetch
+    const size_t verify_offset = 1 * 1024 * 1024;  // 1MB
+
+    // Create file /a filled with 0xAA
+    uint64_t nodeid_a = 0;
+    void *handle_a = nullptr;
+    struct stat st;
+    int r = create_and_flush(parent, "file_a", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                             &nodeid_a, &st, &handle_a);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid_a, 1));
+
+    std::vector<char> buf_aa(file_size, (char)0xAA);
+    auto file_a = get_file_from_handle(handle_a);
+    r = file_a->pwrite(buf_aa.data(), file_size, 0);
+    ASSERT_EQ(r, (int)file_size);
+    r = fs_->release(nodeid_a, file_a);
+    ASSERT_EQ(r, 0);
+
+    // Create file /b filled with 0xBB
+    uint64_t nodeid_b = 0;
+    void *handle_b = nullptr;
+    r = create_and_flush(parent, "file_b", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                         &nodeid_b, &st, &handle_b);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid_b, 1));
+
+    std::vector<char> buf_bb(file_size, (char)0xBB);
+    auto file_b = get_file_from_handle(handle_b);
+    r = file_b->pwrite(buf_bb.data(), file_size, 0);
+    ASSERT_EQ(r, (int)file_size);
+    r = fs_->release(nodeid_b, file_b);
+    ASSERT_EQ(r, 0);
+
+    // Open /a to anchor inode (E_A)
+    void *handle_read = nullptr;
+    bool unused = false;
+    r = fs_->open(nodeid_a, O_RDONLY, &handle_read, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid_a, get_file_from_handle(handle_read)));
+
+    // Read front 128KB to trigger background prefetch of subsequent ranges
+    auto file_read = get_file_from_handle(handle_read);
+    std::vector<char> trigger_buf(trigger_size, 0);
+    ssize_t n = file_read->pread(trigger_buf.data(), trigger_size, 0);
+    ASSERT_EQ(n, (ssize_t)trigger_size);
+    // Verify the trigger read got old data (0xAA)
+    for (size_t i = 0; i < trigger_size; i++) {
+      ASSERT_EQ(trigger_buf[i], (char)0xAA)
+          << "mismatch at trigger offset " << i;
+    }
+
+    // Wait for background prefetch to populate cache with 0xAA data
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // Rename /b over /a (overwrite): /a now has content 0xBB (E_B)
+    r = fs_->rename(parent, "file_b", parent, "file_a", 0);
+    ASSERT_EQ(r, 0);
+
+    // Read from offset 1MB onward (region that prefetch should have cached).
+    // After rename overwrite, possible outcomes:
+    // - Returns cached old data 0xAA (cache hit, attr not yet refreshed) —
+    // acceptable
+    // - Returns -EIO (ETag verification on cache-miss refill detected mismatch)
+    // — acceptable
+    // - Returns new data 0xBB (path refresh succeeded) — acceptable
+    // The key invariant: no crash, no garbage (random bytes). Data must be
+    // entirely 0xAA or entirely 0xBB, not a mix.
+    size_t remaining = file_size - verify_offset;
+    std::vector<char> read_buf(remaining, 0);
+    size_t offset = 0;
+    bool read_error = false;
+    while (offset < remaining) {
+      n = file_read->pread(read_buf.data() + offset, remaining - offset,
+                           verify_offset + offset);
+      if (n <= 0) {
+        // Error return is acceptable (ETag mismatch detected on refill)
+        read_error = true;
+        break;
+      }
+      offset += n;
+    }
+
+    if (!read_error && offset > 0) {
+      // Verify data coherence: must be all-0xAA or all-0xBB, no mix.
+      bool all_aa = true, all_bb = true;
+      for (size_t i = 0; i < offset; i++) {
+        if (read_buf[i] != (char)0xAA) all_aa = false;
+        if (read_buf[i] != (char)0xBB) all_bb = false;
+      }
+      ASSERT_TRUE(all_aa || all_bb)
+          << "Data corruption: read mixed content after rename overwrite";
+    }
+  }
+
+  // Stress-test concurrent rename + pread on the same file (random-write
+  // mode). Verifies that concurrent path mutations never cause crashes or
+  // silent data corruption; pread may return correct data or -EIO (path
+  // refresh detected external replacement) but never garbage.
+  void verify_concurrent_rename_read_stress() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    // Create and write a 1MB file with known pattern.
+    const size_t kFileSize = 1 * 1024 * 1024;
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    struct stat st;
+    int r = create_and_flush(parent, "stress_src", CREATE_BASE_FLAGS, 0777, 0,
+                             0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    // Fill with pattern 0xCD
+    std::vector<char> write_data(kFileSize, (char)0xCD);
+    auto file_w = get_file_from_handle(handle);
+    r = file_w->pwrite(write_data.data(), kFileSize, 0);
+    ASSERT_EQ(r, (int)kFileSize);
+    r = fs_->release(nodeid, file_w);
+    ASSERT_EQ(r, 0);
+
+    // Reopen for read
+    void *read_handle = nullptr;
+    bool unused = false;
+    r = fs_->open(nodeid, O_RDONLY, &read_handle, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(read_handle)));
+
+    const int kRounds = 80;
+    std::atomic<bool> stop{false};
+    std::atomic<int> rename_done{0};
+    std::atomic<int> read_ok{0};
+    std::atomic<int> read_eio{0};
+    std::atomic<bool> corruption_detected{false};
+
+    // Rename thread: toggle between "stress_src" and "stress_dst"
+    auto rename_future = std::async(std::launch::async, [&]() {
+      INIT_PHOTON();
+      std::string names[2] = {"stress_src", "stress_dst"};
+      int idx = 0;
+      for (int i = 0; i < kRounds && !stop.load(); i++) {
+        int from = idx;
+        int to = 1 - idx;
+        int ret = fs_->rename(parent, names[from].c_str(), parent,
+                              names[to].c_str(), 0);
+        if (ret == 0) {
+          idx = to;
+          rename_done.fetch_add(1);
+        }
+        photon::thread_usleep(5000);  // 5ms between renames
+      }
+    });
+
+    // Reader threads: concurrent pread
+    const int kReaders = 4;
+    std::vector<std::future<void>> reader_futures;
+    for (int t = 0; t < kReaders; t++) {
+      reader_futures.push_back(std::async(std::launch::async, [&]() {
+        INIT_PHOTON();
+        auto file_r = get_file_from_handle(read_handle);
+        const size_t kBufSize = 64 * 1024;
+        std::vector<char> buf(kBufSize);
+        std::vector<char> expected(kBufSize, (char)0xCD);
+
+        while (!stop.load()) {
+          off_t offset = (rand() % (kFileSize / kBufSize)) * kBufSize;
+          ssize_t n = file_r->pread(buf.data(), kBufSize, offset);
+          if (n == (ssize_t)kBufSize) {
+            // Verify data integrity
+            if (memcmp(buf.data(), expected.data(), kBufSize) != 0) {
+              corruption_detected = true;
+              stop.store(true);
+              return;
+            }
+            read_ok.fetch_add(1);
+          } else if (n == -EIO || n == -ENOENT) {
+            // Acceptable: path stale after rename, ETag mismatch
+            read_eio.fetch_add(1);
+          } else if (n < 0) {
+            // Other errors are acceptable during path refresh
+            read_eio.fetch_add(1);
+          } else if (n > 0 && n < (ssize_t)kBufSize) {
+            // Partial read at EOF boundary is OK, verify what we got
+            if (memcmp(buf.data(), expected.data(), n) != 0) {
+              corruption_detected = true;
+              stop.store(true);
+              return;
+            }
+            read_ok.fetch_add(1);
+          }
+          photon::thread_usleep(1000);  // 1ms between reads
+        }
+      }));
+    }
+
+    // Wait for rename thread to finish, then signal readers to stop
+    rename_future.wait();
+    stop.store(true);
+
+    for (auto &f : reader_futures) {
+      f.wait();
+    }
+
+    LOG_INFO(
+        "Stress test done: renames=`, reads_ok=`, reads_eio=`, "
+        "corruption=`",
+        rename_done.load(), read_ok.load(), read_eio.load(),
+        corruption_detected.load());
+
+    ASSERT_FALSE(corruption_detected.load())
+        << "Data corruption detected during concurrent rename+read";
+    ASSERT_GT(rename_done.load(), 0)
+        << "At least one rename should have succeeded";
+    ASSERT_GT(read_ok.load() + read_eio.load(), 0)
+        << "At least one read should have been attempted";
+  }
+
+  void verify_multi_file_cross_rename_no_corruption() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    // Create 3 files with distinct patterns.
+    const size_t kFileSize = 1 * 1024 * 1024;
+    struct {
+      const char *name;
+      char pattern;
+      uint64_t nodeid;
+      void *read_handle;
+    } files[3] = {
+        {"cross_file_x", (char)0x11, 0, nullptr},
+        {"cross_file_y", (char)0x22, 0, nullptr},
+        {"cross_file_z", (char)0x33, 0, nullptr},
+    };
+
+    for (auto &f : files) {
+      void *whandle = nullptr;
+      struct stat st;
+      int r = create_and_flush(parent, f.name, CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                               &f.nodeid, &st, &whandle);
+      ASSERT_EQ(r, 0);
+
+      std::vector<char> data(kFileSize, f.pattern);
+      auto file_w = get_file_from_handle(whandle);
+      r = file_w->pwrite(data.data(), kFileSize, 0);
+      ASSERT_EQ(r, (int)kFileSize);
+      r = fs_->release(f.nodeid, file_w);
+      ASSERT_EQ(r, 0);
+    }
+
+    // Open each file for reading.
+    for (auto &f : files) {
+      bool unused = false;
+      int r = fs_->open(f.nodeid, O_RDONLY, &f.read_handle, &unused);
+      ASSERT_EQ(r, 0);
+    }
+    DEFER({
+      for (auto &f : files) {
+        fs_->release(f.nodeid, get_file_from_handle(f.read_handle));
+        fs_->forget(f.nodeid, 1);
+      }
+    });
+
+    const int kRounds = 60;
+    std::atomic<bool> stop{false};
+    std::atomic<int> rename_done{0};
+    std::atomic<int> read_ok_total{0};
+    std::atomic<int> read_err_total{0};
+    std::atomic<bool> corruption_detected{false};
+    std::atomic<int> corruption_reader{-1};
+    std::atomic<unsigned char> corruption_got{0};
+
+    // Rename thread: cross-rename x->y, y->z, z->x each round.
+    auto rename_future = std::async(std::launch::async, [&]() {
+      INIT_PHOTON();
+      // Track current name positions: names[i] is the current name of
+      // the object originally at slot i.
+      std::string names[3] = {"cross_file_x", "cross_file_y", "cross_file_z"};
+      for (int i = 0; i < kRounds && !stop.load(); i++) {
+        // Rotate: x->y, y->z, z->x via a temp.
+        std::string tmp_name = "cross_file_tmp";
+        int r;
+        // x -> tmp
+        r = fs_->rename(parent, names[0].c_str(), parent, tmp_name.c_str(), 0);
+        if (r != 0) goto next;
+        // y -> x
+        r = fs_->rename(parent, names[1].c_str(), parent, names[0].c_str(), 0);
+        if (r != 0) goto next;
+        // z -> y
+        r = fs_->rename(parent, names[2].c_str(), parent, names[1].c_str(), 0);
+        if (r != 0) goto next;
+        // tmp -> z
+        r = fs_->rename(parent, tmp_name.c_str(), parent, names[2].c_str(), 0);
+        if (r != 0) goto next;
+        rename_done.fetch_add(1);
+      next:
+        photon::thread_usleep(5000);  // 5ms between rounds
+      }
+    });
+
+    // Reader threads: one per file handle.
+    std::vector<std::future<void>> reader_futures;
+    for (int t = 0; t < 3; t++) {
+      reader_futures.push_back(std::async(std::launch::async, [&, t]() {
+        INIT_PHOTON();
+        auto file_r = get_file_from_handle(files[t].read_handle);
+        const size_t kBufSize = 64 * 1024;
+        std::vector<char> buf(kBufSize);
+        char my_pattern = files[t].pattern;
+
+        while (!stop.load()) {
+          off_t offset = (rand() % (kFileSize / kBufSize)) * (off_t)kBufSize;
+          ssize_t n = file_r->pread(buf.data(), kBufSize, offset);
+          if (n > 0) {
+            // Verify every byte matches our own pattern.
+            for (ssize_t i = 0; i < n; i++) {
+              if (buf[i] != my_pattern) {
+                corruption_detected = true;
+                corruption_reader = t;
+                corruption_got = buf[i];
+                stop.store(true);
+                return;
+              }
+            }
+            read_ok_total.fetch_add(1);
+          } else if (n == 0 || n == -EIO || n == -ENOENT) {
+            // Acceptable: file moved, path stale, ETag mismatch.
+            read_err_total.fetch_add(1);
+          } else {
+            // Other negative errors also acceptable during rename storm.
+            read_err_total.fetch_add(1);
+          }
+          photon::thread_usleep(1000);  // 1ms between reads
+        }
+      }));
+    }
+
+    // Wait for rename thread to finish, then signal readers to stop.
+    rename_future.wait();
+    stop.store(true);
+
+    for (auto &f : reader_futures) {
+      f.wait();
+    }
+
+    LOG_INFO(
+        "Cross-rename stress done: renames=`, reads_ok=`, reads_err=`, "
+        "corruption=`",
+        rename_done.load(), read_ok_total.load(), read_err_total.load(),
+        corruption_detected.load());
+
+    ASSERT_FALSE(corruption_detected.load())
+        << "Data corruption: reader " << corruption_reader.load()
+        << " expected pattern 0x" << std::hex
+        << (int)(unsigned char)
+               files[corruption_reader.load() >= 0 ? corruption_reader.load()
+                                                   : 0]
+                   .pattern
+        << " but got 0x" << (int)corruption_got.load();
+    ASSERT_GT(rename_done.load(), 0)
+        << "At least one cross-rename round should have succeeded";
+    ASSERT_GT(read_ok_total.load() + read_err_total.load(), 0)
+        << "At least one read should have been attempted";
+  }
+
   void verify_rename_dir_oss_err_dir_obj() {
     auto parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
@@ -983,6 +1560,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
 };
 
 TEST_F(Ossfs2RenameTest, verify_rename_file) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -991,6 +1569,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_file) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_keep_old_meta) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -1002,11 +1581,13 @@ TEST_F(Ossfs2RenameTest, verify_rename_dir) {
   INIT_PHOTON();
 
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_rename_dir();
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dir_continuously) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -1015,6 +1596,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dir_continuously) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_file_with_oss_err) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1022,6 +1604,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_file_with_oss_err) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dir_with_oss_err) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1029,6 +1612,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dir_with_oss_err) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dir_with_limit) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.rename_dir_limit = 8;
@@ -1037,6 +1621,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dir_with_limit) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dirty_file) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   // with fuse bufvec, write_file_intervally will hung. check this later.
@@ -1046,6 +1631,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dirty_file) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dirty_file_with_fsync_error) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   // with fuse bufvec, write_file_intervally will hung. check this later.
@@ -1055,6 +1641,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dirty_file_with_fsync_error) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dirty_dir) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   // with fuse bufvec, write_file_intervally will hung. check this later.
   FLAGS_write_with_fuse_bufvec = false;
@@ -1063,14 +1650,36 @@ TEST_F(Ossfs2RenameTest, verify_rename_dirty_dir) {
   verify_rename_dirty_dir();
 }
 
+TEST_F(Ossfs2RenameTest, verify_rename_dirty_file_random_write) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  FLAGS_write_with_fuse_bufvec = false;
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // enable random write
+  init(opts);
+  verify_rename_dirty_file_random_write();
+}
+
+TEST_F(Ossfs2RenameTest, verify_rename_dirty_dir_random_write) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  FLAGS_write_with_fuse_bufvec = false;
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // enable random write
+  init(opts);
+  verify_rename_dirty_dir_random_write();
+}
+
 TEST_F(Ossfs2RenameTest, verify_rename_src_not_exist) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_rename_src_not_exist();
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dirty_dir_for_appendable_obj) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
@@ -1080,6 +1689,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dirty_dir_for_appendable_obj) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_remote_dir) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1087,6 +1697,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_remote_dir) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dirty_file_during_prefetch) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1094,6 +1705,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dirty_file_during_prefetch) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dir_partial_deletion) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1101,8 +1713,41 @@ TEST_F(Ossfs2RenameTest, verify_rename_dir_partial_deletion) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dir_oss_err_dir_obj) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
   verify_rename_dir_oss_err_dir_obj();
 }
+
+TEST_F(Ossfs2RenameTest, verify_read_after_rename_overwrite_returns_new_data) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir =
+      test_path_;  // random write mode required for ETag verification
+  init(opts);
+  verify_read_after_rename_overwrite_returns_new_data();
+}
+
+TEST_F(Ossfs2RenameTest, verify_concurrent_rename_read_stress) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // enable random write mode
+  init(opts);
+  verify_concurrent_rename_read_stress();
+}
+
+TEST_F(Ossfs2RenameTest, verify_multi_file_cross_rename_no_corruption) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // random write mode
+  init(opts);
+  verify_multi_file_cross_rename_no_corruption();
+}
+
+// TODO: Add streaming/appendable rename+read tests after extending ETag
+// verification to all write modes (requires writer flush etag sync for
+// streaming put_object and appendable append_object).

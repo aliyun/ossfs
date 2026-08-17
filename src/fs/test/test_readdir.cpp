@@ -39,9 +39,11 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
         std::string name = "file_internal_" + std::to_string(i);
         r = create_and_flush(parent, name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
                              0, 0, &nodeid, &st, &handle);
-        ASSERT_EQ(r, 0);
+        EXPECT_EQ(r, 0);
+        if (r != 0) break;
         r = fs_->release(nodeid, get_file_from_handle(handle));
-        ASSERT_EQ(r, 0);
+        EXPECT_EQ(r, 0);
+        if (r != 0) break;
         created_files.insert(std::make_pair(name, nodeid));
       }
     });
@@ -69,7 +71,8 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
       for (int i = 0; i < 10; ++i) {
         std::string name = "file_internal_" + std::to_string(i);
         int r2 = fs_->unlink(parent, name.c_str());
-        ASSERT_EQ(r2, 0);
+        EXPECT_EQ(r2, 0);
+        if (r2 != 0) break;
       }
     });
     DEFER(if (th.joinable()) th.join(););
@@ -542,6 +545,13 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     int r = 0;
     std::vector<void *> handles;
     std::vector<uint64_t> dirty_nodeids;
+    // Ensure all opened handles are released even if ASSERT fails early.
+    DEFER({
+      for (size_t i = 0; i < handles.size(); ++i) {
+        fs_->release(dirty_nodeids[i], get_file_from_handle(handles[i]));
+        fs_->forget(dirty_nodeids[i], 1);
+      }
+    });
     for (int i = 1; i < 10; i += 2) {
       std::string filename = "testfile_" + std::to_string(i);
       uint64_t nodeid;
@@ -569,6 +579,10 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
     void *dirp = reinterpret_cast<void *>(fi.fh);
+    DEFER(if (dirp) fs_->releasedir(parent, dirp));
+    // Ensure fault injection is cleared on any exit path.
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Failed));
 
     std::unordered_map<std::string, uint64_t> childs;
     // 1. readdir from offset 0. cur_list_res: empty
@@ -639,12 +653,9 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
         FaultInjectionId::FI_OssError_Call_Failed);
     r = fs_->releasedir(parent, dirp);
     ASSERT_EQ(r, 0);
+    dirp = nullptr;  // DEFER no longer needs to release
 
-    for (int i = 0; i < int(dirty_nodeids.size()); ++i) {
-      r = fs_->release(dirty_nodeids[i], get_file_from_handle(handles[i]));
-      ASSERT_EQ(r, 0);
-      fs_->forget(dirty_nodeids[i], 1);
-    }
+    // DEFER handles cleanup of handles/dirty_nodeids.
   }
 
   void verify_readdir_no_plus() {
@@ -791,14 +802,27 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     r = fs_->creat(parent, filename.c_str(), CREATE_BASE_FLAGS, 0777, 0, 0, 0,
                    &file_nodeid, &st, &file_handle);
     ASSERT_EQ(r, 0);
+    // Ensure handle cleanup on any exit path.
+    DEFER({
+      if (file_handle) {
+        fs_->release(file_nodeid,
+                     reinterpret_cast<IFileHandleFuseLL *>(file_handle));
+      }
+      if (file_nodeid) fs_->forget(file_nodeid, 1);
+    });
 
-    auto file = (OssFileHandle *)(file_handle);
-    ASSERT_TRUE(file->get_is_dirty());
+    // In HDFS mode, file_handle is HdfsFileHandle*, not OssFileHandle*.
+    // "dirty" concept only applies to OSS mode (local staging).
+    if (!is_hdfs_test_mode()) {
+      auto file = (OssFileHandle *)(file_handle);
+      ASSERT_TRUE(file->get_is_dirty());
+    }
 
     struct fuse_file_info fi;
     r = fs_->opendir(parent, &fi);
     ASSERT_EQ(r, 0);
     void *dirp = reinterpret_cast<void *>(fi.fh);
+    DEFER(if (dirp) fs_->releasedir(parent, dirp));
 
     std::vector<TestInode> childs;
     r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true, nullptr);
@@ -818,11 +842,13 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
 
     r = fs_->releasedir(parent, dirp);
     ASSERT_EQ(r, 0);
+    dirp = nullptr;  // DEFER no longer needs to release
 
     r = fs_->release(file_nodeid,
                      reinterpret_cast<IFileHandleFuseLL *>(file_handle));
     ASSERT_EQ(r, 0);
-    DEFER(fs_->forget(file_nodeid, 1));
+    file_handle = nullptr;  // DEFER no longer needs to release
+    // forget is handled by DEFER
 
     // 2. dir contains dirty files that exist on the cloud
     bool unused = 0;
@@ -878,10 +904,12 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     ASSERT_TRUE(found_1);
     r = fs_->releasedir(parent, dirp);
     ASSERT_EQ(r, 0);
+    dirp = nullptr;
 
     r = fs_->release(file_nodeid,
                      reinterpret_cast<IFileHandleFuseLL *>(file_handle));
     ASSERT_EQ(r, 0);
+    file_handle = nullptr;
   }
 
   void verify_readdir_type_change() {
@@ -1076,13 +1104,14 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     auto readdircb2 = [&](std::vector<TestInode> &childs) {
       int rr = fs_->readdir(parent, 0, dirp2, filler, &childs, nullptr, false,
                             nullptr);
-      ASSERT_EQ(rr, 0);
+      EXPECT_EQ(rr, 0);
     };
 
     auto thread2 = std::thread([&]() {
       INIT_PHOTON();
       readdircb2(childs1);
     });
+    DEFER(if (thread2.joinable()) thread2.join());
 
     readdircb2(childs2);
     thread2.join();
@@ -1287,11 +1316,505 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     g_fault_injector->clear_injection(
         FaultInjectionId::FI_Oss_Missing_Object_Type);
   }
+
+  // Drop the whole lookup_cnt of every remaining child of dir_nodeid so
+  // their inodes are destroyed.
+  void forget_all_children(uint64_t dir_nodeid) {
+    auto iter = fs_->global_inodes_map_.find(dir_nodeid);
+    if (iter == fs_->global_inodes_map_.end()) return;
+    auto *dir = static_cast<DirInode *>(iter->second);
+    std::vector<std::pair<uint64_t, uint64_t>> child_ids;
+    for (auto &kv : dir->children) {
+      child_ids.emplace_back(kv.second->nodeid, kv.second->lookup_cnt);
+    }
+    for (auto &p : child_ids) {
+      if (p.second > 0) fs_->forget(p.first, p.second);
+    }
+  }
+
+  // Drop the whole lookup_cnt of a known nodeid. Deleted children keep
+  // their create/fill references but may be unreachable via the parent's
+  // children map after unlink/rmdir/release, so clean them up explicitly.
+  void forget_inode_full(uint64_t nodeid) {
+    auto iter = fs_->global_inodes_map_.find(nodeid);
+    if (iter == fs_->global_inodes_map_.end()) return;
+    uint64_t cnt = iter->second->lookup_cnt;
+    if (cnt > 0) fs_->forget(nodeid, cnt);
+  }
+
+  int create_file_and_release(uint64_t parent, const std::string &name,
+                              uint64_t *nodeid) {
+    void *handle = nullptr;
+    struct stat st;
+    int r = create_and_flush(parent, name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
+                             0, 0, nodeid, &st, &handle);
+    if (r != 0) return r;
+    return fs_->release(*nodeid, get_file_from_handle(handle));
+  }
+
+  static int filler_all(void *ctx, const uint64_t nodeid, const char *name,
+                        const struct stat *stbuf, off_t off) {
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
+    auto *nodes = reinterpret_cast<std::vector<TestInode> *>(ctx);
+    nodes->emplace_back(nodeid, name);
+    return 0;
+  }
+
+  // Release-hidden is serialized with readdirplus by the parent lock: even
+  // when release is racing to land inside the readdirplus call (the window is
+  // opened by fault injection), it must wait until the call finishes. The
+  // listing therefore sees the hidden object still present and fills it with
+  // the original live inode; no ghost is left behind.
+  void verify_readdirplus_release_hidden_serialized() {
+    auto test_dir_nodeid = get_test_dir_parent();
+    DEFER(fs_->forget(test_dir_nodeid, 1));
+
+    uint64_t parent;
+    struct stat st;
+    ASSERT_EQ(
+        fs_->mkdir(test_dir_nodeid, "workdir", 0777, 0, 0, 0, &parent, &st), 0);
+    DEFER(fs_->forget(parent, 1));
+    DEFER(forget_all_children(parent));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    ASSERT_EQ(create_and_flush(parent, "victim", CREATE_BASE_FLAGS, 0777, 0, 0,
+                               0, &nodeid, &st, &handle),
+              0);
+    auto *inode =
+        static_cast<FileInode *>(get_file_from_handle(handle)->get_inode());
+
+    // Unlink while open: the file is hidden instead of deleted.
+    ASSERT_EQ(fs_->unlink(parent, "victim"), 0);
+    ASSERT_TRUE(inode->is_hidden);
+    ASSERT_FALSE(inode->is_stale);
+
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_Readdir_Delay_Before_Construct, FaultInjection{1});
+
+    std::vector<TestInode> childs;
+    std::thread th([&]() {
+      struct fuse_file_info fi;
+      ASSERT_EQ(fs_->opendir(parent, &fi), 0);
+      void *dirp = reinterpret_cast<void *>(fi.fh);
+      ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_all, &childs, nullptr,
+                             true, nullptr),
+                0);
+      ASSERT_EQ(fs_->releasedir(parent, dirp), 0);
+    });
+
+    // Release tries to land inside the readdirplus call; the parent lock must
+    // make it wait until the call finishes.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    ASSERT_EQ(fs_->release(nodeid, get_file_from_handle(handle)), 0);
+    ASSERT_TRUE(inode->is_stale);
+
+    th.join();
+    g_fault_injector->clear_injection(
+        FaultInjectionId::FI_Readdir_Delay_Before_Construct);
+
+    // The hidden entry was listed before the delete and filled with the
+    // original inode.
+    ASSERT_SIZE_EQ(childs.size(), 1);
+    ASSERT_TRUE(childs[0].name.rfind(".fuse_hidden", 0) == 0);
+    ASSERT_EQ(childs[0].nodeid, nodeid);
+
+    forget_inode_full(nodeid);
+
+    // No ghost may survive: the directory must be removable.
+    ASSERT_EQ(fs_->rmdir(test_dir_nodeid, "workdir"), 0);
+  }
+
+  // The objects of local children are deleted remotely; a from-start readdir
+  // gets an empty listing and must mark those ghost children stale so they
+  // are no longer served from the local attr cache.
+  void verify_readdirplus_empty_listing_reaps_ghost_files() {
+    auto test_dir_nodeid = get_test_dir_parent();
+    DEFER(fs_->forget(test_dir_nodeid, 1));
+
+    uint64_t parent;
+    struct stat st;
+    ASSERT_EQ(
+        fs_->mkdir(test_dir_nodeid, "workdir", 0777, 0, 0, 0, &parent, &st), 0);
+    DEFER(fs_->forget(parent, 1));
+    DEFER(forget_all_children(parent));
+
+    constexpr int kFileCnt = 3;
+    for (int i = 0; i < kFileCnt; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      uint64_t nodeid = 0;
+      ASSERT_EQ(create_file_and_release(parent, name, &nodeid), 0);
+    }
+
+    // Materialize each child with a lookup so a live local inode with a
+    // valid attr cache exists: this is the ghost the sweep must reap.
+    for (int i = 0; i < kFileCnt; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      uint64_t nid = 0;
+      ASSERT_EQ(fs_->lookup(parent, name, &nid, &st), 0);
+    }
+
+    // Delete the objects remotely; the local children know nothing about it.
+    auto parent_path = nodeid_to_path(parent);
+    auto background_env =
+        bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next();
+    background_env.executor->perform([&]() {
+      auto obj_store = background_env.obj_store;
+      for (int i = 0; i < kFileCnt; ++i) {
+        std::string name = "file_";
+        name.push_back(char('a' + i));
+        ASSERT_EQ(obj_store->delete_object(join_paths(parent_path, name)), 0);
+      }
+    });
+
+    struct fuse_file_info fi;
+    ASSERT_EQ(fs_->opendir(parent, &fi), 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
+
+    std::vector<TestInode> childs;
+    ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_all, &childs, nullptr, true,
+                           nullptr),
+              0);
+    ASSERT_EQ(fs_->releasedir(parent, dirp), 0);
+    ASSERT_SIZE_EQ(childs.size(), 0);
+
+    // The ghost children must have been marked stale by the sweep.
+    auto piter = fs_->global_inodes_map_.find(parent);
+    ASSERT_TRUE(piter != fs_->global_inodes_map_.end());
+    for (int i = 0; i < kFileCnt; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      Inode *cinode =
+          static_cast<DirInode *>(piter->second)->find_child_node(name);
+      ASSERT_NE(cinode, nullptr);
+      ASSERT_TRUE(cinode->is_stale);
+    }
+
+    // The ghosts must no longer be served from the local attr cache.
+    for (int i = 0; i < kFileCnt; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      uint64_t nid = 0;
+      ASSERT_EQ(fs_->lookup(parent, name, &nid, &st), -ENOENT);
+    }
+
+    ASSERT_EQ(fs_->rmdir(test_dir_nodeid, "workdir"), 0);
+  }
+
+  struct CappedCtx {
+    std::vector<TestInode> *nodes;
+    size_t cap;
+  };
+
+  // A filler accepting at most `cap` entries; returns -1 when full, so
+  // readdir stops with the rest of the listing page left unfilled.
+  static int filler_capped(void *ctx, const uint64_t nodeid, const char *name,
+                           const struct stat *stbuf, off_t off) {
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
+    auto *c = reinterpret_cast<CappedCtx *>(ctx);
+    if (c->nodes->size() >= c->cap) return -1;
+    c->nodes->emplace_back(nodeid, name);
+    return 0;
+  }
+
+  // Sequential continuation over a cached page after deleting an entry that
+  // was listed but not yet filled: the stale child is skipped, never
+  // resurrected as a new inode, and the rest of the page is filled normally.
+  void verify_readdirplus_seq_delete_rest_of_page() {
+    auto test_dir_nodeid = get_test_dir_parent();
+    DEFER(fs_->forget(test_dir_nodeid, 1));
+
+    uint64_t parent;
+    struct stat st;
+    ASSERT_EQ(
+        fs_->mkdir(test_dir_nodeid, "workdir", 0777, 0, 0, 0, &parent, &st), 0);
+    DEFER(fs_->forget(parent, 1));
+    DEFER(forget_all_children(parent));
+
+    uint64_t na = 0, nb = 0, nc = 0;
+    ASSERT_EQ(create_file_and_release(parent, "file_a", &na), 0);
+    ASSERT_EQ(create_file_and_release(parent, "file_b", &nb), 0);
+    ASSERT_EQ(create_file_and_release(parent, "file_c", &nc), 0);
+
+    struct fuse_file_info fi;
+    ASSERT_EQ(fs_->opendir(parent, &fi), 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
+
+    // Fill only file_a; file_b/file_c stay constructed but unfilled.
+    std::vector<TestInode> childs1;
+    CappedCtx ctx1{&childs1, 1};
+    ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_capped, &ctx1, nullptr, true,
+                           nullptr),
+              -1);
+    ASSERT_SIZE_EQ(childs1.size(), 1);
+
+    ASSERT_EQ(fs_->unlink(parent, "file_b"), 0);
+
+    // Sequential continuation: file_b is stale and skipped, no new inode.
+    std::vector<TestInode> childs2;
+    ASSERT_EQ(fs_->readdir(parent, 3, dirp, filler_all, &childs2, nullptr, true,
+                           nullptr),
+              0);
+    ASSERT_SIZE_EQ(childs2.size(), 1);
+    ASSERT_EQ(childs2[0].name, "file_c");
+    ASSERT_EQ(childs2[0].nodeid, nc);
+
+    Inode *b = static_cast<DirInode *>(fs_->global_inodes_map_[parent])
+                   ->find_child_node("file_b");
+    ASSERT_NE(b, nullptr);
+    ASSERT_EQ(b->nodeid, nb);
+    ASSERT_TRUE(b->is_stale);
+
+    ASSERT_EQ(fs_->releasedir(parent, dirp), 0);
+
+    ASSERT_EQ(fs_->unlink(parent, "file_a"), 0);
+    ASSERT_EQ(fs_->unlink(parent, "file_c"), 0);
+    forget_all_children(parent);
+    ASSERT_EQ(fs_->rmdir(test_dir_nodeid, "workdir"), 0);
+  }
+
+  // A deletion of an entry in a not-yet-fetched page lands before that page
+  // is LISTed: the fresh listing under the parent lock never contains it and
+  // no inode is constructed for it.
+  void verify_readdirplus_seq_delete_next_page() {
+    auto test_dir_nodeid = get_test_dir_parent();
+    DEFER(fs_->forget(test_dir_nodeid, 1));
+
+    uint64_t parent;
+    struct stat st;
+    ASSERT_EQ(
+        fs_->mkdir(test_dir_nodeid, "workdir", 0777, 0, 0, 0, &parent, &st), 0);
+    DEFER(fs_->forget(parent, 1));
+    DEFER(forget_all_children(parent));
+
+    uint64_t nids[5];
+    for (int i = 0; i < 5; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      ASSERT_EQ(create_file_and_release(parent, name, &nids[i]), 0);
+    }
+
+    struct fuse_file_info fi;
+    ASSERT_EQ(fs_->opendir(parent, &fi), 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
+
+    // max_keys is 2: fill only file_a of the first page.
+    std::vector<TestInode> childs1;
+    CappedCtx ctx1{&childs1, 1};
+    ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_capped, &ctx1, nullptr, true,
+                           nullptr),
+              -1);
+    ASSERT_SIZE_EQ(childs1.size(), 1);
+
+    ASSERT_EQ(fs_->unlink(parent, "file_c"), 0);
+
+    // Continuation pages through the rest: file_c is absent from the fresh
+    // listings and never constructed.
+    std::vector<TestInode> childs2;
+    ASSERT_EQ(fs_->readdir(parent, 3, dirp, filler_all, &childs2, nullptr, true,
+                           nullptr),
+              0);
+    ASSERT_SIZE_EQ(childs2.size(), 3);
+    ASSERT_EQ(childs2[0].name, "file_b");
+    ASSERT_EQ(childs2[0].nodeid, nids[1]);
+    ASSERT_EQ(childs2[1].name, "file_d");
+    ASSERT_EQ(childs2[1].nodeid, nids[3]);
+    ASSERT_EQ(childs2[2].name, "file_e");
+    ASSERT_EQ(childs2[2].nodeid, nids[4]);
+
+    Inode *c = static_cast<DirInode *>(fs_->global_inodes_map_[parent])
+                   ->find_child_node("file_c");
+    ASSERT_NE(c, nullptr);
+    ASSERT_EQ(c->nodeid, nids[2]);
+    ASSERT_TRUE(c->is_stale);
+
+    ASSERT_EQ(fs_->releasedir(parent, dirp), 0);
+
+    for (auto name : {"file_a", "file_b", "file_d", "file_e"}) {
+      ASSERT_EQ(fs_->unlink(parent, name), 0);
+    }
+    forget_all_children(parent);
+    ASSERT_EQ(fs_->rmdir(test_dir_nodeid, "workdir"), 0);
+  }
+
+  // An entry is deleted and recreated before the sequential continuation
+  // fills it: the fill must return the brand-new inode, not the stale one.
+  void verify_readdirplus_seq_recreate_after_delete() {
+    auto test_dir_nodeid = get_test_dir_parent();
+    DEFER(fs_->forget(test_dir_nodeid, 1));
+
+    uint64_t parent;
+    struct stat st;
+    ASSERT_EQ(
+        fs_->mkdir(test_dir_nodeid, "workdir", 0777, 0, 0, 0, &parent, &st), 0);
+    DEFER(fs_->forget(parent, 1));
+    DEFER(forget_all_children(parent));
+
+    uint64_t na = 0, nb = 0, nc = 0;
+    ASSERT_EQ(create_file_and_release(parent, "file_a", &na), 0);
+    ASSERT_EQ(create_file_and_release(parent, "file_b", &nb), 0);
+    ASSERT_EQ(create_file_and_release(parent, "file_c", &nc), 0);
+    DEFER(forget_inode_full(nb));
+
+    struct fuse_file_info fi;
+    ASSERT_EQ(fs_->opendir(parent, &fi), 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
+
+    std::vector<TestInode> childs1;
+    CappedCtx ctx1{&childs1, 1};
+    ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_capped, &ctx1, nullptr, true,
+                           nullptr),
+              -1);
+    ASSERT_SIZE_EQ(childs1.size(), 1);
+
+    ASSERT_EQ(fs_->unlink(parent, "file_b"), 0);
+    uint64_t nb2 = 0;
+    ASSERT_EQ(create_file_and_release(parent, "file_b", &nb2), 0);
+    ASSERT_NE(nb2, nb);
+
+    std::vector<TestInode> childs2;
+    ASSERT_EQ(fs_->readdir(parent, 3, dirp, filler_all, &childs2, nullptr, true,
+                           nullptr),
+              0);
+    ASSERT_SIZE_EQ(childs2.size(), 2);
+    ASSERT_EQ(childs2[0].name, "file_b");
+    ASSERT_EQ(childs2[0].nodeid, nb2);
+    ASSERT_EQ(childs2[1].name, "file_c");
+    ASSERT_EQ(childs2[1].nodeid, nc);
+
+    ASSERT_EQ(fs_->releasedir(parent, dirp), 0);
+
+    for (auto name : {"file_a", "file_b", "file_c"}) {
+      ASSERT_EQ(fs_->unlink(parent, name), 0);
+    }
+    forget_all_children(parent);
+    ASSERT_EQ(fs_->rmdir(test_dir_nodeid, "workdir"), 0);
+  }
+
+  // Rename over an existing target while a cached page is being consumed:
+  // the overwritten name fills with the renamed (source) inode and the old
+  // source name is gone; no inode is constructed for the vanished name.
+  void verify_readdirplus_seq_rename_overwrite_while_filling() {
+    auto test_dir_nodeid = get_test_dir_parent();
+    DEFER(fs_->forget(test_dir_nodeid, 1));
+
+    uint64_t parent;
+    struct stat st;
+    ASSERT_EQ(
+        fs_->mkdir(test_dir_nodeid, "workdir", 0777, 0, 0, 0, &parent, &st), 0);
+    DEFER(fs_->forget(parent, 1));
+    DEFER(forget_all_children(parent));
+
+    uint64_t na = 0, nb = 0, nc = 0;
+    ASSERT_EQ(create_file_and_release(parent, "file_a", &na), 0);
+    ASSERT_EQ(create_file_and_release(parent, "file_b", &nb), 0);
+    ASSERT_EQ(create_file_and_release(parent, "file_c", &nc), 0);
+    DEFER(forget_inode_full(nb));
+
+    struct fuse_file_info fi;
+    ASSERT_EQ(fs_->opendir(parent, &fi), 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
+
+    std::vector<TestInode> childs1;
+    CappedCtx ctx1{&childs1, 1};
+    ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_capped, &ctx1, nullptr, true,
+                           nullptr),
+              -1);
+    ASSERT_SIZE_EQ(childs1.size(), 1);
+
+    // file_c overwrites file_b.
+    ASSERT_EQ(fs_->rename(parent, "file_c", parent, "file_b", 0), 0);
+
+    std::vector<TestInode> childs2;
+    ASSERT_EQ(fs_->readdir(parent, 3, dirp, filler_all, &childs2, nullptr, true,
+                           nullptr),
+              0);
+    ASSERT_SIZE_EQ(childs2.size(), 1);
+    ASSERT_EQ(childs2[0].name, "file_b");
+    ASSERT_EQ(childs2[0].nodeid, nc);
+
+    Inode *c = static_cast<DirInode *>(fs_->global_inodes_map_[parent])
+                   ->find_child_node("file_c");
+    ASSERT_EQ(c, nullptr);
+
+    ASSERT_EQ(fs_->releasedir(parent, dirp), 0);
+
+    ASSERT_EQ(fs_->unlink(parent, "file_a"), 0);
+    ASSERT_EQ(fs_->unlink(parent, "file_b"), 0);
+    forget_all_children(parent);
+    ASSERT_EQ(fs_->rmdir(test_dir_nodeid, "workdir"), 0);
+  }
+
+  // All children are forgotten after a full listing; a rewind from the start
+  // must construct them again from the fresh listing without dropping any.
+  void verify_readdirplus_seq_forget_then_refresh() {
+    auto test_dir_nodeid = get_test_dir_parent();
+    DEFER(fs_->forget(test_dir_nodeid, 1));
+
+    uint64_t parent;
+    struct stat st;
+    ASSERT_EQ(
+        fs_->mkdir(test_dir_nodeid, "workdir", 0777, 0, 0, 0, &parent, &st), 0);
+    DEFER(fs_->forget(parent, 1));
+    DEFER(forget_all_children(parent));
+
+    uint64_t nids[3];
+    for (int i = 0; i < 3; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      ASSERT_EQ(create_file_and_release(parent, name, &nids[i]), 0);
+    }
+
+    struct fuse_file_info fi;
+    ASSERT_EQ(fs_->opendir(parent, &fi), 0);
+    void *dirp = reinterpret_cast<void *>(fi.fh);
+
+    std::vector<TestInode> childs1;
+    ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_all, &childs1, nullptr, true,
+                           nullptr),
+              0);
+    ASSERT_SIZE_EQ(childs1.size(), 3);
+
+    // The kernel forgets every child; the inodes are reaped.
+    forget_all_children(parent);
+
+    // Rewind: the fresh listing reconstructs all entries; nothing is lost.
+    std::vector<TestInode> childs2;
+    ASSERT_EQ(fs_->readdir(parent, 0, dirp, filler_all, &childs2, nullptr, true,
+                           nullptr),
+              0);
+    ASSERT_SIZE_EQ(childs2.size(), 3);
+    // The staged cache is disabled for this case, so reconstructed inodes
+    // must carry brand-new nodeids.
+    for (int i = 0; i < 3; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      ASSERT_EQ(childs2[i].name, name);
+      ASSERT_NE(childs2[i].nodeid, nids[i]);
+    }
+
+    ASSERT_EQ(fs_->releasedir(parent, dirp), 0);
+
+    for (int i = 0; i < 3; ++i) {
+      std::string name = "file_";
+      name.push_back(char('a' + i));
+      ASSERT_EQ(fs_->unlink(parent, name), 0);
+    }
+    forget_all_children(parent);
+    ASSERT_EQ(fs_->rmdir(test_dir_nodeid, "workdir"), 0);
+  }
+
+  // TODO: cover out-of-order (backward seekdir) readdirplus scenarios: the
+  // cached-snapshot replay path may still resurrect locally deleted children
+  // as ghost inodes; add those cases together with the freshness fix.
 };
 
 TEST_F(Ossfs2ReaddirTest, verify_readdir_while_create_and_unlink) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_while_create_and_unlink();
 }
@@ -1299,6 +1822,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_while_create_and_unlink) {
 TEST_F(Ossfs2ReaddirTest, verify_partial_readdir) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_partial_readdir();
 }
@@ -1307,6 +1831,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_offset) {
   INIT_PHOTON();
   srand(time(nullptr));
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_offset(true);
 }
@@ -1315,6 +1840,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_offset_noplus) {
   INIT_PHOTON();
   srand(time(nullptr));
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_offset(false);
 }
@@ -1324,11 +1850,13 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_out_of_order) {
   srand(time(nullptr));
   OssFsOptions opts;
   opts.readdir_remember_count = 5;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, 6);
   verify_readdir_out_of_order(true);
 }
 
 TEST_F(Ossfs2ReaddirTest, verify_readdir_outoforder_with_dirty_children) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   srand(time(nullptr));
   OssFsOptions opts;
@@ -1342,6 +1870,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_out_of_order_noplus) {
   srand(time(nullptr));
   OssFsOptions opts;
   opts.readdir_remember_count = 5;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, 6);
   verify_readdir_out_of_order(false);
 }
@@ -1349,6 +1878,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_out_of_order_noplus) {
 TEST_F(Ossfs2ReaddirTest, verify_readdir_no_plus) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_no_plus();
 }
@@ -1356,6 +1886,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_no_plus) {
 TEST_F(Ossfs2ReaddirTest, verify_readdir_interruption) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, 2);
   verify_readdir_interruption(true);
 }
@@ -1363,11 +1894,13 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_interruption) {
 TEST_F(Ossfs2ReaddirTest, verify_readdir_interruption_noplus) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, 2);
   verify_readdir_interruption(false);
 }
 
 TEST_F(Ossfs2ReaddirTest, verify_readdir_with_dirty_files) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts, get_random_max_keys() + 1);
@@ -1375,6 +1908,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_with_dirty_files) {
 }
 
 TEST_F(Ossfs2ReaddirTest, verify_readdir_with_dirty_files_maxkeys_1) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts, 1);
@@ -1382,6 +1916,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_with_dirty_files_maxkeys_1) {
 }
 
 TEST_F(Ossfs2ReaddirTest, verify_readdir_type_change) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts, get_random_max_keys());
@@ -1391,6 +1926,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_type_change) {
 TEST_F(Ossfs2ReaddirTest, verify_readdir_while_renamedir) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_while_renamedir();
 }
@@ -1398,6 +1934,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_while_renamedir) {
 TEST_F(Ossfs2ReaddirTest, verify_readdir_concurrently_noplus) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_concurrently_noplus();
 }
@@ -1405,6 +1942,7 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_concurrently_noplus) {
 TEST_F(Ossfs2ReaddirTest, verify_readdir_cover_stale_child) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_cover_stale_child();
 }
@@ -1412,13 +1950,67 @@ TEST_F(Ossfs2ReaddirTest, verify_readdir_cover_stale_child) {
 TEST_F(Ossfs2ReaddirTest, verify_remember_null_stale_child) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_remember_null_stale_child();
 }
 
 TEST_F(Ossfs2ReaddirTest, verify_readdir_missing_object_type) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts, get_random_max_keys());
   verify_readdir_missing_object_type();
+}
+
+TEST_F(Ossfs2ReaddirTest, verify_readdirplus_release_hidden_serialized) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;
+  init(opts);
+  verify_readdirplus_release_hidden_serialized();
+}
+
+TEST_F(Ossfs2ReaddirTest, verify_readdirplus_empty_listing_reaps_ghost_files) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts, 3);
+  verify_readdirplus_empty_listing_reaps_ghost_files();
+}
+
+TEST_F(Ossfs2ReaddirTest, verify_readdirplus_seq_delete_rest_of_page) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_readdirplus_seq_delete_rest_of_page();
+}
+
+TEST_F(Ossfs2ReaddirTest, verify_readdirplus_seq_delete_next_page) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts, 2);
+  verify_readdirplus_seq_delete_next_page();
+}
+
+TEST_F(Ossfs2ReaddirTest, verify_readdirplus_seq_recreate_after_delete) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_readdirplus_seq_recreate_after_delete();
+}
+
+TEST_F(Ossfs2ReaddirTest,
+       verify_readdirplus_seq_rename_overwrite_while_filling) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_readdirplus_seq_rename_overwrite_while_filling();
+}
+
+TEST_F(Ossfs2ReaddirTest, verify_readdirplus_seq_forget_then_refresh) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.max_inode_cache_count = 0;
+  init(opts);
+  verify_readdirplus_seq_forget_then_refresh();
 }

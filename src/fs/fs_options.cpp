@@ -14,10 +14,39 @@
  * limitations under the License.
  */
 
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include <string>
+
 #include "common/logger.h"
 #include "fs.h"
 
 namespace OssFileSystem {
+
+// - temp_dir (WriteMode::Random) is mutually exclusive with
+//   enable_appendable_object (WriteMode::Appendable)
+// - temp_dir is unsupported on the HDFS backend: the FileInode write-state
+//   union slot aliases hdfs_dirty_count and rw_ctx, and random-mode code
+//   would misinterpret the counter as a RandomWriteContext pointer.
+int OssFsOptions::validate_random_write(const OssFsOptions &opts) {
+  if (opts.temp_dir.empty()) return 0;
+
+  // TODO: make sure the dir exist
+
+  if (opts.enable_appendable_object) {
+    LOG_ERROR("temp_dir and enable_appendable_object are exclusive");
+    return -EINVAL;
+  }
+
+  if (opts.storage_backend == IObjStore::StorageBackend::kHDFS) {
+    LOG_ERROR("temp_dir (random write) is not supported on the HDFS backend");
+    return -EINVAL;
+  }
+
+  return 0;
+}
 
 // In memory cache mode, we need to reserve at least
 // std::min(4GiB, memory_data_cache_size * (1 - read_ratio) / read_ratio) memory

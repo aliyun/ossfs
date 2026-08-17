@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 
 #include "common/filesystem.h"
@@ -34,16 +35,25 @@ class IWriter {
   virtual ssize_t pwrite(size_t count, off_t offset, const void *buf,
                          struct fuse_bufvec *bufv, std::string *wpath) = 0;
   virtual int flush() = 0;
+  virtual int truncate(uint64_t new_size) = 0;
+
+  virtual void close() = 0;
 
   // With inode rlock held outside.
-  virtual ssize_t pread_from_upload_buffer(void *buf, size_t count,
-                                           off_t offset) = 0;
+  virtual ssize_t pread_from_local(void *buf, size_t count, off_t offset) = 0;
   virtual size_t calc_remote_size() = 0;
 
   // With either inode rlock or wlock held outside.
   virtual bool get_is_dirty() = 0;
   virtual bool get_is_immutable() = 0;
 };
+
+// Returns base_part_size, or enlarges it to keep part count within the OSS
+// 10000-part limit. base_part_size must already be chunk-aligned. Returns 0
+// if file_size exceeds OSS capacity.
+uint64_t calc_random_write_part_size(uint64_t file_size,
+                                     uint64_t base_part_size,
+                                     uint64_t chunk_size);
 
 std::unique_ptr<IWriter> create_oss_writer(OssFs *fs, std::string_view path,
                                            FileInode *inode, int flags,

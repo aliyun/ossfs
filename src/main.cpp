@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -47,6 +48,7 @@
   { 128 }
 
 #define DEV_STDOUT "/dev/stdout"
+#define LOG_SYSLOG "syslog"
 #define LOG_FILE_PREFIX "ossfs2.log"
 
 static const std::string kUserAgentPrefix = "ossfs2-";
@@ -54,6 +56,7 @@ static const std::string kUserAgentPrefix = "ossfs2-";
 static OssFileSystem::BackgroundVCpuEnv g_bg_vcpu_env;
 static std::string g_mountpoint;
 static bool g_log_to_stdout = false;
+static bool g_log_to_syslog = false;
 
 static int block_all_signal(sigset_t *oldset) {
   sigset_t sigset;
@@ -97,17 +100,25 @@ static std::string build_fsname(const std::string &bucket,
   return bucket + "." + ep + ":/" + prefix;
 }
 
+static std::string get_log_file_base_dir(const std::string &root) {
+  std::string base = root;
+  auto uid = getuid();
+  struct passwd *pw = getpwuid(uid);
+  if (pw) {
+    base = join_paths(base, std::string(pw->pw_name));
+  } else {
+    base = join_paths(base, std::to_string(uid));
+  }
+  return base;
+}
+
 static OssFileSystem::IObjStore *create_obj_store(
     photon::Executor *eth, const std::string &access_key_id,
     const std::string &access_key_secret,
     const OssFileSystem::ObjStoreOptions &options) {
   return eth->perform([&]() {
-    OssFileSystem::IObjStore *ossfs = nullptr;
-
-    ossfs = OssFileSystem::new_oss_store(access_key_id.c_str(),
-                                         access_key_secret.c_str(), options);
-
-    return ossfs;
+    return OssFileSystem::new_obj_store(access_key_id.c_str(),
+                                        access_key_secret.c_str(), options);
   });
 }
 
@@ -117,7 +128,11 @@ int create_background_obj_stores() {
   std::string prefix = FLAGS_oss_bucket_prefix;
   auto [access_key_id, access_key_secret] = get_oss_credentials();
 
-  if ((access_key_id.empty() || access_key_secret.empty()) &&
+  // HDFS mode: credentials can be provided via hdfs_client_options
+  // (e.g., fs.oss.provider.endpoint=provider://ASSUME_ROLE), so skip
+  // the empty credential check.
+  bool is_hdfs = OssFileSystem::is_hdfs_endpoint(endpoint);
+  if (!is_hdfs && (access_key_id.empty() || access_key_secret.empty()) &&
       FLAGS_ram_role.empty() && FLAGS_credential_process.empty()) {
     LOG_ERROR(
         "empty credential, please set ak/sk, ram_role or credential_process");
@@ -143,7 +158,53 @@ int create_background_obj_stores() {
   options.prefix = prefix;
   options.use_auth_cache = FLAGS_use_auth_cache;
   options.enable_symlink = FLAGS_enable_symlink;
+  options.auto_create_bucket = FLAGS_auto_create_bucket;
+  options.agentic_bucket = FLAGS_agentic_bucket;
+
+  // Fallback to OSSFS_PROXY env var when --http_proxy is not explicitly set.
+  if (gflags::GetCommandLineFlagInfoOrDie("http_proxy").is_default) {
+    char *env_proxy = std::getenv("OSSFS_PROXY");
+    if (env_proxy != nullptr) {
+      LOG_INFO("Detected OSSFS_PROXY env var");
+      FLAGS_http_proxy = env_proxy;
+    }
+  }
+
   options.proxy = FLAGS_http_proxy;
+  if (!options.proxy.empty()) {
+    LOG_INFO("HTTP proxy is enabled");
+  }
+
+  // HDFS mode: only need 1 store (SDK manages its own threads,
+  // get_obj_store_direct uses index 0).
+  // OSS mode: need multiple stores (one per vCPU for photon executor I/O).
+  uint64_t store_count = FLAGS_oss_vcpu_count;
+  if (is_hdfs) {
+    store_count = 1;
+    options.hdfs_client_options = FLAGS_oss_hdfs_client_options;
+
+    if (!FLAGS_log_dir.empty() && FLAGS_log_dir != "/dev/stdout") {
+      options.append_hdfs_client_option(
+          OssFileSystem::kHdfsSdkOptLoggerAppender, "file");
+      options.append_hdfs_client_option(
+          OssFileSystem::kHdfsSdkOptLoggerDir,
+          get_log_file_base_dir(FLAGS_log_dir.c_str()));
+    }
+
+    if (gflags::GetCommandLineFlagInfoOrDie("enable_symlink").is_default) {
+      options.enable_symlink = true;
+    }
+
+    // HDFS mode: use larger default list count for better readdir performance.
+    if (gflags::GetCommandLineFlagInfoOrDie("max_list_ret_count").is_default) {
+      options.max_list_ret_cnt = 1000;
+    }
+    // Sync random write at attr_timeout interval so cross-mount getattr
+    // sees up-to-date metadata. Skipped if user already set it.
+    options.append_hdfs_client_option(
+        OssFileSystem::kHdfsSdkOptRandomWriteSyncInterval,
+        std::to_string(FLAGS_attr_timeout * 1000));
+  }
 
   sigset_t oldset;
   int bas = block_all_signal(&oldset);
@@ -159,7 +220,7 @@ int create_background_obj_stores() {
     LOG_DEBUG("oss_vcpu_count is set to ", hw_concurrency);
   }
 
-  for (unsigned i = 0; i < FLAGS_oss_vcpu_count; i++) {
+  for (unsigned i = 0; i < store_count; i++) {
     auto executor = new photon::Executor(
         OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {}, EXECUTOR_QUEUE_OPTION);
     auto obj_store =
@@ -202,11 +263,19 @@ static int create_background_disk_cache(OssFileSystem::OssFsOptions *fs_opts) {
     io_engine_type = photon::fs::ioengine_psync;
     photon_io_init = photon::INIT_IO_NONE;
   }
+  // psync runs all disk cache requests inline, so a single primary
+  // executor (env lifecycle / recycle timer owner) is enough.
+  int executor_num = FLAGS_libaio_vcpu_count;
+  if (io_engine_type == photon::fs::ioengine_psync) {
+    executor_num = 1;
+  }
   auto bg_disk_cache_env = new OssFileSystem::BGVCpuDiskCacheEnv();
-  auto executor =
-      new photon::Executor(OSSFS_EVENT_ENGINE, photon_io_init,
-                           LIBAIO_PHOTON_OPTION, EXECUTOR_QUEUE_OPTION);
-  bg_disk_cache_env->set_executor(executor);
+  for (int i = 0; i < executor_num; i++) {
+    auto executor =
+        new photon::Executor(OSSFS_EVENT_ENGINE, photon_io_init,
+                             LIBAIO_PHOTON_OPTION, EXECUTOR_QUEUE_OPTION);
+    bg_disk_cache_env->add_executor(executor);
+  }
 
   OssFileSystem::DiskCacheOptions cache_opts(
       FLAGS_disk_data_cache_dir, cache_size >> 30, 1024 * 1024, io_engine_type,
@@ -318,6 +387,65 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->appendable_object_autoswitch_threshold =
       FLAGS_appendable_object_autoswitch_threshold;
 
+  fs_options->temp_dir = FLAGS_temp_dir;
+  fs_options->random_write_chunk_size =
+      parse_bytes_string(FLAGS_random_write_chunk_size).value();
+  if (!FLAGS_temp_dir.empty()) {
+    // Random write uploads read staging data from local disk; cap the
+    // default upload concurrency to limit disk pressure.
+    constexpr uint32_t kRandomWriteUploadConcurrency = 8;
+    if (gflags::GetCommandLineFlagInfoOrDie("upload_concurrency").is_default) {
+      fs_options->upload_concurrency = kRandomWriteUploadConcurrency;
+      LOG_INFO("random write mode: upload_concurrency set to `",
+               fs_options->upload_concurrency);
+    }
+
+    fs_options->temp_dir_free_bytes =
+        parse_bytes_string(FLAGS_temp_dir_free_bytes).value();
+    fs_options->random_write_max_file_size =
+        parse_bytes_string(FLAGS_random_write_max_file_size).value();
+    struct statvfs vfs;
+    if (::statvfs(FLAGS_temp_dir.c_str(), &vfs) == 0) {
+      if (FLAGS_temp_dir_free_percent > 0) {
+        uint64_t root_reserved_blocks = 0;
+        if (vfs.f_bfree > vfs.f_bavail) {
+          root_reserved_blocks =
+              static_cast<uint64_t>(vfs.f_bfree - vfs.f_bavail);
+        }
+
+        if (static_cast<uint64_t>(vfs.f_blocks) <= root_reserved_blocks) {
+          LOG_ERROR("vfs.f_blocks ` <= root_reserved_blocks `", vfs.f_blocks,
+                    root_reserved_blocks);
+          return -EINVAL;
+        }
+
+        uint64_t usable =
+            (static_cast<uint64_t>(vfs.f_blocks) - root_reserved_blocks) *
+            static_cast<uint64_t>(vfs.f_frsize);
+        double ratio = FLAGS_temp_dir_free_percent / 100.0;
+        uint64_t ratio_bytes = static_cast<uint64_t>(usable * ratio);
+        fs_options->temp_dir_free_bytes =
+            std::max(fs_options->temp_dir_free_bytes, ratio_bytes);
+        LOG_INFO("total usable bytes: `, multiplied by ratio: `", usable,
+                 ratio_bytes);
+      }
+
+      uint64_t avail = static_cast<uint64_t>(vfs.f_bavail) *
+                       static_cast<uint64_t>(vfs.f_frsize);
+      if (avail < fs_options->temp_dir_free_bytes) {
+        LOG_ERROR("temp_dir ` has only ` bytes available, required ` bytes",
+                  FLAGS_temp_dir, avail, fs_options->temp_dir_free_bytes);
+        return -EINVAL;
+      }
+    } else {
+      LOG_WARN("statvfs(`) failed: `, ignored temp_dir_free_percent",
+               FLAGS_temp_dir, strerror(errno));
+    }
+
+    LOG_INFO("Using temp directory ` with free disk space threshold ` Bytes",
+             FLAGS_temp_dir, fs_options->temp_dir_free_bytes);
+  }
+
   fs_options->readdir_remember_count = FLAGS_max_list_ret_count;
   fs_options->kernel_readdir_cache_timeout = FLAGS_kernel_readdir_cache_timeout;
 
@@ -336,6 +464,9 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->max_inode_cache_count = FLAGS_max_inode_cache_count;
 
   fs_options->enable_symlink = FLAGS_enable_symlink;
+  fs_options->enable_xattr = FLAGS_enable_xattr;
+  fs_options->hdfs_set_owner_on_create = FLAGS_hdfs_set_owner_on_create;
+  fs_options->mountpoint = g_mountpoint;
 
   if (gflags::GetCommandLineFlagInfoOrDie("uid").is_default) {
     fs_options->uid = getuid();
@@ -386,7 +517,35 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
     fs_options->prefetch_chunks = prefetch_chunks;
   }
 
-  if (adjust_fs_options_with_mem_limit(fs_options) < 0) return -EINVAL;
+  if (OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint)) {
+    // HDFS-specific fs_options defaults
+    fs_options->storage_backend =
+        OssFileSystem::IObjStore::StorageBackend::kHDFS;
+    fs_options->upload_buffer_size = 1ULL * 1024 * 1024;
+    LOG_INFO("HDFS mode: upload_buffer_size forced to 1MB");
+
+    if (gflags::GetCommandLineFlagInfoOrDie("kernel_readdir_cache_timeout")
+            .is_default) {
+      int64_t entry_timeout = FLAGS_fuse_entry_timeout == -1
+                                  ? FLAGS_attr_timeout
+                                  : FLAGS_fuse_entry_timeout;
+      fs_options->kernel_readdir_cache_timeout = entry_timeout;
+      LOG_INFO("HDFS mode: auto-set kernel_readdir_cache_timeout = `",
+               entry_timeout);
+    }
+
+    // Auto-enable symlink in HDFS mode unless user explicitly disabled it.
+    if (gflags::GetCommandLineFlagInfoOrDie("enable_symlink").is_default) {
+      fs_options->enable_symlink = true;
+      LOG_INFO("HDFS mode: auto-enabled symlink");
+    }
+  } else {
+    if (adjust_fs_options_with_mem_limit(fs_options) < 0) return -EINVAL;
+  }
+
+  if (OssFileSystem::OssFsOptions::validate_random_write(*fs_options) < 0) {
+    return -EINVAL;
+  }
 
   fs_options->enable_admin_server = FLAGS_enable_admin_server;
   return 0;
@@ -401,13 +560,39 @@ static void parse_fuse_options() {
                                ? FLAGS_attr_timeout
                                : FLAGS_fuse_entry_timeout;
   fuse_opt.negative_timeout = FLAGS_negative_timeout;
-  fuse_opt.readdirplus = FLAGS_readdirplus;
+  fuse_opt.readdirplus =
+      FLAGS_readdirplus ? ReaddirplusMode::kOn : ReaddirplusMode::kOff;
   if (FLAGS_attr_timeout == 0 && fuse_opt.attr_timeout == 0 &&
       fuse_opt.entry_timeout == 0) {
-    fuse_opt.readdirplus = false;
+    fuse_opt.readdirplus = ReaddirplusMode::kOff;
   }
 
-  fuse_opt.ignore_fsync = FLAGS_ignore_fsync;
+  if (OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint)) {
+    fuse_opt.ignore_fsync = false;
+    fuse_opt.replace_unresolved_uid_gid = true;
+    fuse_opt.enable_flock = true;
+    // HDFS mode: use adaptive readdirplus so plain ls uses READDIR (more
+    // entries per call) while ls -l uses READDIRPLUS (avoids extra lookups).
+    if (fuse_opt.readdirplus == ReaddirplusMode::kOn) {
+      fuse_opt.readdirplus = ReaddirplusMode::kAuto;
+    }
+    // Default negative_timeout to 30s in HDFS mode unless explicitly set.
+    if (gflags::GetCommandLineFlagInfoOrDie("negative_timeout").is_default) {
+      fuse_opt.negative_timeout = 30;
+    }
+    LOG_INFO("HDFS endpoint detected");
+    LOG_INFO("HDFS mode: ignore_fsync set to false");
+    LOG_INFO("HDFS mode: negative_timeout set to `", fuse_opt.negative_timeout);
+  } else {
+    fuse_opt.ignore_fsync = FLAGS_ignore_fsync;
+    if (!FLAGS_temp_dir.empty() &&
+        gflags::GetCommandLineFlagInfoOrDie("ignore_fsync").is_default) {
+      // Random write mode honors fsync for correct POSIX semantics unless the
+      // user explicitly opts out.
+      fuse_opt.ignore_fsync = false;
+      LOG_INFO("random write mode: ignore_fsync set to false");
+    }
+  }
 
   if (FLAGS_close_to_open && !FLAGS_sync_upload) {
     FLAGS_sync_upload = true;
@@ -470,20 +655,19 @@ static void trim_mount_options() {
   }
 }
 
-static std::string get_log_file_base_dir(const std::string &root) {
-  std::string base = root;
-  auto uid = getuid();
-  struct passwd *pw = getpwuid(uid);
-  if (pw) {
-    base = join_paths(base, std::string(pw->pw_name));
-  } else {
-    base = join_paths(base, std::to_string(uid));
-  }
-  return base;
-}
-
 static void init_logger() {
   int log_level = FLAGS_log_level == "debug" ? ALOG_DEBUG : ALOG_INFO;
+
+  if (g_log_to_syslog) {
+    // Syslog mode: send all logs to syslog (collected by journald).
+    // Triggered by --log_dir=syslog.
+    // This is useful for systemd-managed environments (e.g., cmdmounter in VM)
+    // where journald provides unified log management with automatic rotation.
+    log_output_level = ALOG_ERROR;
+    set_ossfs_log_to_syslog(log_level);
+    set_default_logger_output_to_syslog(ALOG_ERROR);
+    return;
+  }
 
   if (!g_log_to_stdout) {
     std::string base = FLAGS_log_dir;
@@ -624,6 +808,13 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
   set_fuse_ll_fs(fs.get());
   fs_ops_ll = get_fuse_ll_oper();
 
+  // OSS mode does not support xattr or locks; the hooks stay null so the
+  // kernel receives ENOSYS and stops sending these requests.
+  if (OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint)) {
+    enable_fuse_ll_xattr_and_lock();
+    LOG_INFO("HDFS mode: xattr/lock fuse hooks enabled");
+  }
+
   {
     auto t0 = std::chrono::steady_clock::now();
     if ((session = fuse_session_new(
@@ -706,6 +897,10 @@ static void log_exit_error(char r) {
     if (g_log_to_stdout) {
       fprintf(stderr,
               "ERROR: failed to mount ossfs2, see more details in logs\n");
+    } else if (g_log_to_syslog) {
+      fprintf(stderr,
+              "ERROR: failed to mount ossfs2, see more details via: "
+              "journalctl -t ossfs2\n");
     } else {
       fprintf(
           stderr,
@@ -740,88 +935,6 @@ static int check_dir_empty(const std::string &path) {
   if (errno != 0) result = -1;
   closedir(dh);
   return result;
-}
-
-static int validate_log_dir(const std::string &mountpoint,
-                            const std::string &log_dir) {
-  if (g_log_to_stdout) return 0;
-
-  // 1. convert log dir to absolute path
-  if (log_dir.empty()) {
-    fprintf(stderr, "ERROR: log_dir cannot be empty\n");
-    return -1;
-  }
-
-  // Users could not find the real path if they use relative path, reject it.
-  if (log_dir[0] != '/') {
-    fprintf(stderr, "ERROR: log_dir must be absolute path: %s\n",
-            log_dir.c_str());
-    return -1;
-  }
-
-  std::error_code ec;
-  std::filesystem::path abs_log_dir_path =
-      std::filesystem::absolute(log_dir, ec);
-  if (ec) {
-    fprintf(stderr, "ERROR: cannot get absolute path of log_dir: %s, err: %s\n",
-            log_dir.c_str(), ec.message().c_str());
-    return -1;
-  }
-  std::string abs_log_dir_str = abs_log_dir_path.lexically_normal().string();
-  if (abs_log_dir_str.back() == '/') abs_log_dir_str.pop_back();
-
-  std::filesystem::path abs_mountpoint =
-      std::filesystem::absolute(mountpoint, ec);
-  if (ec) {
-    fprintf(stderr,
-            "ERROR: cannot get absolute path of mountpoint: %s, err: %s\n",
-            mountpoint.c_str(), ec.message().c_str());
-    return -1;
-  }
-  std::string abs_mountpoint_str = abs_mountpoint.lexically_normal().string();
-  if (abs_mountpoint_str.back() == '/') abs_mountpoint_str.pop_back();
-
-  // Check deadlock.
-  if (abs_mountpoint_str == abs_log_dir_str) {
-    fprintf(stderr, "ERROR: log_dir cannot be the same as MOUNTPOINT: %s\n",
-            abs_log_dir_str.c_str());
-    return -1;
-  } else if (is_subdir(abs_mountpoint_str, abs_log_dir_str)) {
-    fprintf(stderr, "ERROR: log_dir %s cannot be subdir of MOUNTPOINT: %s\n",
-            abs_log_dir_str.c_str(), abs_mountpoint_str.c_str());
-    return -1;
-  } else if (is_subdir(abs_log_dir_str, abs_mountpoint_str)) {
-    fprintf(stderr, "ERROR: MOUNTPOINT %s cannot be subdir of log_dir: %s\n",
-            abs_mountpoint_str.c_str(), abs_log_dir_str.c_str());
-    return -1;
-  }
-
-  int r = ::access(log_dir.c_str(), R_OK | W_OK | X_OK);
-  if (r == 0) {
-    if (!std::filesystem::is_directory(log_dir, ec)) {
-      if (ec) {
-        fprintf(stderr, "ERROR: cannot check mode of log_dir: %s, err: %s\n",
-                log_dir.c_str(), ec.message().c_str());
-      } else {
-        fprintf(stderr, "ERROR: log_dir: %s is not a directory\n",
-                log_dir.c_str());
-      }
-      return -1;
-    }
-  } else {
-    auto omask = ::umask(0);
-    r = ::mkdir(log_dir.c_str(), 0777);
-    if (r != 0) {
-      fprintf(stderr, "ERROR: cannot create log_dir: %s, err: %s\n",
-              log_dir.c_str(), strerror(errno));
-      return -1;
-    }
-    ::umask(omask);
-  }
-
-  FLAGS_log_dir = abs_log_dir_str;
-  g_mountpoint = abs_mountpoint_str;
-  return 0;
 }
 
 static void do_show_mount_help() {
@@ -1003,13 +1116,22 @@ int main(int argc, char *argv[]) {
                                    std::string(pfx).c_str());
     }
 
+    g_log_to_syslog = FLAGS_log_dir == LOG_SYSLOG;
     g_log_to_stdout =
         FLAGS_log_dir == DEV_STDOUT ||
         (gflags::GetCommandLineFlagInfoOrDie("log_dir").is_default && FLAGS_f);
+    if (g_log_to_stdout || g_log_to_syslog) FLAGS_log_dir.clear();
 
     if (FLAGS_fuse_device_fd < 0) {
       // mountpoint was mounted by ossfs2 itself, so we can access mountpoint
       // directory.
+
+      g_mountpoint = normalize_path(mountpoint);
+      if (g_mountpoint.empty()) {
+        fprintf(stderr, "ERROR: cannot normalize MOUNTPOINT: %s\n",
+                mountpoint.c_str());
+        return -1;
+      }
 
       std::error_code ec;
       if (!std::filesystem::is_directory(
@@ -1018,8 +1140,6 @@ int main(int argc, char *argv[]) {
                 ec ? ec.message().c_str() : "not a directory");
         return -1;
       }
-
-      if (validate_log_dir(mountpoint, FLAGS_log_dir) != 0) return -1;
 
       if (!FLAGS_nonempty) {
         int r = check_dir_empty(mountpoint);
@@ -1052,6 +1172,20 @@ int main(int argc, char *argv[]) {
       fuse_args[1] = const_cast<char *>(mountpoint_param.c_str());
     }
 
+    // Normalize and validate directory parameters, creating them if absent.
+    {
+      if (!normalize_dir_flag(FLAGS_log_dir)) return -1;
+      if (!normalize_dir_flag(FLAGS_disk_data_cache_dir)) return -1;
+      if (!normalize_dir_flag(FLAGS_temp_dir)) return -1;
+
+      if (!validate_dir_params(FLAGS_log_dir, FLAGS_disk_data_cache_dir,
+                               FLAGS_temp_dir, g_mountpoint))
+        return -1;
+    }
+
+    // Ensure log directory has 0777 permission for log rotation tools.
+    if (!FLAGS_log_dir.empty()) ::chmod(FLAGS_log_dir.c_str(), 0777);
+
     const std::string &dir = FLAGS_disk_data_cache_dir;
     if (!dir.empty() && check_dir_empty(dir) == 1) {
       fprintf(stderr, "ERROR: disk cache directory %s is not empty\n",
@@ -1081,7 +1215,16 @@ int main(int argc, char *argv[]) {
       fuse_opt_add_arg(&args, "-oallow_other");
     }
 
-    fuse_opt_add_arg(&args, "-odefault_permissions");
+    // Handle default_permissions: OSS mode forces true, HDFS mode configurable.
+    bool use_default_permissions;
+    if (OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint)) {
+      use_default_permissions = FLAGS_default_permissions;
+    } else {
+      use_default_permissions = true;
+    }
+    if (use_default_permissions) {
+      fuse_opt_add_arg(&args, "-odefault_permissions");
+    }
     fuse_opt_add_arg(&args, "-osubtype=ossfs2");
     // fuse_opt_add_arg internally copies the string, so local std::string is
     // safe.

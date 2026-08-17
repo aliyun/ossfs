@@ -385,7 +385,7 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
 
     auto reader = (dynamic_cast<OssFileHandle *>(file))->reader_.get();
     auto cache_file = dynamic_cast<OssCachedReader *>(reader);
-    ASSERT_NE(cache_file->running_download_tasks_.load(), 0ULL);
+    ASSERT_NE(cache_file->in_flight_count(), 0ULL);
 
     void *mem;
     ssize_t ret = file->pin(0, io_size, &mem);
@@ -395,7 +395,7 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
     r = fs_->release(nodeid, file);
     ASSERT_EQ(r, 0);
 
-    ASSERT_EQ(cache_file->running_download_tasks_.load(), 0ULL);
+    ASSERT_EQ(cache_file->in_flight_count(), 0ULL);
 
     file->unpin(0);
   }
@@ -444,6 +444,7 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
 TEST_F(Ossfs2OpenCloseTest, verify_open) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss);
   init(opts);
   verify_open();
 }
@@ -451,6 +452,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_open) {
 TEST_F(Ossfs2OpenCloseTest, verify_filehandle_release) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss);
   init(opts);
   verify_filehandle_release();
 }
@@ -460,6 +462,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_close_to_open) {
   OssFsOptions opts;
   opts.close_to_open = true;
   opts.attr_timeout = 3;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_close_to_open();
 }
@@ -469,6 +472,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_close_to_open_stale) {
   OssFsOptions opts;
   opts.close_to_open = true;
   opts.attr_timeout = 0;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_close_to_open_stale();
 }
@@ -477,6 +481,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_max_total_reserved_buffer_count) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.max_total_reserved_buffer_count = 32;
+  SET_TEST_MODE(kTestOss);
   init(opts);
   verify_max_total_reserved_buffer_count();
 }
@@ -487,6 +492,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_wait_for_prefetching_with_pin_read) {
   opts.prefetch_chunk_size = 1024 * 1024;
   opts.prefetch_concurrency_per_file = 256;
   opts.seq_read_detect_count = 1;
+  SET_TEST_MODE(kTestOss);
   init(opts);
   verify_wait_for_prefetching_with_pin_read();
 }
@@ -494,6 +500,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_wait_for_prefetching_with_pin_read) {
 TEST_F(Ossfs2OpenCloseTest, verify_open_truncate) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_open_truncate();
 }
@@ -502,6 +509,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_open_truncate_for_appendable_object) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_open_truncate();
 }

@@ -90,6 +90,7 @@ TEST_F(Ossfs2CredentialsTest, verify_mount_with_invalid_ramrole) {
   opts.ram_role = "gtest-ramrole-invalid";
 
   // init should failed
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   EXPECT_NE(do_init(opts), 0);
 }
 
@@ -97,14 +98,16 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_process) {
   INIT_PHOTON();
   OssFsOptions opts;
 
-  std::ofstream cred_file("ossfs2_test_creds_process_file");
-  DEFER(unlink("ossfs2_test_creds_process_file"));
+  std::string cred_path = join_paths(test_path_, "creds_process_file");
+  std::ofstream cred_file(cred_path);
+  DEFER(unlink(cred_path.c_str()));
 
   cred_file << format_creds(FLAGS_oss_access_key_id,
                             FLAGS_oss_access_key_secret, "", "");
   cred_file.close();
 
-  opts.credential_process = "/bin/cat ossfs2_test_creds_process_file";
+  opts.credential_process = "/bin/cat " + cred_path;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   EXPECT_EQ(do_init(opts), 0);
 }
 
@@ -113,7 +116,6 @@ TEST_F(Ossfs2CredentialsTest, verify_invalid_credential_process) {
   OssFsOptions opts;
   opts.credential_process = "echo \"{invalid\"";
   EXPECT_NE(do_init(opts), 0);
-
   destroy();
 
   opts.credential_process = "echo `ls`";
@@ -125,10 +127,11 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_refresh) {
   OssFsOptions opts;
   opts.attr_timeout = 1;
 
-  std::ofstream cred_file("ossfs2_test_creds_process_file");
-  DEFER(unlink("ossfs2_test_creds_process_file"));
-
-  DEFER(unlink("timestamp.txt"));
+  std::string cred_path = join_paths(test_path_, "creds_process_file");
+  std::string ts_path = join_paths(test_path_, "timestamp.txt");
+  std::ofstream cred_file(cred_path);
+  DEFER(unlink(cred_path.c_str()));
+  DEFER(unlink(ts_path.c_str()));
 
   cred_file << format_creds(FLAGS_oss_access_key_id,
                             FLAGS_oss_access_key_secret, "",
@@ -136,16 +139,13 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_refresh) {
   cred_file.close();
 
   opts.credential_process =
-      "/bin/bash -c '/bin/echo $(date -u +\"%Y-%m-%dT%H:%M:%SZ\") > "
-      "timestamp.txt && /bin/cat "
-      "ossfs2_test_creds_process_file'";
+      "/bin/bash -c '/bin/echo $(date -u +\"%Y-%m-%dT%H:%M:%SZ\") > " +
+      ts_path + " && /bin/cat " + cred_path + "'";
   EXPECT_EQ(do_init(opts), 0);
-
-  time_t first_refresh = parse_iso8601_time(read_file("timestamp.txt"));
+  time_t first_refresh = parse_iso8601_time(read_file(ts_path));
 
   // set invalid expiration time
-  cred_file.open("ossfs2_test_creds_process_file",
-                 std::ios::out | std::ios::trunc);
+  cred_file.open(cred_path, std::ios::out | std::ios::trunc);
   cred_file << format_creds(FLAGS_oss_access_key_id,
                             FLAGS_oss_access_key_secret, "", "invalid");
   cred_file.close();
@@ -155,12 +155,11 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_refresh) {
   LOG_INFO("After 20 seconds, check result");
 
   // check timestamp
-  time_t refresh_time_1 = parse_iso8601_time(read_file("timestamp.txt"));
+  time_t refresh_time_1 = parse_iso8601_time(read_file(ts_path));
   EXPECT_TRUE(refresh_time_1 > first_refresh);
 
   // remove expiration and will not refresh credential anymore
-  cred_file.open("ossfs2_test_creds_process_file",
-                 std::ios::out | std::ios::trunc);
+  cred_file.open(cred_path, std::ios::out | std::ios::trunc);
   cred_file << format_creds(FLAGS_oss_access_key_id,
                             FLAGS_oss_access_key_secret, "", "");
   cred_file.close();
@@ -170,7 +169,7 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_refresh) {
   LOG_INFO("After 20 seconds, check result");
 
   // check timestamp
-  time_t refresh_time_2 = parse_iso8601_time(read_file("timestamp.txt"));
+  time_t refresh_time_2 = parse_iso8601_time(read_file(ts_path));
   EXPECT_TRUE(refresh_time_2 > refresh_time_1);
 
   LOG_INFO("Wait for 20 seconds for credential refresh again");
@@ -178,18 +177,21 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_refresh) {
   LOG_INFO("After 20 seconds, check result");
 
   // refresh time should not change
-  EXPECT_TRUE(parse_iso8601_time(read_file("timestamp.txt")) == refresh_time_2);
+  EXPECT_TRUE(parse_iso8601_time(read_file(ts_path)) == refresh_time_2);
 }
 
 TEST_F(Ossfs2CredentialsTest, verify_credential_fixed_interval_refresh) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
   opts.credential_refresh_interval = 3;  // 3 seconds interval.
 
-  std::ofstream cred_file("ossfs2_test_creds_process_file");
-  DEFER(unlink("ossfs2_test_creds_process_file"));
-  DEFER(unlink("timestamp.txt"));
+  std::string cred_path = join_paths(test_path_, "creds_process_file");
+  std::string ts_path = join_paths(test_path_, "timestamp.txt");
+  std::ofstream cred_file(cred_path);
+  DEFER(unlink(cred_path.c_str()));
+  DEFER(unlink(ts_path.c_str()));
 
   // Write initial credentials with real AK/SK
   cred_file << format_creds(FLAGS_oss_access_key_id,
@@ -197,24 +199,22 @@ TEST_F(Ossfs2CredentialsTest, verify_credential_fixed_interval_refresh) {
   cred_file.close();
 
   opts.credential_process =
-      "/bin/bash -c '/bin/echo $(date -u +\"%Y-%m-%dT%H:%M:%SZ\") > "
-      "timestamp.txt && /bin/cat "
-      "ossfs2_test_creds_process_file'";
+      "/bin/bash -c '/bin/echo $(date -u +\"%Y-%m-%dT%H:%M:%SZ\") > " +
+      ts_path + " && /bin/cat " + cred_path + "'";
   EXPECT_EQ(do_init(opts), 0);
-
-  time_t first_refresh = parse_iso8601_time(read_file("timestamp.txt"));
+  time_t first_refresh = parse_iso8601_time(read_file(ts_path));
 
   // Wait for fixed interval (3 seconds) + some buffer
   sleep(5);
 
   // check timestamp - should have refreshed
-  time_t refresh_time_1 = parse_iso8601_time(read_file("timestamp.txt"));
+  time_t refresh_time_1 = parse_iso8601_time(read_file(ts_path));
   EXPECT_TRUE(refresh_time_1 > first_refresh);
 
   // Wait another interval
   sleep(5);
 
   // check timestamp - should have refreshed again
-  time_t refresh_time_2 = parse_iso8601_time(read_file("timestamp.txt"));
+  time_t refresh_time_2 = parse_iso8601_time(read_file(ts_path));
   EXPECT_TRUE(refresh_time_2 > refresh_time_1);
 }

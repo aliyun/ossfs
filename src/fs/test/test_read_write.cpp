@@ -14,7 +14,11 @@
  * limitations under the License.
  */
 
+#include <chrono>
+#include <thread>
+
 #include "fs/disk_cache.h"
+#include "metric/metrics.h"
 #include "test_suite.h"
 
 class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
@@ -938,8 +942,12 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     }
     ASSERT_EQ(crc64, crc64_read);
 
+    Metric::set_enabled_metrics("oss");
+    DEFER(Metric::set_enabled_metrics(""));
     // read 5 times next, and check the number of cache hits
     for (int j = 0; j < 5; j++) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      auto metric_start = std::chrono::steady_clock::now();
       size_t cache_hit_cnt = 0;
       uint64_t crc64_read = 0;
       for (size_t i = 0; i < file_size; i++) {
@@ -958,6 +966,16 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       LOG_INFO("cache hit cnt: `", cache_hit_cnt);
       ASSERT_GT(cache_hit_cnt, file_size * 8 / 10);
       ASSERT_EQ(crc64, crc64_read);
+
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - metric_start)
+                             .count() +
+                         1;
+      auto metrics = Metric::get_metrics_map(elapsed_sec);
+      uint64_t oss_read_bytes = metrics["oss_read_bytes"];
+      uint64_t file_size_bytes = static_cast<uint64_t>(file_size) * 1024 * 1024;
+      ASSERT_LT(oss_read_bytes, file_size_bytes * 1.1);
     }
 
     r = fs_->release(nodeid, file);
@@ -1042,7 +1060,12 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     DEFER(fs_->forget(parent, 1));
 
     uint64_t nodeid = 0;
-    const size_t file_size_MB = 1823 + rand() % 128;
+    // Use smaller file for HDFS to avoid excessive test time
+    // (16 threads × small chunks × large file = too many seeks on shared
+    // handle).
+    const size_t file_size_MB = is_hdfs_mode_
+                                    ? (182 + rand() % 18)     // ~190MB for HDFS
+                                    : (1823 + rand() % 128);  // ~1.9GB for OSS
     auto crc64 =
         create_file_in_folder(parent, "testfile", file_size_MB, nodeid);
     DEFER(fs_->forget(nodeid, 1));
@@ -1496,7 +1519,10 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
 
   void verify_open_with_append_flag() {
     for (int i = 0; i < 2; i++) {
-      fs_->options_.enable_appendable_object = i;
+      OssFsOptions opts;
+      opts.enable_appendable_object = i;
+      destroy();
+      init(opts);
 
       uint64_t parent = get_test_dir_parent();
       DEFER(fs_->forget(parent, 1));
@@ -1643,13 +1669,14 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     ASSERT_EQ(r, 5);
     ASSERT_EQ(std::string(buf, r), "hello");
 
-    std::ofstream tmpfile("tmpfile", std::ios::out | std::ios::trunc);
-    DEFER(unlink("tmpfile"));
+    std::string local_tmp = join_paths(test_path_, "tmpfile");
+    std::ofstream tmpfile(local_tmp, std::ios::out | std::ios::trunc);
+    DEFER(unlink(local_tmp.c_str()));
 
     tmpfile << "helloworld";
     tmpfile.close();
 
-    r = upload_file("tmpfile", join_paths(parent_path, "testfile"),
+    r = upload_file(local_tmp, join_paths(parent_path, "testfile"),
                     FLAGS_oss_bucket_prefix);
     ASSERT_EQ(r, 0);
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1666,11 +1693,11 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     for (int i = 0; i < 5; i++) {
       std::string random_data = random_string(rand() % max_size + 1);
 
-      tmpfile.open("tmpfile", std::ios::out | std::ios::trunc);
+      tmpfile.open(local_tmp, std::ios::out | std::ios::trunc);
       tmpfile << random_data;
       tmpfile.close();
 
-      r = upload_file("tmpfile", join_paths(parent_path, "testfile"),
+      r = upload_file(local_tmp, join_paths(parent_path, "testfile"),
                       FLAGS_oss_bucket_prefix);
       ASSERT_EQ(r, 0);
       std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1727,6 +1754,12 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     std::atomic<bool> is_stopping = {false};
     uint64_t g_epoch = 0;
     uint64_t g_file_size = 0;
+    DEFER({
+      is_stopping = true;
+      for (auto &t : threads) {
+        if (t.joinable()) t.join();
+      }
+    });
 
     // start readers
     for (int i = 0; i < concurrency; i++) {
@@ -1751,7 +1784,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
             ssize_t r =
                 read_from_handle(reader_handles[i], buf, read_size, offset);
             if (r != static_cast<ssize_t>(read_size)) is_stopping = true;
-            ASSERT_EQ(r, static_cast<ssize_t>(read_size));
+            EXPECT_EQ(r, static_cast<ssize_t>(read_size));
 
             offset += read_size;
           }
@@ -1761,7 +1794,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
               LOG_ERROR("Fail to verify data buf[i] = `, epoch = `", buf[i],
                         epoch);
             }
-            ASSERT_TRUE(static_cast<uint64_t>(buf[i]) >= epoch);
+            EXPECT_TRUE(static_cast<uint64_t>(buf[i]) >= epoch);
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
@@ -1779,8 +1812,9 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     for (size_t i = 0; i < test_file_sizes.size() && !is_stopping; i++) {
       uint64_t file_size = test_file_sizes[i];
       std::string data(IO_SIZE, (char)(i + 1));
-      std::ofstream tmpfile("tmpfile", std::ios::out | std::ios::trunc);
-      DEFER(unlink("tmpfile"));
+      std::string local_tmp = join_paths(test_path_, "tmpfile");
+      std::ofstream tmpfile(local_tmp, std::ios::out | std::ios::trunc);
+      DEFER(unlink(local_tmp.c_str()));
       uint64_t offset = 0;
       while (offset < file_size) {
         auto write_size = std::min(IO_SIZE, file_size - offset);
@@ -1792,7 +1826,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       std::this_thread::sleep_for(std::chrono::seconds(1));
 
       photon::scoped_rwlock _(rwlock, photon::WLOCK);
-      r = upload_file("tmpfile", join_paths(parent_path, "testfile"),
+      r = upload_file(local_tmp, join_paths(parent_path, "testfile"),
                       FLAGS_oss_bucket_prefix);
 
       g_epoch = i;
@@ -1803,9 +1837,6 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     }
 
     is_stopping = true;
-    for (auto &thread : threads) {
-      thread.join();
-    }
   }
 
   void verify_refill_with_remote_shrink() {
@@ -1855,15 +1886,16 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     // Upload a 1-byte file to replace the 30MB file on remote.
     // The handle still has cached remote_size_ = 30MB, and inode_->attr.size
     // is also still 30MB (nobody has refreshed since attr expired).
+    std::string tiny_tmp = join_paths(test_path_, "tmpfile_tiny");
     {
-      std::ofstream tmpfile("tmpfile_tiny", std::ios::out | std::ios::trunc);
+      std::ofstream tmpfile(tiny_tmp, std::ios::out | std::ios::trunc);
       tmpfile << "x";
       tmpfile.close();
     }
-    r = upload_file("tmpfile_tiny", join_paths(parent_path, filename),
+    r = upload_file(tiny_tmp, join_paths(parent_path, filename),
                     FLAGS_oss_bucket_prefix);
     ASSERT_EQ(r, 0);
-    unlink("tmpfile_tiny");
+    unlink(tiny_tmp.c_str());
 
     // Step 4: Enable FI and start reader at 10MB offset.
     // Reader's pin_rlocked -> refresh_attr: inode_->attr.size(30MB) ==
@@ -1949,15 +1981,16 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 
     // Upload tiny file to replace 30MB on remote
+    std::string tiny_tmp = join_paths(test_path_, "tmpfile_tiny");
     {
-      std::ofstream tmpfile("tmpfile_tiny", std::ios::out | std::ios::trunc);
+      std::ofstream tmpfile(tiny_tmp, std::ios::out | std::ios::trunc);
       tmpfile << "x";
       tmpfile.close();
     }
-    r = upload_file("tmpfile_tiny", join_paths(parent_path, filename),
+    r = upload_file(tiny_tmp, join_paths(parent_path, filename),
                     FLAGS_oss_bucket_prefix);
     ASSERT_EQ(r, 0);
-    unlink("tmpfile_tiny");
+    unlink(tiny_tmp.c_str());
 
     // Enable FI
     g_fault_injector->set_injection(FaultInjectionId::FI_Do_Refill_Range_Delay);
@@ -2686,6 +2719,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
 };
 
 TEST_F(Ossfs2ReadWriteTest, verify_write_files) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -2694,16 +2728,18 @@ TEST_F(Ossfs2ReadWriteTest, verify_write_files) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_out_of_range) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.upload_buffer_size = 1048576 * 2;
   opts.prefetch_chunk_size = 1048576 * 2;
-  opts.attr_timeout = 30;
+  opts.attr_timeout = 120;
   init(opts);
   verify_read_out_of_range();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_transmission_control) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_transmission_control = true;
@@ -2713,6 +2749,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_transmission_control) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_write_with_fuse_write_buf_failed) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -2720,6 +2757,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_write_with_fuse_write_buf_failed) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_min_reserved_buffer_size_per_file) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.min_reserved_buffer_size_per_file = 0;
@@ -2731,6 +2769,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_min_reserved_buffer_size_per_file) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_write_with_oss_error) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.upload_concurrency = 1;
@@ -2740,6 +2779,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_write_with_oss_error) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_readwrite_archive_and_ia_object) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -2747,6 +2787,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_readwrite_archive_and_ia_object) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_fd) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -2754,6 +2795,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_fd) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_write_to_immutable_handle_normal) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -2761,6 +2803,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_write_to_immutable_handle_normal) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_write_to_immutable_handle_multipart) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.upload_buffer_size = 131072;
@@ -2769,6 +2812,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_write_to_immutable_handle_multipart) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_init_multipart_error) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.upload_buffer_size = 131072;
@@ -2777,6 +2821,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_init_multipart_error) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_object_with_oss_error) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
@@ -2786,6 +2831,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_object_with_oss_error) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_repeatedly_with_prefetch) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.prefetch_chunk_size = 1048576 * 8;
@@ -2795,6 +2841,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_read_repeatedly_with_prefetch) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_direct_read_oss) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.prefetch_concurrency = 0;
@@ -2805,6 +2852,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_direct_read_oss) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_parallel_read_one_fd) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -2812,6 +2860,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_parallel_read_one_fd) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_oss_error_during_append_normal_object) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -2823,6 +2872,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_oss_error_during_append_normal_object) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_oss_multipart_upload_limit) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.upload_buffer_size = 1048576;
@@ -2831,6 +2881,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_oss_multipart_upload_limit) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_create_and_write_with_different_handle) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -2839,6 +2890,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_create_and_write_with_different_handle) {
 
 TEST_F(Ossfs2ReadWriteTest,
        verify_create_and_write_with_different_handle_for_appendable_object) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
@@ -2847,6 +2899,7 @@ TEST_F(Ossfs2ReadWriteTest,
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_default_prefetch_chunks) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.max_total_reserved_buffer_count = 0;
@@ -2866,6 +2919,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_default_prefetch_chunks) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_specified_prefetch_chunks) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.max_total_reserved_buffer_count = 0;
@@ -2895,100 +2949,101 @@ TEST_F(Ossfs2ReadWriteTest, verify_specified_prefetch_chunks) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_share_fd_read_buffer) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.share_fd_read_buffer = true;
   init(opts, 100, "", true);
-
   verify_concurrent_write_and_read("ALL_FILES_PER_WORKER", 53, 32);
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_share_fd_read_buffer_random_select) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.share_fd_read_buffer = true;
   init(opts, 100, "", true);
-
   verify_concurrent_write_and_read("RANDOM", 25, 16);
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_close_to_open_with_share_fd_read_buffer) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
-
   verify_close_to_open_with_cache();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_open_with_append_flag) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
-
   verify_open_with_append_flag();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_local_change_with_existing_fh) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
-
   verify_local_change_with_existing_fh();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_remote_change_with_existing_fh) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
   init(opts);
-
   verify_remote_change_with_existing_fh();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_remote_change_with_existing_fh_parallel) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
   init(opts);
-
   verify_remote_change_with_existing_fh_parallel();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_refill_with_remote_shrink) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
   init(opts);
-
   verify_refill_with_remote_shrink();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_refill_with_remote_shrink_concurrent) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
   init(opts);
-
   verify_refill_with_remote_shrink_concurrent();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_random_read_range) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
-
   verify_random_read_range();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_random_read_write_and_truncate) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
-
   verify_random_read_write_and_truncate();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_multipart_complete_with_immutable) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.upload_buffer_size = 131072;  // Small buffer to trigger more parts
@@ -2997,6 +3052,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_multipart_complete_with_immutable) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_immutable_writer_behavior) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -3004,6 +3060,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_immutable_writer_behavior) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_merge_remote_data_download_failure) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -3013,11 +3070,13 @@ TEST_F(Ossfs2ReadWriteTest, verify_merge_remote_data_download_failure) {
 TEST_F(Ossfs2ReadWriteTest, verify_mixed_read_write) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_mixed_read_write();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_mixed_read_write_with_immutable) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -3025,6 +3084,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_mixed_read_write_with_immutable) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_small_file_block_cache_after_release) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.prefetch_concurrency = 1;
@@ -3035,6 +3095,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_small_file_block_cache_after_release) {
 
 TEST_F(Ossfs2ReadWriteTest,
        verify_small_file_block_cache_after_release_no_share) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.prefetch_concurrency = 1;
@@ -3044,29 +3105,29 @@ TEST_F(Ossfs2ReadWriteTest,
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
   init(opts);
-
   verify_concurrent_write_and_read("ALL_FILES_PER_WORKER", 13, 8);
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_disk_cache_random_select) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
   init(opts);
-
   verify_concurrent_write_and_read("RANDOM", 17, 8);
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_write_with_disk_cache_init_failed) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
   init(opts);
-
   g_fault_injector->set_injection(FaultInjectionId::FI_DiskCache_Init_Failure);
   DEFER(g_fault_injector->clear_injection(
       FaultInjectionId::FI_DiskCache_Init_Failure));
@@ -3075,28 +3136,29 @@ TEST_F(Ossfs2ReadWriteTest, verify_read_write_with_disk_cache_init_failed) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_out_of_range_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.upload_buffer_size = 1048576 * 2;
   opts.prefetch_chunk_size = 1048576 * 2;
-  opts.attr_timeout = 30;
+  opts.attr_timeout = 120;
   opts.cache_type = CacheType::kDiskCache;
   init(opts);
-
   verify_read_out_of_range();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_close_to_open_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
   init(opts);
-
   verify_close_to_open_with_cache();
 }
 
 TEST_F(Ossfs2ReadWriteTest,
        verify_random_read_write_and_truncate_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
@@ -3106,6 +3168,7 @@ TEST_F(Ossfs2ReadWriteTest,
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_fd_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
@@ -3115,6 +3178,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_fd_with_disk_cache) {
 
 TEST_F(Ossfs2ReadWriteTest,
        verify_local_change_with_existing_fh_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
@@ -3125,6 +3189,7 @@ TEST_F(Ossfs2ReadWriteTest,
 
 TEST_F(Ossfs2ReadWriteTest,
        verify_remote_change_with_existing_fh_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
@@ -3136,6 +3201,7 @@ TEST_F(Ossfs2ReadWriteTest,
 
 TEST_F(Ossfs2ReadWriteTest,
        verify_remote_change_with_existing_fh_parallel_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
@@ -3146,29 +3212,29 @@ TEST_F(Ossfs2ReadWriteTest,
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_random_read_range_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
   init(opts);
-
   verify_random_read_range();
 }
 
 // Psync tests: force psync IO engine.
 TEST_F(Ossfs2ReadWriteTest, verify_disk_cache_psync) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
   init(opts, -1, "", false, photon::fs::ioengine_psync);
-
   verify_concurrent_write_and_read("ALL_FILES_PER_WORKER", 9, 4);
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_disk_cache_psync_random_read) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
   init(opts, -1, "", false, photon::fs::ioengine_psync);
-
   verify_random_read_range();
 }

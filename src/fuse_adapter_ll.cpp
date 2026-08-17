@@ -32,8 +32,10 @@
 #include <thread>
 #include <vector>
 
+#include "common/filesystem.h"
 #include "common/logger.h"
 #include "common/macros.h"
+#include "fs/fs.h"
 #include "metric/metrics.h"
 
 using OssFileSystem::Metric::MetricsType;
@@ -62,6 +64,31 @@ struct readdir_ctx {
   bool plus = false;
 };
 
+// Helper function to get uid/gid from fuse_req_ctx
+static bool get_fuse_request_uid_gid(fuse_req_t req, uid_t *out_uid,
+                                     gid_t *out_gid) {
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  if (ctx != nullptr) {
+    *out_uid = ctx->uid;
+    *out_gid = ctx->gid;
+    return true;
+  }
+  return false;
+}
+
+static void resolve_unresolved_uid_gid(fuse_req_t req, struct stat *stbuf) {
+  if (!fuse_options.replace_unresolved_uid_gid) {
+    return;
+  }
+
+  uid_t req_uid;
+  gid_t req_gid;
+  if (get_fuse_request_uid_gid(req, &req_uid, &req_gid)) {
+    if (stbuf->st_uid == kReservedUnresolvedUid) stbuf->st_uid = req_uid;
+    if (stbuf->st_gid == kReservedUnresolvedGid) stbuf->st_gid = req_gid;
+  }
+}
+
 static int dirent_filler(void *ctx, uint64_t nodeid, const char *name,
                          const struct stat *stbuf, off_t off) {
   struct readdir_ctx *c = (struct readdir_ctx *)ctx;
@@ -77,10 +104,16 @@ static int dirent_filler(void *ctx, uint64_t nodeid, const char *name,
     e.attr = *stbuf;
     e.attr_timeout = fuse_options.attr_timeout;
     e.entry_timeout = fuse_options.entry_timeout;
+
+    resolve_unresolved_uid_gid(c->req, &e.attr);
+
     needed =
         fuse_add_direntry_plus(c->req, c->buf + c->pos, left, name, &e, off);
   } else {
-    needed = fuse_add_direntry(c->req, c->buf + c->pos, left, name, stbuf, off);
+    struct stat stbuf_copy = *stbuf;
+    resolve_unresolved_uid_gid(c->req, &stbuf_copy);
+    needed = fuse_add_direntry(c->req, c->buf + c->pos, left, name, &stbuf_copy,
+                               off);
   }
 
   if (needed > left) {
@@ -126,15 +159,34 @@ static void ossfs2_init(void *userdata, struct fuse_conn_info *conn) {
     conn->want |= FUSE_CAP_PARALLEL_DIROPS;
   }
 
-  conn->want &= (~FUSE_CAP_READDIRPLUS_AUTO);
-  if (fuse_options.readdirplus && (conn->capable & FUSE_CAP_READDIRPLUS)) {
+  if (fuse_options.readdirplus != ReaddirplusMode::kOff &&
+      (conn->capable & FUSE_CAP_READDIRPLUS)) {
     conn->want |= FUSE_CAP_READDIRPLUS;
+    if (fuse_options.readdirplus == ReaddirplusMode::kAuto) {
+      conn->want |= FUSE_CAP_READDIRPLUS_AUTO;
+    } else {
+      conn->want &= ~FUSE_CAP_READDIRPLUS_AUTO;
+    }
   } else {
-    conn->want &= (~FUSE_CAP_READDIRPLUS);
+    conn->want &= ~(FUSE_CAP_READDIRPLUS | FUSE_CAP_READDIRPLUS_AUTO);
+  }
+
+  // Disable and let kernel handle internally.
+  conn->want &= ~FUSE_CAP_POSIX_LOCKS;
+  if (!fuse_options.enable_flock && (conn->capable & FUSE_CAP_FLOCK_LOCKS)) {
+    conn->want &= ~FUSE_CAP_FLOCK_LOCKS;
   }
 }
 
 static void ossfs2_destroy(void *userdata) {}
+
+static inline void common_reply_entry(fuse_req_t req,
+                                      struct fuse_entry_param *fe) {
+  if (fuse_reply_entry(req, fe) == -ENOENT && fe->ino != 0) {
+    LOG_INFO("reply_entry interrupted, forgetting inode `", fe->ino);
+    fuse_ll_fs->forget(fe->ino, 1);
+  }
+}
 
 static void ossfs2_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   LOG_DEBUG("LOOKUP. pid: `, parent: `, name: `", get_pid(req), parent, name);
@@ -144,9 +196,10 @@ static void ossfs2_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   memset(&fe, 0, sizeof(fe));
   int r = fuse_ll_fs->lookup(parent, name, &fe.ino, &fe.attr);
   if (r == 0) {
+    resolve_unresolved_uid_gid(req, &fe.attr);
     fe.attr_timeout = fuse_options.attr_timeout;
     fe.entry_timeout = fuse_options.entry_timeout;
-    fuse_reply_entry(req, &fe);
+    common_reply_entry(req, &fe);
   } else {
     // TODO: optimize for cases we want to return ENOENT immediately.
     if (r == -ENOENT && fuse_options.negative_timeout > 0) {
@@ -177,6 +230,7 @@ static void ossfs2_getattr(fuse_req_t req, fuse_ino_t ino,
   memset(&stbuf, 0, sizeof(stbuf));
   int r = fuse_ll_fs->getattr(ino, &stbuf);
   if (r == 0) {
+    resolve_unresolved_uid_gid(req, &stbuf);
     fuse_reply_attr(req, &stbuf, fuse_options.attr_timeout);
   } else {
     fuse_reply_err(req, -r);
@@ -188,12 +242,40 @@ static void ossfs2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
   LOG_DEBUG("SETATTR. pid: `, ino: `, to_set: `", get_pid(req), ino, to_set);
 
   DECLARE_METRIC_LATENCY(setattr, MetricsType::kFsMetrics);
-  int r = fuse_ll_fs->setattr(ino, attr, to_set);
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  int r = fuse_ll_fs->setattr(ino, attr, to_set, fi, ctx->uid, ctx->gid);
   if (r == 0) {
+    resolve_unresolved_uid_gid(req, attr);
     fuse_reply_attr(req, attr, fuse_options.attr_timeout);
   } else {
     fuse_reply_err(req, -r);
   }
+}
+
+static void ossfs2_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
+                             off_t offset, off_t length,
+                             struct fuse_file_info *fi) {
+  LOG_DEBUG("FALLOCATE. pid: `, ino: `, mode: `, offset: `, length: `",
+            get_pid(req), ino, OCT(mode), offset, length);
+
+  DECLARE_METRIC_LATENCY(fallocate, MetricsType::kFsMetrics);
+
+  // Only support default mode (mode == 0), no flags.
+  if (mode != 0) {
+    LOG_WARN("fallocate mode ` not supported, ino: `", mode, ino);
+    fuse_reply_err(req, ENOTSUP);
+    return;
+  }
+
+  int r = fuse_ll_fs->fallocate(ino, offset, length, (void *)fi->fh);
+  if (r < 0) {
+    LOG_ERROR("fallocate failed, ino: `, offset: `, length: `, r: `", ino,
+              offset, length, r);
+    fuse_reply_err(req, -r);
+    return;
+  }
+
+  fuse_reply_err(req, 0);
 }
 
 static void ossfs2_readlink(fuse_req_t req, fuse_ino_t ino) {
@@ -214,18 +296,43 @@ static void ossfs2_readlink(fuse_req_t req, fuse_ino_t ino) {
 static void ossfs2_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
                          mode_t mode) {
   LOG_DEBUG("MKDIR. pid: `, parent: `, name: `, mode: `", get_pid(req), parent,
-            name, mode);
+            name, OCT(mode));
 
   DECLARE_METRIC_LATENCY(mkdir, MetricsType::kFsMetrics);
   struct fuse_entry_param fe;
   memset(&fe, 0, sizeof(fe));
-  // uid, gid, umask, mode are not supported actually.
-  int r = fuse_ll_fs->mkdir(parent, name, mode, 0, 0, 0, &fe.ino, &fe.attr);
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  int r = fuse_ll_fs->mkdir(parent, name, mode, ctx->uid, ctx->gid, ctx->umask,
+                            &fe.ino, &fe.attr);
 
   if (r == 0) {
+    resolve_unresolved_uid_gid(req, &fe.attr);
     fe.attr_timeout = fuse_options.attr_timeout;
     fe.entry_timeout = fuse_options.entry_timeout;
-    fuse_reply_entry(req, &fe);
+    common_reply_entry(req, &fe);
+  } else {
+    fuse_reply_err(req, -r);
+  }
+}
+
+static void ossfs2_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
+                         mode_t mode, dev_t rdev) {
+  LOG_DEBUG("MKNOD. pid: `, parent: `, name: `, mode: 0o`, rdev: `",
+            get_pid(req), parent, name, OCT(mode), rdev);
+
+  DECLARE_METRIC_LATENCY(mknod, MetricsType::kFsMetrics);
+  struct fuse_entry_param fe;
+  memset(&fe, 0, sizeof(fe));
+
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  int r = fuse_ll_fs->mknod(parent, name, mode, ctx->uid, ctx->gid, &fe.ino,
+                            &fe.attr);
+
+  if (r == 0) {
+    resolve_unresolved_uid_gid(req, &fe.attr);
+    fe.attr_timeout = fuse_options.attr_timeout;
+    fe.entry_timeout = fuse_options.entry_timeout;
+    common_reply_entry(req, &fe);
   } else {
     fuse_reply_err(req, -r);
   }
@@ -235,7 +342,8 @@ static void ossfs2_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
   LOG_DEBUG("UNLINK. pid: `, parent: `, name: `", get_pid(req), parent, name);
 
   DECLARE_METRIC_LATENCY(unlink, MetricsType::kFsMetrics);
-  int r = fuse_ll_fs->unlink(parent, name);
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  int r = fuse_ll_fs->unlink(parent, name, ctx->uid, ctx->gid);
   fuse_reply_err(req, -r);
 }
 
@@ -255,11 +363,14 @@ static void ossfs2_symlink(fuse_req_t req, const char *link, fuse_ino_t parent,
   DECLARE_METRIC_LATENCY(symlink, MetricsType::kFsMetrics);
   struct fuse_entry_param fe;
   memset(&fe, 0, sizeof(fe));
-  int r = fuse_ll_fs->symlink(parent, name, link, 0, 0, &fe.ino, &fe.attr);
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  int r = fuse_ll_fs->symlink(parent, name, link, ctx->uid, ctx->gid, &fe.ino,
+                              &fe.attr);
   if (r == 0) {
+    resolve_unresolved_uid_gid(req, &fe.attr);
     fe.attr_timeout = fuse_options.attr_timeout;
     fe.entry_timeout = fuse_options.entry_timeout;
-    fuse_reply_entry(req, &fe);
+    common_reply_entry(req, &fe);
   } else {
     fuse_reply_err(req, -r);
   }
@@ -280,7 +391,7 @@ static void ossfs2_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
 static void ossfs2_create(fuse_req_t req, fuse_ino_t parent, const char *name,
                           mode_t mode, struct fuse_file_info *fi) {
   LOG_DEBUG("CREATE. pid: `, parent: `, name: `, mode: ` flags: `",
-            get_pid(req), parent, name, mode, fi->flags);
+            get_pid(req), parent, name, OCT(mode), fi->flags);
 
   DECLARE_METRIC_LATENCY(create, MetricsType::kFsMetrics);
   struct fuse_entry_param fe;
@@ -288,15 +399,18 @@ static void ossfs2_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 
   void *fh = nullptr;
 
-  // Ignore uid, gid and umask.
-  int r = fuse_ll_fs->creat(parent, name, fi->flags, mode, 0, 0, 0, &fe.ino,
-                            &fe.attr, &fh);
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  int r = fuse_ll_fs->creat(parent, name, fi->flags, mode, ctx->uid, ctx->gid,
+                            ctx->umask, &fe.ino, &fe.attr, &fh);
   if (r == 0) {
+    resolve_unresolved_uid_gid(req, &fe.attr);
     fi->fh = reinterpret_cast<uint64_t>(fh);
     if (fuse_reply_create(req, &fe, fi) == -ENOENT) {
-      // -ENOENT means that the request was interrupted.
-      LOG_ERROR("Fail to reply create request with parent: `, name: `", parent,
-                name);
+      // Interrupted: release fh and forget inode since kernel won't.
+      LOG_INFO("create interrupted, releasing fh and forgetting inode `",
+               fe.ino);
+      fuse_ll_fs->release(fe.ino, fh);
+      fuse_ll_fs->forget(fe.ino, 1);
     }
   } else {
     fuse_reply_err(req, -r);
@@ -320,8 +434,9 @@ static void ossfs2_open(fuse_req_t req, fuse_ino_t ino,
   if (r == 0) {
     fi->fh = reinterpret_cast<uint64_t>(fh);
     if (fuse_reply_open(req, fi) == -ENOENT) {
-      // -ENOENT means that the request was interrupted.
-      LOG_ERROR("Fail to reply open request with ino: `", ino);
+      // Interrupted: release fh since kernel won't send a release request.
+      LOG_INFO("open interrupted, releasing fh for ino: `", ino);
+      fuse_ll_fs->release(ino, fh);
     }
   } else {
     fuse_reply_err(req, -r);
@@ -388,10 +503,10 @@ static void ossfs2_flush(fuse_req_t req, fuse_ino_t ino,
   }
 
   int r = fuse_ll_fs->flush(ino, (void *)fi->fh);
-  if (r == 0) {
-    fuse_reply_err(req, 0);
-  } else {
+  if (r < 0) {
     fuse_reply_err(req, -r);
+  } else {
+    fuse_reply_err(req, 0);
   }
 }
 
@@ -437,8 +552,9 @@ static void ossfs2_opendir(fuse_req_t req, fuse_ino_t ino,
   }
 
   if (fuse_reply_open(req, fi) == -ENOENT) {
-    // -ENOENT means that the request was interrupted.
-    LOG_ERROR("Fail to reply open request with ino: `", ino);
+    // Interrupted: release dir handle since kernel won't send releasedir.
+    LOG_INFO("opendir interrupted, releasing dir handle for ino: `", ino);
+    fuse_ll_fs->releasedir(ino, reinterpret_cast<void *>(fi->fh));
   }
 }
 
@@ -503,7 +619,101 @@ static void ossfs2_statfs(fuse_req_t req, fuse_ino_t ino) {
 
 static void ossfs2_access(fuse_req_t req, fuse_ino_t ino, int mask) {
   DECLARE_METRIC_LATENCY(access, MetricsType::kFsMetrics);
-  fuse_reply_err(req, 0);
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
+  int r = fuse_ll_fs->access(ino, mask, ctx->uid, ctx->gid);
+  if (r < 0) {
+    fuse_reply_err(req, -r);
+  } else {
+    fuse_reply_err(req, 0);
+  }
+}
+
+static void ossfs2_flock(fuse_req_t req, fuse_ino_t ino,
+                         struct fuse_file_info *fi, int op) {
+  LOG_DEBUG("FLOCK. pid: `, ino: `, op: `", get_pid(req), ino, op);
+
+  DECLARE_METRIC_LATENCY(flock, MetricsType::kFsMetrics);
+  int r = fuse_ll_fs->flock(ino, (void *)fi->fh, op, fi->lock_owner);
+  if (r < 0) {
+    fuse_reply_err(req, -r);
+  } else {
+    fuse_reply_err(req, 0);
+  }
+}
+
+static void ossfs2_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+                            const char *value, size_t size, int flags) {
+  LOG_DEBUG("SETXATTR. pid: `, ino: `, name: `, size: `", get_pid(req), ino,
+            name, size);
+
+  DECLARE_METRIC_LATENCY(setxattr, MetricsType::kFsMetrics);
+  int r = fuse_ll_fs->setxattr(ino, name, value, size, flags);
+  if (r < 0) {
+    fuse_reply_err(req, -r);
+  } else {
+    fuse_reply_err(req, 0);
+  }
+}
+
+static void ossfs2_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+                            size_t size) {
+  LOG_DEBUG("GETXATTR. pid: `, ino: `, name: `, size: `", get_pid(req), ino,
+            name, size);
+
+  DECLARE_METRIC_LATENCY(getxattr, MetricsType::kFsMetrics);
+  if (size) {
+    char *value = new char[size];
+    DEFER(delete[] value);
+    int r = fuse_ll_fs->getxattr(ino, name, value, size);
+    if (r < 0) {
+      fuse_reply_err(req, -r);
+    } else {
+      fuse_reply_buf(req, value, r);
+    }
+  } else {
+    int r = fuse_ll_fs->getxattr(ino, name, nullptr, 0);
+    if (r < 0) {
+      fuse_reply_err(req, -r);
+    } else {
+      fuse_reply_xattr(req, r);
+    }
+  }
+}
+
+static void ossfs2_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
+  LOG_DEBUG("LISTXATTR. pid: `, ino: `, size: `", get_pid(req), ino, size);
+
+  DECLARE_METRIC_LATENCY(listxattr, MetricsType::kFsMetrics);
+  if (size) {
+    char *list = new char[size];
+    DEFER(delete[] list);
+    int r = fuse_ll_fs->listxattr(ino, list, size);
+    if (r < 0) {
+      fuse_reply_err(req, -r);
+    } else {
+      fuse_reply_buf(req, list, r);
+    }
+  } else {
+    int r = fuse_ll_fs->listxattr(ino, nullptr, 0);
+    if (r < 0) {
+      fuse_reply_err(req, -r);
+    } else {
+      fuse_reply_xattr(req, r);
+    }
+  }
+}
+
+static void ossfs2_removexattr(fuse_req_t req, fuse_ino_t ino,
+                               const char *name) {
+  LOG_DEBUG("REMOVEXATTR. pid: `, ino: `, name: `", get_pid(req), ino, name);
+
+  DECLARE_METRIC_LATENCY(removexattr, MetricsType::kFsMetrics);
+  int r = fuse_ll_fs->removexattr(ino, name);
+  if (r < 0) {
+    fuse_reply_err(req, -r);
+  } else {
+    fuse_reply_err(req, 0);
+  }
 }
 
 struct fuse_lowlevel_ops fuse_ll_ops = {
@@ -514,7 +724,7 @@ struct fuse_lowlevel_ops fuse_ll_ops = {
     .getattr = ossfs2_getattr,
     .setattr = ossfs2_setattr,
     .readlink = ossfs2_readlink,
-    .mknod = nullptr,
+    .mknod = ossfs2_mknod,
     .mkdir = ossfs2_mkdir,
     .unlink = ossfs2_unlink,
     .rmdir = ossfs2_rmdir,
@@ -547,7 +757,7 @@ struct fuse_lowlevel_ops fuse_ll_ops = {
     .retrieve_reply = nullptr,
     .forget_multi = nullptr,
     .flock = nullptr,
-    .fallocate = nullptr,
+    .fallocate = ossfs2_fallocate,
     .readdirplus = ossfs2_readdirplus,
     .copy_file_range = nullptr,
     .lseek = nullptr,
@@ -556,6 +766,14 @@ struct fuse_lowlevel_ops fuse_ll_ops = {
 struct fuse_lowlevel_ops *get_fuse_ll_oper() {
   return &fuse_ll_ops;
 };
+
+void enable_fuse_ll_xattr_and_lock() {
+  fuse_ll_ops.setxattr = ossfs2_setxattr;
+  fuse_ll_ops.getxattr = ossfs2_getxattr;
+  fuse_ll_ops.listxattr = ossfs2_listxattr;
+  fuse_ll_ops.removexattr = ossfs2_removexattr;
+  fuse_ll_ops.flock = ossfs2_flock;
+}
 
 static void do_fuse_loop(fuse_session *se) {
   struct fuse_buf fbuf;

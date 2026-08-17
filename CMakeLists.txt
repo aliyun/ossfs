@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 
-project(ossfs2 VERSION 2.0.8)
+project(ossfs2 VERSION 2.0.9)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 include(FindPackageHandleStandardArgs)
@@ -143,7 +143,8 @@ include_directories(
   ${GFLAGS_INCLUDE_DIRS}
   ${CLI11_INCLUDE_DIRS}
   ${AIO_INCLUDE_DIRS}
-  ${CITYHASH_INCLUDE_DIRS})
+  ${CITYHASH_INCLUDE_DIRS}
+  ${JINDOSDK_INCLUDE_DIRS})
 
 file(GLOB_RECURSE ossfs2_common_srcs RELATIVE "${PROJECT_SOURCE_DIR}"
   src/common/*.cpp
@@ -155,7 +156,8 @@ file(GLOB_RECURSE ossfs2_common_srcs RELATIVE "${PROJECT_SOURCE_DIR}"
 
 file(GLOB_RECURSE ossfs2_test_srcs RELATIVE "${PROJECT_SOURCE_DIR}"
   src/common/test/*.cpp
-  src/fs/test/*.cpp)
+  src/fs/test/*.cpp
+  src/fs/test/hdfs/*.cpp)
 
 list(REMOVE_ITEM ossfs2_common_srcs ${ossfs2_test_srcs})
 
@@ -173,7 +175,7 @@ target_sources(ossfs2_common PRIVATE
 )
 include_directories(${PHOTON_PATCHED_SRC_DIR}/ecosystem)
 
-add_dependencies(ossfs2_common libfuse PhotonLibOS photon_patched)
+add_dependencies(ossfs2_common libfuse PhotonLibOS photon_patched JindoSDK)
 if (actually_built)
   add_dependencies(ossfs2_common ${actually_built})
 endif ()
@@ -188,8 +190,11 @@ add_executable(ossfs2 ${ossfs2_srcs})
 set(OSSFS2_RPATH "/usr/local/lib64/ossfs2")
 set(COMMON_RPATH "/usr/lib:/usr/lib64:/usr/local/lib:/usr/local/lib64")
 get_filename_component(LIBFUSE_LIB_DIR ${LIBFUSE_LIBRARIES} DIRECTORY)
+get_filename_component(JINDOSDK_LIB_DIR ${JINDOSDK_LIBRARIES} DIRECTORY)
+get_filename_component(JINDOSDK_PARENT_DIR ${JINDOSDK_LIB_DIR} DIRECTORY)
+get_filename_component(JINDOSDK_DIR_NAME ${JINDOSDK_PARENT_DIR} NAME)
 set_target_properties(ossfs2 PROPERTIES
-  BUILD_RPATH "$ORIGIN:${LIBFUSE_LIB_DIR}:${OSSFS2_RPATH}:${COMMON_RPATH}"
+  BUILD_RPATH "$ORIGIN:${LIBFUSE_LIB_DIR}:${JINDOSDK_LIB_DIR}:$ORIGIN/${JINDOSDK_DIR_NAME}/lib:${OSSFS2_RPATH}:${COMMON_RPATH}"
   INSTALL_RPATH "$ORIGIN:${OSSFS2_RPATH}:${COMMON_RPATH}")
 
 target_compile_definitions(ossfs2 PRIVATE
@@ -212,6 +217,18 @@ endif()
 install(TARGETS ossfs2 RUNTIME DESTINATION /usr/local/bin COMPONENT main)
 install(FILES ${LIBFUSE_LIBRARIES} DESTINATION /usr/local/lib64/ossfs2/
         RENAME libfuse3.so.3 COMPONENT main)
+
+# Install JindoSDK shared library.
+# Use execute_process with cp to follow symlinks and install the real file,
+# avoiding a self-referencing symlink when install(FILES RENAME) target
+# matches an intermediate symlink name (libjindosdk_c.so -> .so.6 -> .so.6.10.4).
+install(CODE "
+  execute_process(COMMAND \${CMAKE_COMMAND} -E make_directory
+    \"\$ENV{DESTDIR}/usr/local/lib64/ossfs2\")
+  execute_process(COMMAND cp
+    \"${JINDOSDK_LIBRARIES}\"
+    \"\$ENV{DESTDIR}/usr/local/lib64/ossfs2/libjindosdk_c.so.6\")
+" COMPONENT main)
 
 add_custom_command(
   OUTPUT ${CMAKE_BINARY_DIR}/mount.ossfs2
@@ -236,12 +253,13 @@ if (ENABLE_TESTING)
 
   file(GLOB ossfs2_test_srcs RELATIVE "${PROJECT_SOURCE_DIR}" 
     src/fs/test/*.cpp
+    src/fs/test/hdfs/*.cpp
     src/common/test/*.cpp)
 
   add_executable(ossfs2-test ${ossfs2_test_srcs})
 
   set_target_properties(ossfs2-test PROPERTIES
-    BUILD_RPATH "$ORIGIN:${LIBFUSE_LIB_DIR}")
+    BUILD_RPATH "$ORIGIN:${LIBFUSE_LIB_DIR}:${JINDOSDK_LIB_DIR}:$ORIGIN/${JINDOSDK_DIR_NAME}/lib")
   target_link_libraries(ossfs2-test ossfs2_common ${test_static_deps} 
     ${LIBFUSE_LIBRARIES} rt dl pthread -static-libgcc -static-libstdc++)
 endif()

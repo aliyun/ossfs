@@ -1,13 +1,13 @@
 set(PRE_BUILT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/pre-built)
 
 # process PhotonLibOS
-set(PHOTONLIBOS_REF 2bebdafb CACHE STRING "PhotonLibOS git ref" FORCE)
+set(PHOTONLIBOS_REF 212595e4 CACHE STRING "PhotonLibOS git ref" FORCE)
 if (${ARCH} STREQUAL x86_64)
   set(PHOTONLIBOS_URL file://${PRE_BUILT_DIR}/PhotonLibOS/PhotonLibOS-${PHOTONLIBOS_REF}-linux-x86_64.tar.gz)
-  set(PHOTONLIBOS_HASH MD5=9e682eebd50055cf9b27d77cf6c57200)
+  set(PHOTONLIBOS_HASH MD5=5f9059988077400cc7b77fe27a4f88b5)
 elseif (${ARCH} STREQUAL aarch64)
   set(PHOTONLIBOS_URL file://${PRE_BUILT_DIR}/PhotonLibOS/PhotonLibOS-${PHOTONLIBOS_REF}-linux-aarch64.tar.gz)
-  set(PHOTONLIBOS_HASH MD5=5e0614ab3f6413048c6ba3ea7acb8930)
+  set(PHOTONLIBOS_HASH MD5=f991b50cdf4459db1c3154253422f11c)
 endif ()
 
 ExternalProject_Add(PhotonLibOS
@@ -60,3 +60,26 @@ ExternalProject_Add(CLI11
 )
 
 set(CLI11_INCLUDE_DIRS ${CMAKE_BINARY_DIR}/CLI11-2.4.1/include PARENT_SCOPE)
+
+# process JindoSDK
+set(JINDOSDK_VERSION 6.10.4)
+if (${ARCH} STREQUAL x86_64)
+  set(JINDOSDK_URL file://${PRE_BUILT_DIR}/JindoSDK/jindosdk-${JINDOSDK_VERSION}-linux-x86_64.tar.gz)
+  set(JINDOSDK_HASH MD5=e9fbcbef0ac433e5db8d2c98bb39b562)
+elseif (${ARCH} STREQUAL aarch64)
+  set(JINDOSDK_URL file://${PRE_BUILT_DIR}/JindoSDK/jindosdk-${JINDOSDK_VERSION}-linux-aarch64.tar.gz)
+  set(JINDOSDK_HASH MD5=df807c22f9893b9e38743ccfb1dc5988)
+endif ()
+
+ExternalProject_Add(JindoSDK
+  SOURCE_DIR ${CMAKE_BINARY_DIR}/jindosdk-${JINDOSDK_VERSION}-linux
+  URL ${JINDOSDK_URL}
+  URL_HASH ${JINDOSDK_HASH}
+  CONFIGURE_COMMAND ""
+  BUILD_COMMAND ""
+  UPDATE_COMMAND ""
+  INSTALL_COMMAND ""
+)
+
+set(JINDOSDK_INCLUDE_DIRS ${CMAKE_BINARY_DIR}/jindosdk-${JINDOSDK_VERSION}-linux/include PARENT_SCOPE)
+set(JINDOSDK_LIBRARIES ${CMAKE_BINARY_DIR}/jindosdk-${JINDOSDK_VERSION}-linux/lib/libjindosdk_c.so PARENT_SCOPE)

@@ -19,41 +19,40 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include "common/filesystem.h"
+
 namespace OssFileSystem {
+
+static constexpr size_t kDefaultDirSize = 4096;
 
 bool Inode::can_be_invalidated() const {
   return lookup_cnt == 0 && ref_ctr == 0;
 }
 
-void Inode::update_attr(uint64_t file_size, struct timespec file_mtime) {
-  // No need to update dir attr.
-  if (is_dir()) {
-    return;
-  }
+void Inode::update_attr(uint64_t file_size, struct timespec file_mtime,
+                        struct timespec file_atime) {
+  if (is_dir()) return;
 
   attr.size = file_size;
   attr.mtime = file_mtime;
-
+  if (file_atime.tv_sec != 0) {
+    set_atime(file_atime);
+  }
   attr_time = time(nullptr);
 }
 
 void Inode::fill_statbuf(struct stat *stbuf) const {
   stbuf->st_ino = nodeid;
-  stbuf->st_mode = Attribute::get_mode(type);
-  if (nodeid == kMountPointNodeId) {
-    stbuf->st_nlink = 2;
-  } else {
-    stbuf->st_nlink = 1;
-  }
-  stbuf->st_uid = Attribute::DEFAULT_UID;
-  stbuf->st_gid = Attribute::DEFAULT_GID;
+  stbuf->st_mode = get_mode();
+  stbuf->st_uid = get_uid();
+  stbuf->st_gid = get_gid();
+
+  stbuf->st_nlink = S_ISDIR(stbuf->st_mode) ? 2 : 1;
+  stbuf->st_size = S_ISDIR(stbuf->st_mode) ? kDefaultDirSize : attr.size;
   stbuf->st_mtim = attr.mtime;
-  stbuf->st_size = attr.size;
-
-  stbuf->st_atim = stbuf->st_mtim;
+  stbuf->st_atim = get_atime();
   stbuf->st_ctim = stbuf->st_mtim;
-
-  stbuf->st_blksize = 4096;
+  stbuf->st_blksize = Attribute::DEFAULT_BLKSIZE;
   stbuf->st_blocks = stbuf->st_size >> 9;
 }
 
@@ -117,7 +116,6 @@ void DirInode::add_child_node_directly(Inode *inode) {
   children.emplace(inode->name, inode);
 }
 
-// Protected by inodes_map_lck_.
 bool DirInode::can_be_invalidated() const {
   // When we use drop_cache to evict inodes, parent_inode's forget may come
   // earlier than its descendants' forget. Therefore we need to check if
@@ -131,12 +129,11 @@ bool DirInode::is_dir_empty(std::string *child_name) const {
   // and then becomes stale, so it may return false for an empty dir,
   // but it will never return true for a non-empty dir.
   for (auto &child : children) {
-    if (!(child.second->is_stale)) {
+    if (!child.second->is_stale) {
       if (child_name) child_name->assign(child.second->name);
       return false;
     }
   }
-
   return true;
 }
 
@@ -153,10 +150,7 @@ Inode *DirInode::find_child_node(std::string_view name) const {
 // all of the keys in children are valid.
 void DirInode::erase_child_node(std::string_view name, const uint64_t nodeid) {
   auto iter = children.find(name);
-  if (iter == children.end() || iter->second->nodeid != nodeid) {
-    return;
-  }
-
+  if (iter == children.end() || iter->second->nodeid != nodeid) return;
   children.erase(iter);
 }
 

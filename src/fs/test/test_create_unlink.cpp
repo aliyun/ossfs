@@ -205,11 +205,13 @@ TEST_F(Ossfs2CreateUnlinkTest, verify_basic_create_unlink_files) {
   INIT_PHOTON();
 
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_basic_create_unlink_files();
 }
 
 TEST_F(Ossfs2CreateUnlinkTest, verify_unlink_dirty_file) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -219,6 +221,7 @@ TEST_F(Ossfs2CreateUnlinkTest, verify_unlink_dirty_file) {
 TEST_F(Ossfs2CreateUnlinkTest, verify_unlink_rmdir) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_unlink_rmdir();
 }

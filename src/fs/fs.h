@@ -36,29 +36,42 @@
 #include "staged_inode_cache.h"
 #include "test/class_declarations.h"
 
-// Call obj_store's methods in background threads.
-#define PERFORM_BACKGROUND_OBJ_REQUEST(__fs, __func, ...)              \
-  ({                                                                   \
-    auto __bg_env_ctx =                                                \
-        __fs->bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next(); \
-    auto __r = __bg_env_ctx.executor->perform([&]() {                  \
-      IObjStore *__c = __bg_env_ctx.obj_store;                         \
-      return __c->__func(__VA_ARGS__);                                 \
-    });                                                                \
-    __r;                                                               \
+// Call obj_store's methods in background threads (OSS) or directly in the
+// current thread (HDFS, since HDFS SDK manages its own thread pool).
+#define PERFORM_BACKGROUND_OBJ_REQUEST(__fs, __func, ...)                   \
+  ({                                                                        \
+    auto __r = (__fs)->bypass_executor()                                    \
+                   ? (__fs)->get_obj_store_direct()->__func(__VA_ARGS__)    \
+                   : [&]() {                                                \
+                       auto __bg_env_ctx =                                  \
+                           (__fs)                                           \
+                               ->bg_vcpu_env()                              \
+                               .bg_obj_store_env->get_obj_store_env_next(); \
+                       return __bg_env_ctx.executor->perform([&]() {        \
+                         IObjStore *__c = __bg_env_ctx.obj_store;           \
+                         return __c->__func(__VA_ARGS__);                   \
+                       });                                                  \
+                     }();                                                   \
+    __r;                                                                    \
   })
 
 // Call common functions which use obj_store pointer as the first argument
-// in background threads.
-#define GET_BACKGROUND_OBJ_STORE_AND_PERFORM(__fs, __func, ...)        \
-  ({                                                                   \
-    auto __bg_env_ctx =                                                \
-        __fs->bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next(); \
-    auto __r = __bg_env_ctx.executor->perform([&]() {                  \
-      IObjStore *__c = __bg_env_ctx.obj_store;                         \
-      return __func(__c, __VA_ARGS__);                                 \
-    });                                                                \
-    __r;                                                               \
+// in background threads (OSS) or directly in the current thread (HDFS).
+#define GET_BACKGROUND_OBJ_STORE_AND_PERFORM(__fs, __func, ...)             \
+  ({                                                                        \
+    auto __r = (__fs)->bypass_executor()                                    \
+                   ? __func((__fs)->get_obj_store_direct(), __VA_ARGS__)    \
+                   : [&]() {                                                \
+                       auto __bg_env_ctx =                                  \
+                           (__fs)                                           \
+                               ->bg_vcpu_env()                              \
+                               .bg_obj_store_env->get_obj_store_env_next(); \
+                       return __bg_env_ctx.executor->perform([&]() {        \
+                         IObjStore *__c = __bg_env_ctx.obj_store;           \
+                         return __func(__c, __VA_ARGS__);                   \
+                       });                                                  \
+                     }();                                                   \
+    __r;                                                                    \
   })
 
 #define AUTO_USLEEP(us)                                           \
@@ -78,11 +91,26 @@ enum class CacheType : uint8_t {
   kDiskCache = 1,
 };
 
+// How writes are persisted to OSS. The three modes are mutually exclusive and
+// derived from configuration (temp_dir / enable_appendable_object).
+enum class WriteMode : uint8_t {
+  // Streaming: buffer and upload the whole object (MultipartUpload/PutObject).
+  Streaming = 0,
+  // Appendable: use AppendObject to append data incrementally.
+  Appendable = 1,
+  // Random: stage data on local disk (temp_dir) to support random writes.
+  Random = 2,
+};
+
 struct OssFsOptions {
   static int apply_mem_limit(OssFsOptions *fs_options, uint64_t total_mem_limit,
                              double rw_ratio);
 
+  static int validate_random_write(const OssFsOptions &opts);
+
   CacheType cache_type = CacheType::kFhCache;
+  IObjStore::StorageBackend storage_backend = IObjStore::StorageBackend::kOSS;
+
   bool share_fd_read_buffer = false;
   uint64_t cache_refill_unit = 1024 * 1024;
   uint64_t cache_block_size = 1048576;
@@ -105,6 +133,12 @@ struct OssFsOptions {
 
   bool enable_appendable_object = false;
   uint64_t appendable_object_autoswitch_threshold = 128 * 1024 * 1024;
+
+  // ── Random write (disk-staged) ──
+  std::string temp_dir;
+  uint64_t random_write_chunk_size = 2 * 1024 * 1024;
+  uint64_t random_write_max_file_size = 100ULL * 1024 * 1024 * 1024;  // 100 GiB
+  uint64_t temp_dir_free_bytes = 1ULL * 1024 * 1024 * 1024;           // 1 GiB
 
   uint32_t readdir_remember_count = 100;
   int64_t kernel_readdir_cache_timeout = 0;
@@ -138,6 +172,14 @@ struct OssFsOptions {
 
   bool enable_admin_server = true;
   bool enable_symlink = false;
+  bool enable_xattr = true;
+  // Explicitly set_owner on HDFS after create/mkdir/mknod. Default off.
+  bool hdfs_set_owner_on_create = false;
+
+  // Normalized Mount point path(e.g., "/mnt/ossfs"), used to convert absolute
+  // symlink targets to mount-internal relative paths. It could be empty when
+  // mount with fuse device fd.
+  std::string mountpoint;
 
   uint64_t mempool_purge_interval_ms = 5000;
 };
@@ -154,12 +196,15 @@ class OssFs : public IFileSystemFuseLL {
              struct stat *stbuf) override;
   int forget(uint64_t nodeid, uint64_t nlookup) override;
   int getattr(uint64_t nodeid, struct stat *stbuf) override;
-  int setattr(uint64_t nodeid, struct stat *stbuf, int to_set) override;
+  int setattr(uint64_t nodeid, struct stat *stbuf, int to_set,
+              struct fuse_file_info *fi = nullptr, uid_t caller_uid = 0,
+              gid_t caller_gid = 0) override;
   int statfs(struct statvfs *stbuf) override;
   int rename(uint64_t old_parent, std::string_view old_name,
              uint64_t new_parent, std::string_view new_name,
              unsigned int flags) override;
-  int unlink(uint64_t parent, std::string_view name) override;
+  int unlink(uint64_t parent, std::string_view name, uid_t caller_uid = 0,
+             gid_t caller_gid = 0) override;
 
   int open(uint64_t nodeid, int flags, void **fh,
            bool *keep_page_cache) override;
@@ -194,6 +239,20 @@ class OssFs : public IFileSystemFuseLL {
               struct stat *stbuf) override;
   ssize_t readlink(uint64_t nodeid, char *buf, size_t size) override;
 
+  int fallocate(uint64_t nodeid, off_t offset, off_t length, void *fh) override;
+
+  int mknod(uint64_t parent, std::string_view name, mode_t mode, uid_t uid,
+            gid_t gid, uint64_t *nodeid, struct stat *stbuf) override;
+
+  int flock(uint64_t nodeid, void *fh, int op, uint64_t lock_owner) override;
+
+  int setxattr(uint64_t nodeid, const char *name, const char *value,
+               size_t size, int flags) override;
+  int getxattr(uint64_t nodeid, const char *name, char *value,
+               size_t size) override;
+  int listxattr(uint64_t nodeid, char *list, size_t size) override;
+  int removexattr(uint64_t nodeid, const char *name) override;
+
   int get_one_list_results(std::string_view full_path,
                            std::vector<ObjDirent> &results,
                            std::string &marker);
@@ -202,8 +261,45 @@ class OssFs : public IFileSystemFuseLL {
     return options_.cache_type;
   }
 
+  IObjStore::StorageBackend get_backend_type() const {
+    return options_.storage_backend;
+  }
+
+  bool is_hdfs_mode() const {
+    return get_backend_type() == IObjStore::StorageBackend::kHDFS;
+  }
+
+  bool bypass_executor() const {
+    return is_hdfs_mode();
+  }
+
+  // Get objstore pointer for direct calls (HDFS bypasses executor).
+  IObjStore *get_obj_store_direct() {
+    return bg_vcpu_env_.bg_obj_store_env->obj_stores[0];
+  }
+
+  // Create file handle based on storage backend type
+  IFileHandleFuseLL *create_file_handle(const std::string &path,
+                                        FileInode *inode, int flags,
+                                        mode_t mode = 0777);
+
+  int access(uint64_t nodeid, int mask, uid_t caller_uid, gid_t caller_gid);
+
+  // Check permission via store's policy. Returns 0 if permitted.
+  int check_permission(PermOp op, Inode *inode, uid_t uid, gid_t gid);
+
   bool enable_prefetching() {
     return options_.prefetch_concurrency > 0;
+  }
+
+  static WriteMode compute_write_mode(const OssFsOptions &opts) {
+    if (!opts.temp_dir.empty()) return WriteMode::Random;
+    if (opts.enable_appendable_object) return WriteMode::Appendable;
+    return WriteMode::Streaming;
+  }
+
+  WriteMode write_mode() const {
+    return write_mode_;
   }
 
   std::shared_ptr<FixedBlockMemoryPool> get_download_buffers() {
@@ -212,6 +308,15 @@ class OssFs : public IFileSystemFuseLL {
 
   const OssFsOptions &get_options() const {
     return options_;
+  }
+
+  // Base multipart part size for random-write flush.
+  uint64_t random_write_base_part_size() const {
+    return random_write_base_part_size_;
+  }
+
+  BackgroundVCpuEnv &bg_vcpu_env() {
+    return bg_vcpu_env_;
   }
 
  private:
@@ -270,10 +375,14 @@ class OssFs : public IFileSystemFuseLL {
 
   int create_internal(uint64_t parent, std::string_view name, int flags,
                       uint64_t *nodeid, struct stat *stbuf, void **fh,
-                      InodeType type, std::string_view link);
+                      InodeType type, std::string_view link, mode_t mode,
+                      uid_t uid, gid_t gid);
 
   // readdir related
   void construct_inodes_if_needed(DirInode *parent_inode, OssDirHandle *dh);
+  // Mark local file children of a dir stale after a from-start listing
+  // confirmed the remote dir is empty; caller holds the parent's write lock.
+  void mark_ghost_children_stale(DirInode *parent_inode);
 
   int remember_inode_if_needed_with_fill(
       DirInode *parent_inode, const char *name, off_t offset, OssDirHandle *dh,
@@ -300,7 +409,9 @@ class OssFs : public IFileSystemFuseLL {
                    void *filler_ctx);
 
   void try_update_inode_attr_from_list(Inode *inode, struct stat *stbuf,
-                                       std::string_view remote_etag);
+                                       std::string_view remote_etag,
+                                       mode_t perm = 0, uid_t uid = 0,
+                                       gid_t gid = 0);
 
   std::shared_ptr<ICache> create_inode_cache();
   void evict_inode_cache(FileInode *inode);
@@ -310,10 +421,17 @@ class OssFs : public IFileSystemFuseLL {
   int truncate_inode_data(Inode *inode, std::string_view full_path,
                           size_t to_size);
 
+  int random_write_truncate(FileInode *inode, std::string_view full_path,
+                            uint64_t new_size);
+
+  // Requires the inode's wlock.
+  void resync_randwrite_remote_size(Inode *inode);
+
   Inode *create_new_inode(uint64_t file_nodeid, std::string_view file_name,
                           uint64_t file_size, struct timespec file_mtime,
                           InodeType type, bool is_dirty, uint64_t parent_nodeid,
-                          Inode *parent_node, std::string_view remote_etag);
+                          Inode *parent_node, std::string_view remote_etag,
+                          mode_t perm = 0, uid_t uid = 0, gid_t gid = 0);
 
   // Staged cache related
   bool enable_staged_cache() const {
@@ -345,12 +463,31 @@ class OssFs : public IFileSystemFuseLL {
                                   uint64_t &marked_cnt);
   void mark_inode_stale_if_needed(Inode *inode, bool recursively);
 
-  int rename_file(std::string_view oldpath, std::string_view newpath);
-  int rename_dir(std::string_view oldpath, std::string_view newpath);
+  int flush_dirty_inodes_for_rename(Inode *src_node, std::string_view src_path);
+  // Finish the rename after the caller holds the unique inode_lock of both
+  // parents and the unique inode_lock of src_node.
+  int do_rename_locked(DirInode *o_parent, DirInode *n_parent, Inode *src_node,
+                       std::string_view old_name, std::string_view new_name,
+                       uint64_t new_parent, std::string_view src_parent_path,
+                       std::string_view dst_parent_path, unsigned int flags);
+  // Caller must hold the unique inode_lock of the parent dir and src_node.
+  int hide_inode(DirInode *parent, Inode *src_node,
+                 std::string_view parent_path);
+  // Delete the object of a hidden inode whose last handle was closed, under
+  // the parent's and the inode's write locks, then mark the inode stale.
+  void delete_hidden_inode(FileInode *inode, std::string_view inode_path);
+  int rename_file(std::string_view oldpath, std::string_view newpath,
+                  bool dst_exists);
+  int rename_dir(std::string_view oldpath, std::string_view newpath,
+                 bool dst_exists);
+  int do_rename_dir(std::string_view oldpath, std::string_view newpath,
+                    bool dst_exists);
+  int rename_dir_copy_delete(std::string_view oldpath,
+                             std::string_view newpath);
   static void *do_rename_task(void *arg);
 
   uint64_t transmission_control();
-  void update_max_oss_rw_lat(uint64_t latency_us);
+  void update_max_refill_range_lat(uint64_t latency_us);
 
   std::vector<uint64_t> get_dirty_nodeids() {
     std::lock_guard<std::mutex> l(dirty_nodeids_lock_);
@@ -397,9 +534,61 @@ class OssFs : public IFileSystemFuseLL {
 
   void start_creds_refresher(std::promise<int> &result_promise);
   uint64_t refresh_creds();
-  std::pair<int, uint64_t> do_refresh_creds();
+  std::pair<int, uint64_t> do_refresh_creds(bool allow_auto_create = false);
   void update_creds(const ObjCredentials &creds);
-  int validate_creds(const ObjCredentials &creds);
+  int validate_creds(const ObjCredentials &creds,
+                     bool allow_auto_create = false);
+
+  void init_hdfs_root_inode();
+
+  // HDFS setattr family.
+  int hdfs_setattr(uint64_t nodeid, struct stat *stbuf, int to_set,
+                   struct fuse_file_info *fi, uid_t caller_uid,
+                   gid_t caller_gid);
+  int do_hdfs_setattr_mode(uint64_t nodeid, std::string_view path, mode_t mode,
+                           Inode *inode, uid_t caller_uid, gid_t caller_gid);
+  int do_hdfs_setattr_uid_gid(uint64_t nodeid, std::string_view path,
+                              const struct stat *stbuf, int to_set,
+                              Inode *inode, uid_t caller_uid, gid_t caller_gid);
+  int do_hdfs_setattr_times(Inode *inode, std::string_view path,
+                            const struct stat *stbuf, int to_set,
+                            uid_t caller_uid, gid_t caller_gid);
+  int do_hdfs_setattr_size(uint64_t nodeid, Inode *inode,
+                           std::string_view full_path, off_t target_size,
+                           uid_t caller_uid, gid_t caller_gid);
+  int do_hdfs_ftruncate(uint64_t nodeid, Inode *inode, off_t target_size,
+                        struct fuse_file_info *fi, uid_t caller_uid,
+                        gid_t caller_gid);
+
+  void staging_disk_usage_update(int64_t old_bytes, int64_t new_bytes) {
+    if (old_bytes < 0 || new_bytes < 0 || old_bytes == new_bytes) return;
+    if (new_bytes > old_bytes) {
+      staging_disk_usage_.fetch_add(new_bytes - old_bytes,
+                                    std::memory_order_relaxed);
+    } else {
+      // Clamp at 0 so the subtraction can never underflow the unsigned
+      // counter.
+      uint64_t delta = static_cast<uint64_t>(old_bytes - new_bytes);
+      uint64_t cur = staging_disk_usage_.load(std::memory_order_relaxed);
+      while (!staging_disk_usage_.compare_exchange_weak(
+          cur, cur > delta ? cur - delta : 0, std::memory_order_relaxed)) {
+      }
+    }
+  }
+
+  uint64_t staging_reserved_add(uint64_t bytes) {
+    return staging_reserved_bytes_.fetch_add(bytes) + bytes;
+  }
+
+  void staging_reserved_sub(uint64_t bytes) {
+    staging_reserved_bytes_.fetch_sub(bytes);
+  }
+
+  // Effective free bytes of the staging filesystem; a real fstatvfs runs at
+  // most once per staging_avail_refresh_ns_ to refresh the cache, and a
+  // concurrent caller hitting a stale cache runs its own fstatvfs without
+  // publishing. Returns 0 or -errno.
+  int staging_disk_avail(int staging_fd, uint64_t *avail_out);
 
   static inline constexpr uint64_t kMaxFsSize =
       std::numeric_limits<uint64_t>::max();  // 16 EB;
@@ -407,6 +596,8 @@ class OssFs : public IFileSystemFuseLL {
       std::numeric_limits<uint64_t>::max() / 1024;
 
   OssFsOptions options_;
+
+  const WriteMode write_mode_;
 
   BackgroundVCpuEnv bg_vcpu_env_;
 
@@ -439,8 +630,14 @@ class OssFs : public IFileSystemFuseLL {
   // for renaming directory
   std::unique_ptr<photon::semaphore> rename_sem_;
 
+  // Global seq for generating ".fuse_hiddenXXX" names in hide_inode.
+  std::atomic<uint32_t> hidden_inode_seq_ = ATOMIC_VAR_INIT(0);
+
   std::unique_ptr<FixedBlockMemoryPool> upload_buffers_;
   std::shared_ptr<FixedBlockMemoryPool> download_buffers_;
+
+  // Derived from upload_buffer_size at construction, aligned to chunk_size.
+  uint64_t random_write_base_part_size_ = 0;
 
   // tracking all the dirty inodes
   std::unordered_set<uint64_t> dirty_nodeids_;
@@ -448,7 +645,7 @@ class OssFs : public IFileSystemFuseLL {
 
   std::thread *transmission_control_th_ = nullptr;
   photon::spinlock tc_lock_;
-  uint64_t max_oss_rw_lat_us_ = 0;
+  uint64_t max_refill_range_lat_us_ = 0;
 
   std::thread *health_check_th_ = nullptr;
   std::thread *reverse_invalidate_th_ = nullptr;
@@ -460,13 +657,33 @@ class OssFs : public IFileSystemFuseLL {
   std::atomic<uint64_t> total_create_cnt_ = ATOMIC_VAR_INIT(0);
   std::atomic<uint64_t> active_file_handles_ = ATOMIC_VAR_INIT(0);
 
+  // Random-write staging disk usage, for health-check log and the avail-cache
+  // compensation in staging_disk_avail; memory_order_relaxed is OK.
+  std::atomic<uint64_t> staging_disk_usage_ = ATOMIC_VAR_INIT(0);
+
+  // Used for the random-write mode disk space check.
+  std::atomic<uint64_t> staging_reserved_bytes_ = ATOMIC_VAR_INIT(0);
+
+  // fstatvfs throttle interval; non-const so unit tests can override it.
+  uint64_t staging_avail_refresh_ns_ = 100 * 1000 * 1000;  // 100ms
+
+  // Cached disk-avail snapshot for the staging (temp_dir) filesystem.
+  photon::spinlock staging_avail_lock_;
+  uint64_t staging_avail_ts_ns_ = 0;  // monotonic time of last refresh
+  uint64_t staging_avail_bytes_ =
+      std::numeric_limits<uint64_t>::max();  // f_bavail*f_frsize at refresh
+  uint64_t staging_avail_usage_snap_ = 0;    // staging_disk_usage_ at refresh
+  std::atomic<bool> staging_avail_refreshing_ = ATOMIC_VAR_INIT(false);
+
   friend class OssWriter;
   friend class OssSeqWriter;
-  friend class OssNormalWriter;
+  friend class OssStreamingWriter;
   friend class OssAppendableWriter;
+  friend class OssRandomWriter;
   friend class OssCachedReader;
   friend class OssDirectReader;
   friend class OssFileHandle;
+  friend class HdfsFileHandle;
 
   template <typename T>
   friend class EnableFilePrefetching;

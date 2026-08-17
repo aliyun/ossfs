@@ -148,8 +148,10 @@ class BlockCacheStore : public ICacheStore {
   }
 
   // Drop all existing cache blocks by incrementing the generation number,
-  // which causes subsequent accesses to reload the data.
-  void drop() override {
+  // Blocks are not keyed by object key/etag, so parameters are unused;
+  // drop just bumps the generation to invalidate cached block refs.
+  void drop(std::string_view /* object_key */, std::string_view /* etag */,
+            size_t /* size */) override {
     increment_generation();
   }
 
@@ -276,7 +278,7 @@ class BlockCache : public ICache {
 
   // Get the cache instance and increase the reference count.
   CacheHandle *get(std::string_view name = "", std::string_view etag = "",
-                   off_t actual_size = 0) override;
+                   size_t size = 0) override;
 
   // Try to expand cache blocks by allocating 'count' blocks in buffer_pool_,
   // and the total number of blocks should not exceed 'max_capacity'

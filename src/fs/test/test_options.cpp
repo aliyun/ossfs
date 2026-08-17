@@ -147,3 +147,33 @@ TEST(OssFsOptionsTest, verify_memory_limit_adjustment) {
   options.memory_data_cache_size = 2ULL << 30;
   EXPECT_EQ(OssFsOptions::apply_mem_limit(&options, 4ULL << 30, 0.6), -EINVAL);
 }
+
+TEST(OssFsOptionsTest, verify_random_write_validation) {
+  OssFsOptions options;
+
+  // Random write disabled: nothing to validate.
+  options.temp_dir = "";
+  EXPECT_EQ(OssFsOptions::validate_random_write(options), 0);
+
+  options.temp_dir = "/tmp/ossfs2_rw";
+
+  // Default config (2 MiB chunk, 8 MiB part) is valid.
+  EXPECT_EQ(OssFsOptions::validate_random_write(options), 0);
+
+  // Mutually exclusive with appendable objects.
+  options.enable_appendable_object = true;
+  EXPECT_EQ(OssFsOptions::validate_random_write(options), -EINVAL);
+  options.enable_appendable_object = false;
+
+  // Unsupported on the HDFS backend (the FileInode write-state union slot
+  // aliases hdfs_dirty_count and rw_ctx).
+  options.storage_backend = IObjStore::StorageBackend::kHDFS;
+  EXPECT_EQ(OssFsOptions::validate_random_write(options), -EINVAL);
+  options.storage_backend = IObjStore::StorageBackend::kOSS;
+
+  // chunk_size > upload_buffer_size is allowed: the constructor aligns
+  // base_part_size up to chunk_size via align_up().
+  options.upload_buffer_size = 1ULL << 20;
+  options.random_write_chunk_size = 2ULL << 20;
+  EXPECT_EQ(OssFsOptions::validate_random_write(options), 0);
+}

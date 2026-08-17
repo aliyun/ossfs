@@ -477,6 +477,7 @@ class Ossfs2HttpProxyTest : public Ossfs2TestSuite {
 };
 
 TEST_F(Ossfs2HttpProxyTest, verify_invalid_proxy_connection_refused) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -484,6 +485,7 @@ TEST_F(Ossfs2HttpProxyTest, verify_invalid_proxy_connection_refused) {
 }
 
 TEST_F(Ossfs2HttpProxyTest, verify_invalid_proxy_malformed_url) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -491,6 +493,7 @@ TEST_F(Ossfs2HttpProxyTest, verify_invalid_proxy_malformed_url) {
 }
 
 TEST_F(Ossfs2HttpProxyTest, verify_valid_reverse_proxy_success) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -498,6 +501,7 @@ TEST_F(Ossfs2HttpProxyTest, verify_valid_reverse_proxy_success) {
 }
 
 TEST_F(Ossfs2HttpProxyTest, verify_proxy_file_operations) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -505,6 +509,7 @@ TEST_F(Ossfs2HttpProxyTest, verify_proxy_file_operations) {
 }
 
 TEST_F(Ossfs2HttpProxyTest, verify_proxy_timeout_behavior) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -512,6 +517,7 @@ TEST_F(Ossfs2HttpProxyTest, verify_proxy_timeout_behavior) {
 }
 
 TEST_F(Ossfs2HttpProxyTest, verify_compare_direct_vs_proxy) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -519,6 +525,7 @@ TEST_F(Ossfs2HttpProxyTest, verify_compare_direct_vs_proxy) {
 }
 
 TEST_F(Ossfs2HttpProxyTest, verify_filesystem_through_proxy) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   // Start reverse proxy
   auto [proxy_url, proxy_resources] = start_reverse_proxy(get_oss_url());

@@ -30,7 +30,7 @@ static const std::vector<std::string_view> mime_suffixes = {
     "wgz",  "wml",  "wmlc", "wmv",   "xhtml", "xls", "xml",  "xpi",     "zip",
 };
 
-class Ossfs2ObjectMetaTest : public Ossfs2TestSuite {
+class Ossfs2ObjectMetaTest : public OssOnlyTestSuite {
  protected:
   void verify_mime_type() {
     uint64_t parent = get_test_dir_parent();
@@ -192,6 +192,7 @@ TEST_F(Ossfs2ObjectMetaTest, verify_mime_type) {
   OssFsOptions opts;
   opts.upload_buffer_size = 1048576;
   opts.set_mime_for_rename_dst = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_mime_type();
 }
@@ -202,6 +203,7 @@ TEST_F(Ossfs2ObjectMetaTest, verify_mime_type_with_appendable_object) {
   opts.enable_appendable_object = true;
   opts.upload_buffer_size = 1048576;
   opts.set_mime_for_rename_dst = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_mime_type();
 }
@@ -209,6 +211,7 @@ TEST_F(Ossfs2ObjectMetaTest, verify_mime_type_with_appendable_object) {
 TEST_F(Ossfs2ObjectMetaTest, verify_meta_copy_without_set_mime) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_meta_copy_without_set_mime();
 }

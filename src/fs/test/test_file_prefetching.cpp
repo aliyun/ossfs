@@ -174,6 +174,7 @@ class Ossfs2PrefetchWindowTest : public Ossfs2TestSuite {
 };
 
 TEST_F(Ossfs2PrefetchWindowTest, verify_cached_reader_dynamic_max_window) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -182,6 +183,7 @@ TEST_F(Ossfs2PrefetchWindowTest, verify_cached_reader_dynamic_max_window) {
 
 TEST_F(Ossfs2PrefetchWindowTest,
        verify_cached_reader_dynamic_expansion_factor) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -189,8 +191,76 @@ TEST_F(Ossfs2PrefetchWindowTest,
 }
 
 TEST_F(Ossfs2PrefetchWindowTest, verify_prefetch_distance_threshold) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
   verify_prefetch_distance_threshold();
+}
+
+class Ossfs2PrefetchTest : public Ossfs2TestSuite {
+ protected:
+  void verify_bg_prefetch_etag_mismatch_not_cached() {
+    std::string filename = "prefetch_etag_check_file";
+    uint64_t parent = get_test_dir_parent();
+    ASSERT_GT(parent, 1ULL);
+    DEFER(fs_->forget(parent, 1));
+
+    const uint64_t kFileSizeMB = 1;
+    uint64_t file_size = kFileSizeMB * 1024 * 1024;
+
+    // Create a 1MB file
+    uint64_t nodeid = 0;
+    uint64_t crc =
+        create_file_in_folder(parent, filename, kFileSizeMB, nodeid, 0);
+    ASSERT_GT(crc, 0ULL);
+    DEFER(fs_->forget(nodeid, 1));
+
+    struct stat st;
+    ASSERT_EQ(fs_->getattr(nodeid, &st), 0);
+
+    // Open read-only to get a reader
+    void *handle = nullptr;
+    bool unused = false;
+    int r = fs_->open(nodeid, O_RDONLY, &handle, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(handle)));
+
+    auto oss_file = dynamic_cast<OssFileHandle *>(get_file_from_handle(handle));
+    ASSERT_NE(oss_file, nullptr);
+    auto reader = dynamic_cast<OssCachedReader *>(oss_file->reader_.get());
+    ASSERT_NE(reader, nullptr);
+    ASSERT_FALSE(reader->etag_.empty());
+
+    // Replace the remote object externally so its ETag no longer matches.
+    std::string local_file = join_paths(test_path_, filename + ".replaced");
+    create_random_file(local_file, kFileSizeMB * 2, 0);
+    auto parent_path = nodeid_to_path(parent);
+    ASSERT_EQ(upload_file(local_file, join_paths(parent_path, filename),
+                          FLAGS_oss_bucket_prefix),
+              0);
+
+    // Trigger bg_try_refill_range via background obj_store.
+    auto refill = [&](IObjStore *store, int) {
+      return reader->bg_try_refill_range(store, 0, file_size);
+    };
+    ssize_t ret = GET_BACKGROUND_OBJ_STORE_AND_PERFORM(fs_, refill, 0);
+
+    // ETag mismatch detected: returns -EIO.
+    ASSERT_EQ(ret, -EIO);
+
+    // Data must NOT have entered the cache.
+    auto miss = reader->cache_handle_->query_refill_range(0, file_size);
+    ASSERT_EQ(miss.first, 0);
+    ASSERT_EQ(miss.second, file_size);
+  }
+};
+
+TEST_F(Ossfs2PrefetchTest, verify_bg_prefetch_etag_mismatch_not_cached) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // ETag verification is random-write only
+  init(opts);
+  verify_bg_prefetch_etag_mismatch_not_cached();
 }

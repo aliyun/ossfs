@@ -55,9 +55,10 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     uint64_t file_nodeid1 = 0, file_nodeid2 = 0;
     std::thread task([&]() {
       int local_r = fs_->lookup(parent, filename.c_str(), &file_nodeid1, &st);
-      ASSERT_EQ(local_r, 0);
-      DEFER(fs_->forget(file_nodeid1, 1));
+      EXPECT_EQ(local_r, 0);
+      DEFER(if (file_nodeid1 != 0) fs_->forget(file_nodeid1, 1));
     });
+    DEFER(if (task.joinable()) task.join());
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
     g_fault_injector->clear_injection(
@@ -66,10 +67,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     r = fs_->lookup(parent, filename.c_str(), &file_nodeid2, &st);
     ASSERT_EQ(r, 0);
 
-    if (task.joinable()) {
-      task.join();
-    }
-
+    if (task.joinable()) task.join();
     ASSERT_EQ(file_nodeid1, file_nodeid2);
     DEFER(fs_->forget(file_nodeid2, 1));
 
@@ -191,6 +189,8 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     std::string local_file = join_paths(test_path_, "local_file");
     create_random_file(local_file, 3);
+    std::string new_local_file = join_paths(test_path_, "new_local_file");
+    create_random_file(new_local_file, 4);
     auto parent_path = nodeid_to_path(test_dir_nodeid);
     r = upload_file(local_file, join_paths(parent_path, "file-internal"),
                     FLAGS_oss_bucket_prefix);
@@ -203,19 +203,20 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     // 1. thread 1, lookup and get
     std::thread t1([&]() {
       int r1 = fs_->lookup(test_dir_nodeid, "file-internal", &nodeid1, &st1);
-      ASSERT_EQ(r1, 0);
+      EXPECT_EQ(r1, 0);
     });
+    DEFER(if (t1.joinable()) t1.join());
 
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     g_fault_injector->clear_injection(
         FaultInjectionId::FI_Lookup_Delay_After_Getting_Remote_attr);
-    create_random_file(local_file, 4);
-    r = upload_file(local_file, join_paths(parent_path, "file-internal"),
+    r = upload_file(new_local_file, join_paths(parent_path, "file-internal"),
                     FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
     r = fs_->lookup(test_dir_nodeid, "file-internal", &nodeid2, &st2);
     ASSERT_EQ(r, 0);
 
-    t1.join();
+    if (t1.joinable()) t1.join();
     ASSERT_EQ(nodeid1, nodeid2);
     ASSERT_EQ(st1.st_size, st2.st_size);
     ASSERT_EQ(st1.st_size, 4 << 20);
@@ -247,18 +248,20 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     std::thread t1([&]() {
       uint64_t new_nodeid;
       r = fs_->lookup(parent, file_name.c_str(), &new_nodeid, &stbuf);
-      ASSERT_EQ(r, 0);
+      EXPECT_EQ(r, 0);
+      if (r != 0) return;
 
-      ASSERT_NE(nodeid, new_nodeid);
+      EXPECT_NE(nodeid, new_nodeid);
       fs_->forget(new_nodeid, 1);
     });
+    DEFER(if (t1.joinable()) t1.join());
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
     r = fs_->unlink(parent, file_name.c_str());
     ASSERT_EQ(r, 0);
     fs_->forget(nodeid, 1);
 
-    t1.join();
+    if (t1.joinable()) t1.join();
     g_fault_injector->clear_injection(
         FaultInjectionId::FI_Lookup_Delay_After_Getting_Remote_attr);
 
@@ -292,8 +295,9 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     std::thread t3([&]() {
       uint64_t new_nodeid;
       r = fs_->lookup(parent, file_name_2.c_str(), &new_nodeid, &stbuf);
-      ASSERT_EQ(r, -ESTALE);
+      EXPECT_EQ(r, -ESTALE);
     });
+    DEFER(if (t3.joinable()) t3.join());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     r = fs_->unlink(parent, file_name_2.c_str());
@@ -310,8 +314,8 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     ASSERT_TRUE(fs_->global_inodes_map_.count(parent) > 0);
     ASSERT_TRUE(fs_->global_inodes_map_[parent]->is_stale);
     fs_->forget(parent, 1);
-    t3.join();
 
+    if (t3.joinable()) t3.join();
     g_fault_injector->clear_injection(
         FaultInjectionId::FI_Lookup_Delay_After_Getting_Remote_attr);
   }
@@ -709,12 +713,12 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     std::thread forget_thread([&](uint64_t id) { fs_->forget(id, 1); },
                               nodeid1);
+    DEFER(if (forget_thread.joinable()) forget_thread.join());
 
     r = fs_->rename(parent, "testfile2", parent, "testfile1", 0);
     ASSERT_EQ(r, 0);
 
-    forget_thread.join();
-
+    if (forget_thread.joinable()) forget_thread.join();
     ASSERT_TRUE(fs_->global_inodes_map_.find(nodeid1) ==
                 fs_->global_inodes_map_.end());
     ASSERT_TRUE(fs_->global_inodes_map_.find(nodeid2) !=
@@ -1549,6 +1553,7 @@ TEST_F(Ossfs2InodeTest, verify_lookup) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 0;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lookup();
 }
@@ -1558,6 +1563,7 @@ TEST_F(Ossfs2InodeTest, verify_lookup_stale_dirs_recursively) {
   OssFsOptions opts;
   opts.allow_mark_dir_stale_recursively = true;
   opts.allow_rename_dir = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lookup_stale_dirs_recursively();
 }
@@ -1565,6 +1571,7 @@ TEST_F(Ossfs2InodeTest, verify_lookup_stale_dirs_recursively) {
 TEST_F(Ossfs2InodeTest, verify_lookup_simultaneously) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lookup_simultaneously();
 }
@@ -1572,6 +1579,7 @@ TEST_F(Ossfs2InodeTest, verify_lookup_simultaneously) {
 TEST_F(Ossfs2InodeTest, verify_lookup_stale_inodes_while_req) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lookup_stale_inodes_while_req();
 }
@@ -1579,11 +1587,13 @@ TEST_F(Ossfs2InodeTest, verify_lookup_stale_inodes_while_req) {
 TEST_F(Ossfs2InodeTest, verify_stale_lookup) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lookup_getattr_update();
 }
 
 TEST_F(Ossfs2InodeTest, verify_getattr_stale_dir) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 0;
@@ -1595,6 +1605,7 @@ TEST_F(Ossfs2InodeTest, verify_getattr_stale_dir) {
 TEST_F(Ossfs2InodeTest, verify_stale_getattr) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lookup_getattr_update(false);
 }
@@ -1602,6 +1613,7 @@ TEST_F(Ossfs2InodeTest, verify_stale_getattr) {
 TEST_F(Ossfs2InodeTest, verify_forget_no_parent) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_forget_no_parent();
 }
@@ -1609,6 +1621,7 @@ TEST_F(Ossfs2InodeTest, verify_forget_no_parent) {
 TEST_F(Ossfs2InodeTest, verify_forget_out_of_order) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_forget_out_of_order();
 }
@@ -1616,11 +1629,13 @@ TEST_F(Ossfs2InodeTest, verify_forget_out_of_order) {
 TEST_F(Ossfs2InodeTest, verify_forget_while_rename) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_forget_while_rename();
 }
 
 TEST_F(Ossfs2InodeTest, verify_etag) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 3;
@@ -1629,6 +1644,7 @@ TEST_F(Ossfs2InodeTest, verify_etag) {
 }
 
 TEST_F(Ossfs2InodeTest, verify_remote_inode_type_change) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 2;
@@ -1641,11 +1657,13 @@ TEST_F(Ossfs2InodeTest, verify_evictable_inodes_collection) {
   OssFsOptions opts;
   opts.inode_cache_eviction_interval_ms = 1000;
   opts.inode_cache_eviction_threshold = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_evictable_inodes_collection();
 }
 
 TEST_F(Ossfs2InodeTest, verify_oss_dir_check) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1653,6 +1671,7 @@ TEST_F(Ossfs2InodeTest, verify_oss_dir_check) {
 }
 
 TEST_F(Ossfs2InodeTest, verify_test_setattr) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1660,6 +1679,7 @@ TEST_F(Ossfs2InodeTest, verify_test_setattr) {
 }
 
 TEST_F(Ossfs2InodeTest, verify_truncate_with_oss_error) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -1667,6 +1687,7 @@ TEST_F(Ossfs2InodeTest, verify_truncate_with_oss_error) {
 }
 
 TEST_F(Ossfs2InodeTest, verify_truncate_with_oss_error_for_appendable_object) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;

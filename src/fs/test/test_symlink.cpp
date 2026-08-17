@@ -18,7 +18,7 @@
 
 #include "test_suite.h"
 
-class Ossfs2SymlinkTest : public Ossfs2TestSuite {
+class Ossfs2SymlinkTest : public OssOnlyTestSuite {
  protected:
   void verify_oss_symlink() {
     uint64_t parent = get_test_dir_parent();
@@ -319,9 +319,10 @@ class Ossfs2SymlinkTest : public Ossfs2TestSuite {
         ASSERT_EQ(r, 0);
 
         if (target_type == InodeType::kFile) {
-          std::ofstream tmpfile("tmpfile", std::ios::out | std::ios::trunc);
-          DEFER(unlink("tmpfile"));
-          r = upload_file("tmpfile", join_paths(parent_path, file_name),
+          std::string local_tmp = join_paths(test_path_, "tmpfile");
+          std::ofstream tmpfile(local_tmp, std::ios::out | std::ios::trunc);
+          DEFER(unlink(local_tmp.c_str()));
+          r = upload_file(local_tmp, join_paths(parent_path, file_name),
                           FLAGS_oss_bucket_prefix);
           ASSERT_EQ(r, 0);
         } else {
@@ -485,6 +486,7 @@ TEST_F(Ossfs2SymlinkTest, verify_oss_symlink) {
 
   OssFsOptions opts;
   opts.enable_symlink = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_oss_symlink();
 }
@@ -494,6 +496,7 @@ TEST_F(Ossfs2SymlinkTest, verify_symlink_and_readlink) {
 
   OssFsOptions opts;
   opts.enable_symlink = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_symlink_and_readlink();
 }
@@ -504,6 +507,7 @@ TEST_F(Ossfs2SymlinkTest, verify_readdirplus) {
   OssFsOptions opts;
   opts.attr_timeout = 2;
   opts.enable_symlink = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_readdirplus();
 }
@@ -514,6 +518,7 @@ TEST_F(Ossfs2SymlinkTest, verify_lookup_and_getattr) {
   OssFsOptions opts;
   opts.attr_timeout = 2;
   opts.enable_symlink = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lookup_and_getattr();
 }
@@ -523,6 +528,7 @@ TEST_F(Ossfs2SymlinkTest, verify_disable_symlink) {
 
   OssFsOptions opts;
   opts.attr_timeout = 2;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_disable_symlink();
 }
@@ -531,6 +537,7 @@ TEST_F(Ossfs2SymlinkTest, verify_inode_type_change) {
   OssFsOptions opts;
   opts.enable_symlink = true;
   opts.attr_timeout = 1;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_inode_type_change();
 }

@@ -649,8 +649,7 @@ BlockCache::~BlockCache() {
 }
 
 CacheHandle *BlockCache::get(std::string_view /* name */,
-                             std::string_view /* etag */,
-                             off_t /* actual_size */) {
+                             std::string_view /* etag */, size_t /* size */) {
   std::lock_guard<std::mutex> l(mtx_);
   if (cache_store_ == nullptr) {
     cache_store_ = new BlockCacheStore(block_pool_->block_size());

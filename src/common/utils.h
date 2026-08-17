@@ -59,3 +59,14 @@ std::vector<std::string_view> split_string(std::string_view str,
                                            std::string_view delimiter);
 
 std::string cityhash128_base64url(std::string_view data);
+
+// Normalize a path to an absolute form with trailing slash stripped.
+std::string normalize_path(std::string_view path);
+
+// Normalize a directory flag in place; rejects relative paths.
+bool normalize_dir_flag(std::string &dir);
+
+// Validate directory parameters and create them if absent.
+bool validate_dir_params(std::string_view log_dir, std::string_view cache_dir,
+                         std::string_view temp_dir,
+                         std::string_view mountpoint);
