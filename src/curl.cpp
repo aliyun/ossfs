@@ -3539,6 +3539,61 @@ int S3fsCurl::CheckBucket(const char* check_path)
     return result;
 }
 
+int S3fsCurl::CreateBucket(const char* agentic_bucket)
+{
+    S3FS_PRN_INFO3("create a bucket.");
+
+    if(!CreateCurlHandle()){
+        return -EIO;
+    }
+
+    const std::string strPath = "/";
+    std::string resource;
+    std::string turl;
+    MakeUrlResource(strPath.c_str(), resource, turl);
+
+    url             = prepare_url(turl.c_str());
+    path            = strPath;
+    requestHeaders  = NULL;
+    responseHeaders.clear();
+    bodydata.clear();
+
+    // set agentic bucket header if specified
+    if(agentic_bucket && 0 < strlen(agentic_bucket)){
+        requestHeaders = curl_slist_sort_insert(requestHeaders, "x-oss-agentic-bucket", agentic_bucket);
+    }
+
+    op = "PUT";
+    type = REQTYPE_PUT;
+
+    // setopt
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str())){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_UPLOAD, true)){                // HTTP PUT
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEDATA, (void*)&bodydata)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback)){
+        return -EIO;
+    }
+    if(CURLE_OK != curl_easy_setopt(hCurl, CURLOPT_INFILESIZE, 0L)){
+        return -EIO;
+    }
+    if(!S3fsCurl::AddUserAgent(hCurl)){                            // put User-Agent
+        return -EIO;
+    }
+
+    int result = RequestPerform();
+    result = MapPutErrorResponse(result);
+    if(result != 0){
+        S3FS_PRN_ERR("Create bucket failed, OSS response: %s", bodydata.c_str());
+    }
+    return result;
+}
+
 int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
 {
     S3FS_PRN_INFO3("[tpath=%s]", SAFESTRPTR(tpath));

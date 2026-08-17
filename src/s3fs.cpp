@@ -104,6 +104,8 @@ static off_t readdir_check_size   = 0;
 static bool is_new_symlink_format = false;
 static bool is_specified_region   = false;
 static bool skip_clean_statcache_on_ro_flush = false;
+static bool is_auto_create_bucket = false;
+static std::string agentic_bucket_name;
 
 //-------------------------------------------------------------------
 // Global functions : prototype
@@ -3901,7 +3903,29 @@ static int s3fs_check_service()
                 std::string value;
                 if(simple_parse_xml(body->c_str(), body->size(), "Code", value)) {
                     if(value == "NoSuchBucket") {
-                        S3FS_PRN_EXIT("Failed to check bucket : Bucket not found(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+                        if(is_auto_create_bucket){
+                            // try to create the bucket automatically
+                            S3FS_PRN_INFO("Bucket not found, trying to create it automatically.");
+                            s3fscurl.DestroyCurlHandle();
+                            res = s3fscurl.CreateBucket(agentic_bucket_name.empty() ? NULL : agentic_bucket_name.c_str());
+                            responseCode = s3fscurl.GetLastResponseCode();
+                            if(0 == res || responseCode == 409){
+                                // 409 means bucket already exists, also considered success
+                                if(responseCode == 409){
+                                    S3FS_PRN_WARN("Bucket[%s] already exists.", S3fsCred::GetBucket().c_str());
+                                }else{
+                                    S3FS_PRN_WARN("Bucket[%s] created successfully.", S3fsCred::GetBucket().c_str());
+                                }
+                                is_failure = false;
+                            }else{
+                                const std::string* create_body = s3fscurl.GetBodyData();
+                                std::string createErrMsg;
+                                check_error_message(create_body->c_str(), create_body->size(), createErrMsg);
+                                S3FS_PRN_EXIT("Failed to create bucket automatically(host=%s, message=%s)", s3host.c_str(), createErrMsg.c_str());
+                            }
+                        }else{
+                            S3FS_PRN_EXIT("Failed to check bucket : Bucket not found(host=%s, message=%s)", s3host.c_str(), errMessage.c_str());
+                        }
                     } else {
                         is_failure = false;
                     }
@@ -4641,6 +4665,19 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         }       
         if(0 == strcmp(arg, "direct_read")){
             direct_read = true;
+            return 0;
+        }
+        if(0 == strcmp(arg, "auto_create_bucket")){
+            is_auto_create_bucket = true;
+            return 0;
+        }
+        if(is_prefix(arg, "agentic_bucket=")){
+            const char* agentic_name = strchr(arg, '=') + sizeof(char);
+            if(0 == strlen(agentic_name)){
+                S3FS_PRN_EXIT("agentic_bucket option requires a non-empty value.");
+                return -1;
+            }
+            agentic_bucket_name = agentic_name;
             return 0;
         }
         if(is_prefix(arg, "direct_read_prefetch_thread=")){

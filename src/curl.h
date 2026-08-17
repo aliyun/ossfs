@@ -367,6 +367,7 @@ class S3fsCurl
         int PreGetObjectRequest(const char* tpath, int fd, off_t start, off_t size, sse_type_t ssetype, const std::string& ssevalue);
         int GetObjectRequest(const char* tpath, int fd, off_t start = -1, off_t size = -1);
         int CheckBucket(const char* check_path);
+        int CreateBucket(const char* agentic_bucket = NULL);
         int ListBucketRequest(const char* tpath, const char* query);
         int PreMultipartPostRequest(const char* tpath, headers_t& meta, std::string& upload_id, bool is_copy);
         int CompleteMultipartPostRequest(const char* tpath, const std::string& upload_id, etaglist_t& parts);
