@@ -1,9 +1,14 @@
 ﻿ChangeLog for OSSFS
 ------------------
+## v1.91.12 (11/08/2026)
+ - Support creating the bucket automatically when mounting if it does not exist, with the new option auto_create_bucket.
+ - Add the agentic_bucket option to set custom headers when creating the bucket.
+
 ## v1.91.11 (30/06/2026)
  - Remove redundant bucket-checking on mounting.
  - Add time cost statistics in mounting process.
  - Disable CURLOPT_FOLLOWLOCATION for OSS signature V1 for security.
+ - Fix a bug that the new object inherits the SSE settings of the old object during mix multipart upload, now use the SSE specified by ossfs.
 
 ## v1.91.10 (31/03/2026)
  - Release ossfs of Alibaba Cloud Linux 3(aarch64).
