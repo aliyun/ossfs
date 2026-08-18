@@ -34,6 +34,7 @@
 #include "common/test/test_common.h"
 #include "common/utils.h"
 #include "fs/file.h"
+#include "fs/file_hdfs.h"
 #include "fs/fs.h"
 #include "test_util.h"
 
@@ -68,6 +69,68 @@ extern const std::string kUserAgentPrefix;
 
 std::string random_string(int length);
 int random_disk_cache_io_engine(int specified_engine);
+
+// Check if the endpoint indicates HDFS mode.
+bool is_hdfs_test_mode();
+
+// Bitflags declaring which backend mode(s) a test supports.
+enum TestMode : uint32_t {
+  kTestOss = 1 << 0,
+  kTestHdfs = 1 << 1,
+};
+
+// Declare which backend mode(s) this test supports.
+// Must be called in TEST_F body before init().  Uses GTEST_SKIP() so the
+// return statement terminates the TEST_F body directly — no need for
+// additional failure checks after init().
+#define SET_TEST_MODE(mode)                                                   \
+  do {                                                                        \
+    uint32_t _current = is_hdfs_test_mode() ? kTestHdfs : kTestOss;           \
+    if (!((mode)&_current)) GTEST_SKIP() << "Not applicable in current mode"; \
+  } while (0)
+
+// Lightweight JDO SDK wrapper for test helpers.
+// Decoupled from OssHdfsStore to allow cross-verification.
+//
+class HdfsTestHelper {
+ public:
+  HdfsTestHelper(const std::string &endpoint, const std::string &bucket,
+                 const std::string &ak, const std::string &sk);
+  ~HdfsTestHelper();
+
+  bool init();
+
+  // Read a local file and write its content to HDFS.
+  int upload_file(const std::string &local_path, const std::string &hdfs_path);
+  // Delete a single file.
+  int delete_file(const std::string &hdfs_path);
+  // Recursively delete a directory and all its contents.
+  int delete_dir_recursive(const std::string &hdfs_path);
+  // Create a directory (with parents).
+  int create_dir(const std::string &hdfs_path);
+  // Stat a file/dir. Returns 0 on success.
+  int stat_file(const std::string &hdfs_path);
+  // Stat a file and return its size. Returns 0 on success, size via out param.
+  int stat_file_size(const std::string &hdfs_path, int64_t &out_size);
+  // Read file content via SDK and compute CRC64. Returns CRC64 string.
+  std::string read_file_crc64(const std::string &hdfs_path);
+  // List immediate children names under hdfs_path.
+  int list_dir(const std::string &hdfs_path, std::vector<std::string> &results);
+
+  // Recursively list all descendants under hdfs_path (relative paths).
+  // Results are paths relative to hdfs_path, e.g. "subdir/file.txt".
+  int list_all_descendants(const std::string &hdfs_path,
+                           std::vector<std::string> &results);
+
+  // Build full HDFS URI from a relative path: uri_ + path
+  std::string full_uri(const std::string &relative_path) const;
+
+ private:
+  std::string uri_;            // oss://bucket.endpoint
+  void *jdo_opts_ = nullptr;   // JdoOptions_t
+  void *jdo_store_ = nullptr;  // JdoStore_t
+  bool initialized_ = false;
+};
 
 //
 // Base test suite class for OssFs filesystem tests.
@@ -120,10 +183,11 @@ class Ossfs2TestSuite : public ::testing::Test {
       return OssFs::getattr(nodeid, stbuf);
     }
 
-    virtual int setattr(uint64_t nodeid, struct stat *stbuf,
-                        int to_set) override {
+    virtual int setattr(uint64_t nodeid, struct stat *stbuf, int to_set,
+                        struct fuse_file_info *fi = nullptr, uid_t uid = 0,
+                        gid_t gid = 0) override {
       LOG_DEBUG("SETATTR. nodeid `, to_set `", nodeid, to_set);
-      return OssFs::setattr(nodeid, stbuf, to_set);
+      return OssFs::setattr(nodeid, stbuf, to_set, fi, uid, gid);
     }
 
     virtual int open(uint64_t nodeid, int flags, void **fh,
@@ -148,6 +212,35 @@ class Ossfs2TestSuite : public ::testing::Test {
       LOG_DEBUG("READDIR. nodeid: `, off: `", nodeid, off);
       return OssFs::readdir(nodeid, off, dh, filler, filler_ctx, is_interrupted,
                             readdirplus, interrupted_ctx);
+    }
+
+    int mknod(uint64_t parent, std::string_view name, mode_t mode, uid_t uid,
+              gid_t gid, uint64_t *nodeid, struct stat *stbuf) override {
+      return OssFs::mknod(parent, name, mode, uid, gid, nodeid, stbuf);
+    }
+
+    int fallocate(uint64_t nodeid, off_t offset, off_t length,
+                  void *fh) override {
+      return OssFs::fallocate(nodeid, offset, length, fh);
+    }
+
+    int flock(uint64_t nodeid, void *fh, int op, uint64_t lock_owner) override {
+      return OssFs::flock(nodeid, fh, op, lock_owner);
+    }
+
+    int setxattr(uint64_t nodeid, const char *name, const char *value,
+                 size_t size, int flags) override {
+      return OssFs::setxattr(nodeid, name, value, size, flags);
+    }
+    int getxattr(uint64_t nodeid, const char *name, char *value,
+                 size_t size) override {
+      return OssFs::getxattr(nodeid, name, value, size);
+    }
+    int listxattr(uint64_t nodeid, char *list, size_t size) override {
+      return OssFs::listxattr(nodeid, list, size);
+    }
+    int removexattr(uint64_t nodeid, const char *name) override {
+      return OssFs::removexattr(nodeid, name);
     }
   };
 
@@ -179,6 +272,12 @@ class Ossfs2TestSuite : public ::testing::Test {
   std::string test_path_ = "/tmp/OssFs2Test/";
   std::string gtest_base_dir = "";
   ObjStoreOptions oss_options_;
+
+  std::string disk_cache_dir_;
+
+  bool is_hdfs_mode_ = false;
+  std::string hdfs_client_options_;  // custom SDK options for HDFS tests
+  std::unique_ptr<HdfsTestHelper> hdfs_helper_;
 
   // help functions
  protected:
@@ -226,7 +325,8 @@ class Ossfs2TestSuite : public ::testing::Test {
   }
 
   inline uint64_t get_nodeid_from_handle(void *fh) {
-    return static_cast<OssFileHandle *>(fh)->get_inode()->nodeid;
+    IFileHandleFuseLL *handle = static_cast<IFileHandleFuseLL *>(fh);
+    return static_cast<FileInode *>(handle->get_inode())->nodeid;
   }
 
   inline int fsync_file_handle(void *fh, bool datasync = false) {
@@ -286,5 +386,31 @@ class Ossfs2TestSuite : public ::testing::Test {
     int max_keys = (randnum & 1) ? (randnum % 5 + 1) : 100;
     LOG_INFO("max_keys: `", max_keys);
     return max_keys;
+  }
+};
+
+//
+// Base class for test fixtures that are OSS-only and should be skipped
+// entirely when running in HDFS mode.  Inherit from this instead of
+// Ossfs2TestSuite for classes whose every test case is OSS-specific.
+//
+class OssOnlyTestSuite : public Ossfs2TestSuite {
+ protected:
+  void SetUp() override {
+    SET_TEST_MODE(kTestOss);
+    Ossfs2TestSuite::SetUp();
+  }
+};
+
+//
+// Base class for test fixtures that are HDFS-only and should be skipped
+// entirely when running in OSS mode.  Inherit from this instead of
+// Ossfs2TestSuite for classes whose every test case is HDFS-specific.
+//
+class OssHdfsTestSuite : public Ossfs2TestSuite {
+ protected:
+  void SetUp() override {
+    SET_TEST_MODE(kTestHdfs);
+    Ossfs2TestSuite::SetUp();
   }
 };

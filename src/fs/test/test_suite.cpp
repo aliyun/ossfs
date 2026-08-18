@@ -16,13 +16,26 @@
 
 #include "test_suite.h"
 
+#include <jdo_api.h>
+#include <jdo_defines.h>
+#include <jdo_error.h>
+#include <jdo_file_status.h>
+#include <jdo_list_dir_result.h>
+#include <jdo_option_keys.h>
+#include <jdo_options.h>
 #include <signal.h>
 
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
-#include "fs/id_manager.h"
+#include "fs/disk_cache_env.h"
+#include "oss/jdo_sdk_loader.h"
+#include "oss/obj_store.h"
 
 // for oss client
 DEFINE_string(oss_endpoint, "", "");
@@ -31,12 +44,11 @@ DEFINE_string(oss_bucket_prefix, "", "");
 DEFINE_string(oss_access_key_id, "", "");
 DEFINE_string(oss_access_key_secret, "", "");
 DEFINE_uint64(oss_request_timeout_ms, 32000, "oss request timeout");
+DEFINE_string(disk_cache_io_engine, "random", "disk cache io engine");
+DEFINE_string(disk_cache_dir, "/root/tmp/ossfs2/cache", "disk cache dir");
+DEFINE_string(http_proxy, "", "HTTP proxy to use for tests");
 
 DEFINE_bool(write_with_fuse_bufvec, true, "");
-
-DEFINE_string(disk_cache_dir, "/root/tmp/ossfs2/cache", "disk cache dir");
-DEFINE_string(disk_cache_io_engine, "random", "disk cache io engine");
-DEFINE_string(http_proxy, "", "");
 
 const std::string kOssMetaStorageClass = "X-Oss-Storage-Class";
 const std::string kOssSCStandard = "Standard";
@@ -59,14 +71,411 @@ int random_disk_cache_io_engine(int specified_engine) {
   return specified_engine;
 }
 
+bool is_hdfs_test_mode() {
+  return FLAGS_oss_endpoint.find("oss-dls.aliyuncs.com") != std::string::npos;
+}
+
+// ============================================================================
+// HdfsTestHelper implementation
+// ============================================================================
+
+HdfsTestHelper::HdfsTestHelper(const std::string &endpoint,
+                               const std::string &bucket, const std::string &ak,
+                               const std::string &sk) {
+  if (!JindoSDK::load()) {
+    LOG_ERROR("HdfsTestHelper: Failed to load JindoSDK");
+    return;
+  }
+  auto opts = JindoSDK::createOptions();
+  JindoSDK::setOption(opts, kHdfsSdkOptEndpoint, endpoint.c_str());
+  JindoSDK::setOption(opts, kHdfsSdkOptAccessKeyId, ak.c_str());
+  JindoSDK::setOption(opts, kHdfsSdkOptAccessKeySecret, sk.c_str());
+  JindoSDK::setOption(opts, kHdfsSdkOptRandomWriteSyncInterval, "60000");
+  jdo_opts_ = opts;
+
+  uri_ = "oss://" + bucket + "." + endpoint;
+  jdo_store_ = JindoSDK::createStore(opts, uri_.c_str());
+}
+
+HdfsTestHelper::~HdfsTestHelper() {
+  if (jdo_store_) {
+    JindoSDK::destroyStore(static_cast<JdoStore_t>(jdo_store_));
+    JindoSDK::freeStore(static_cast<JdoStore_t>(jdo_store_));
+  }
+  if (jdo_opts_) JindoSDK::freeOptions(static_cast<JdoOptions_t>(jdo_opts_));
+}
+
+bool HdfsTestHelper::init() {
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  JindoSDK::init(ctx, "root");
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeHandleCtx(ctx);
+  initialized_ = (ec == 0);
+  if (!initialized_) {
+    LOG_ERROR("HdfsTestHelper: Jindo SDK init failed, ec: `", ec);
+  }
+  return initialized_;
+}
+
+std::string HdfsTestHelper::full_uri(const std::string &relative_path) const {
+  return uri_ + relative_path;
+}
+
+int HdfsTestHelper::upload_file(const std::string &local_path,
+                                const std::string &hdfs_path) {
+  if (!initialized_) return -EIO;
+
+  // Read local file into memory
+  std::ifstream ifs(local_path, std::ios::binary | std::ios::ate);
+  if (!ifs.is_open()) {
+    LOG_ERROR("HdfsTestHelper::upload_file: cannot open local file: `",
+              local_path);
+    return -ENOENT;
+  }
+  auto file_size = ifs.tellg();
+  ifs.seekg(0, std::ios::beg);
+  std::string data(file_size, '\0');
+  ifs.read(&data[0], file_size);
+  ifs.close();
+
+  // Open HDFS file for writing
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  int32_t flags = JDO_OPEN_FLAG_CREATE | JDO_OPEN_FLAG_OVERWRITE |
+                  JDO_OPEN_FLAG_RANDOM_WRITE;
+  auto io_ctx = JindoSDK::open(ctx, hdfs_path.c_str(), flags, 0777, nullptr);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeHandleCtx(ctx);
+  if (ec != 0 || !io_ctx) {
+    LOG_ERROR("HdfsTestHelper::upload_file: jdo_open failed, ec: `", ec);
+    if (io_ctx) JindoSDK::freeIOContext(io_ctx);
+    return -EIO;
+  }
+
+  // Write data
+  if (file_size > 0) {
+    auto ctx2 = JindoSDK::createHandleCtx2(store, io_ctx);
+    JindoSDK::write(ctx2, data.c_str(), static_cast<int64_t>(file_size),
+                    nullptr);
+    ec = JindoSDK::getHandleCtxErrorCode(ctx2);
+    JindoSDK::freeHandleCtx(ctx2);
+    if (ec != 0) {
+      LOG_ERROR("HdfsTestHelper::upload_file: jdo_write failed, ec: `", ec);
+      JindoSDK::freeIOContext(io_ctx);
+      return -EIO;
+    }
+  }
+
+  // Close
+  auto ctx3 = JindoSDK::createHandleCtx2(store, io_ctx);
+  JindoSDK::close(ctx3, nullptr);
+  ec = JindoSDK::getHandleCtxErrorCode(ctx3);
+  JindoSDK::freeHandleCtx(ctx3);
+  JindoSDK::freeIOContext(io_ctx);
+
+  if (ec != 0) {
+    LOG_ERROR("HdfsTestHelper::upload_file: jdo_close failed, ec: `", ec);
+    return -EIO;
+  }
+
+  LOG_INFO("HdfsTestHelper: uploaded ` -> `", local_path, hdfs_path);
+  return 0;
+}
+
+int HdfsTestHelper::delete_file(const std::string &hdfs_path) {
+  if (!initialized_) return -EIO;
+
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  JindoSDK::remove(ctx, hdfs_path.c_str(), false, nullptr);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeHandleCtx(ctx);
+
+  // File not found is not an error for delete
+  if (ec == JDO_FILE_NOT_FOUND_ERROR) return 0;
+  if (ec != 0) {
+    LOG_ERROR("HdfsTestHelper::delete_file: jdo_remove failed, ec: `", ec);
+    return -EIO;
+  }
+  return 0;
+}
+
+int HdfsTestHelper::delete_dir_recursive(const std::string &hdfs_path) {
+  if (!initialized_) return -EIO;
+
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+
+  // Use recursive=true to let the SDK handle deletion order
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  JindoSDK::remove(ctx, hdfs_path.c_str(), true, nullptr);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeHandleCtx(ctx);
+
+  // Not found is not an error
+  if (ec == JDO_FILE_NOT_FOUND_ERROR) return 0;
+  if (ec != 0) {
+    LOG_ERROR(
+        "HdfsTestHelper::delete_dir_recursive: failed to remove dir `, ec: `",
+        hdfs_path, ec);
+    return -EIO;
+  }
+  return 0;
+}
+
+int HdfsTestHelper::create_dir(const std::string &hdfs_path) {
+  if (!initialized_) return -EIO;
+
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  JindoSDK::mkdir(ctx, hdfs_path.c_str(), true, 0777, nullptr);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeHandleCtx(ctx);
+
+  // "already exists" is not an error — makes create_dir idempotent
+  if (ec != 0 && ec != JDO_FILE_ALREADY_EXISTS_ERROR) {
+    LOG_ERROR("HdfsTestHelper::create_dir: jdo_mkdir failed, ec: `", ec);
+    return -EIO;
+  }
+  LOG_INFO("HdfsTestHelper: created dir `", hdfs_path);
+  return 0;
+}
+
+int HdfsTestHelper::stat_file(const std::string &hdfs_path) {
+  if (!initialized_) return -EIO;
+
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  auto file_status = JindoSDK::getFileStatus(ctx, hdfs_path.c_str(), nullptr);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeHandleCtx(ctx);
+
+  if (ec != 0) {
+    if (ec == JDO_FILE_NOT_FOUND_ERROR) return -ENOENT;
+    LOG_ERROR("HdfsTestHelper::stat_file: jdo_getFileStatus failed, ec: `", ec);
+    return -EIO;
+  }
+
+  if (file_status) JindoSDK::freeFileStatus(file_status);
+  return 0;
+}
+
+int HdfsTestHelper::stat_file_size(const std::string &hdfs_path,
+                                   int64_t &out_size) {
+  if (!initialized_) return -EIO;
+
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  auto file_status = JindoSDK::getFileStatus(ctx, hdfs_path.c_str(), nullptr);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeHandleCtx(ctx);
+
+  if (ec != 0) {
+    if (ec == JDO_FILE_NOT_FOUND_ERROR) return -ENOENT;
+    LOG_ERROR("HdfsTestHelper::stat_file_size: jdo_getFileStatus failed, ec: `",
+              ec);
+    return -EIO;
+  }
+
+  out_size = JindoSDK::getFileStatusSize(file_status);
+  if (file_status) JindoSDK::freeFileStatus(file_status);
+  return 0;
+}
+
+std::string HdfsTestHelper::read_file_crc64(const std::string &hdfs_path) {
+  if (!initialized_) return "";
+
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+
+  // Get file size first
+  auto ctx_stat = JindoSDK::createHandleCtx1(store);
+  auto file_status =
+      JindoSDK::getFileStatus(ctx_stat, hdfs_path.c_str(), nullptr);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx_stat);
+  JindoSDK::freeHandleCtx(ctx_stat);
+  if (ec != 0 || !file_status) {
+    LOG_ERROR("HdfsTestHelper::read_file_crc64: stat failed, ec: `", ec);
+    return "";
+  }
+  int64_t file_size = JindoSDK::getFileStatusSize(file_status);
+  JindoSDK::freeFileStatus(file_status);
+
+  if (file_size == 0) return "0";
+
+  // Open for reading
+  auto ctx_open = JindoSDK::createHandleCtx1(store);
+  auto io_ctx = JindoSDK::open(ctx_open, hdfs_path.c_str(),
+                               JDO_OPEN_FLAG_READ_ONLY, 0, nullptr);
+  ec = JindoSDK::getHandleCtxErrorCode(ctx_open);
+  JindoSDK::freeHandleCtx(ctx_open);
+  if (ec != 0 || !io_ctx) {
+    LOG_ERROR("HdfsTestHelper::read_file_crc64: jdo_open failed, ec: `", ec);
+    if (io_ctx) JindoSDK::freeIOContext(io_ctx);
+    return "";
+  }
+
+  // Read in chunks and compute CRC64
+  const int64_t buf_size = 1024 * 1024;  // 1MB chunks
+  std::vector<char> buf(buf_size);
+  uint64_t crc = 0;
+  int64_t remaining = file_size;
+
+  while (remaining > 0) {
+    int64_t to_read = std::min(remaining, buf_size);
+    auto ctx_read = JindoSDK::createHandleCtx2(store, io_ctx);
+    int64_t nread = JindoSDK::read(ctx_read, buf.data(), to_read, nullptr);
+    ec = JindoSDK::getHandleCtxErrorCode(ctx_read);
+    JindoSDK::freeHandleCtx(ctx_read);
+
+    if (ec != 0 || nread <= 0) {
+      LOG_ERROR(
+          "HdfsTestHelper::read_file_crc64: jdo_read failed, ec: `, "
+          "nread: `",
+          ec, nread);
+      auto ctx_close = JindoSDK::createHandleCtx2(store, io_ctx);
+      JindoSDK::close(ctx_close, nullptr);
+      JindoSDK::freeHandleCtx(ctx_close);
+      JindoSDK::freeIOContext(io_ctx);
+      return "";
+    }
+
+    crc = cal_crc64(crc, buf.data(), static_cast<size_t>(nread));
+    remaining -= nread;
+  }
+
+  // Close
+  auto ctx_close = JindoSDK::createHandleCtx2(store, io_ctx);
+  JindoSDK::close(ctx_close, nullptr);
+  JindoSDK::freeHandleCtx(ctx_close);
+  JindoSDK::freeIOContext(io_ctx);
+
+  return std::to_string(crc);
+}
+
+int HdfsTestHelper::list_dir(const std::string &hdfs_path,
+                             std::vector<std::string> &results) {
+  if (!initialized_) return -EIO;
+
+  auto store = static_cast<JdoStore_t>(jdo_store_);
+  auto ctx = JindoSDK::createHandleCtx1(store);
+  auto list_opts = JindoSDK::createOptions();
+  JindoSDK::setOption(list_opts, JDO_LIST_OPTS_IS_ITERATIVE, "true");
+  JindoSDK::setOption(list_opts, JDO_LIST_OPTS_MAX_KEYS, "10000");
+
+  auto list_result =
+      JindoSDK::listDir(ctx, hdfs_path.c_str(), false, list_opts);
+  int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+  JindoSDK::freeOptions(list_opts);
+  JindoSDK::freeHandleCtx(ctx);
+
+  if (ec != 0) {
+    if (ec == JDO_FILE_NOT_FOUND_ERROR) return -ENOENT;
+    LOG_ERROR("HdfsTestHelper::list_dir: jdo_listDir failed, ec: `", ec);
+    return -EIO;
+  }
+
+  if (list_result) {
+    for (int64_t i = 0; i < JindoSDK::getListDirResultSize(list_result); i++) {
+      auto file_info = JindoSDK::getListDirFileStatus(list_result, i);
+      if (!file_info) continue;
+      const char *path = JindoSDK::getFileStatusPath(file_info);
+      if (!path) continue;
+      // Extract filename from full path
+      std::string full_path(path);
+      auto pos = full_path.rfind('/');
+      if (pos != std::string::npos) {
+        results.push_back(full_path.substr(pos + 1));
+      } else {
+        results.push_back(full_path);
+      }
+    }
+    JindoSDK::freeListDirResult(list_result);
+  }
+
+  return 0;
+}
+
+int HdfsTestHelper::list_all_descendants(const std::string &hdfs_path,
+                                         std::vector<std::string> &results) {
+  if (!initialized_) return -EIO;
+
+  // Compute the base prefix length (with trailing slash) to strip.
+  std::string base = hdfs_path;
+  if (!base.empty() && base.back() != '/') base += '/';
+
+  // Recursive lambda using jdo_listDir.
+  std::function<int(const std::string &)> recurse =
+      [&](const std::string &dir_path) -> int {
+    auto store = static_cast<JdoStore_t>(jdo_store_);
+    auto ctx = JindoSDK::createHandleCtx1(store);
+    auto list_opts = JindoSDK::createOptions();
+    JindoSDK::setOption(list_opts, JDO_LIST_OPTS_IS_ITERATIVE, "true");
+    JindoSDK::setOption(list_opts, JDO_LIST_OPTS_MAX_KEYS, "10000");
+
+    auto list_result =
+        JindoSDK::listDir(ctx, dir_path.c_str(), false, list_opts);
+    int32_t ec = JindoSDK::getHandleCtxErrorCode(ctx);
+    JindoSDK::freeOptions(list_opts);
+    JindoSDK::freeHandleCtx(ctx);
+
+    if (ec != 0) {
+      if (ec == JDO_FILE_NOT_FOUND_ERROR) return -ENOENT;
+      LOG_ERROR(
+          "HdfsTestHelper::list_all_descendants: jdo_listDir failed, "
+          "ec: `",
+          ec);
+      return -EIO;
+    }
+
+    if (list_result) {
+      // Collect children first so we can recurse into dirs.
+      std::vector<std::pair<std::string, bool>> children;
+      for (int64_t i = 0; i < JindoSDK::getListDirResultSize(list_result);
+           i++) {
+        auto file_info = JindoSDK::getListDirFileStatus(list_result, i);
+        if (!file_info) continue;
+        const char *path = JindoSDK::getFileStatusPath(file_info);
+        if (!path) continue;
+        auto type = JindoSDK::getFileStatusType(file_info);
+        bool is_dir = (type == JDO_FILE_TYPE_DIRECTORY ||
+                       type == JDO_FILE_TYPE_MOUNT_POINT);
+        children.emplace_back(std::string(path), is_dir);
+      }
+      JindoSDK::freeListDirResult(list_result);
+
+      for (auto &[full_path, is_dir] : children) {
+        // Append the relative path (strip base prefix).
+        std::string rel = full_path;
+        if (rel.size() > base.size() && rel.substr(0, base.size()) == base) {
+          rel = rel.substr(base.size());
+        }
+        if (!rel.empty()) {
+          results.push_back(rel);
+        }
+        if (is_dir) {
+          int r = recurse(full_path);
+          if (r < 0) return r;
+        }
+      }
+    }
+    return 0;
+  };
+
+  return recurse(hdfs_path);
+}
+
+// ============================================================================
+
 std::string random_string(int length) {
   static std::string charset =
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
   std::string result;
   result.resize(length);
 
-  for (int i = 0; i < length; i++)
-    result[i] = charset[rand() % charset.length()];
+  static thread_local std::mt19937 rng(std::random_device{}());
+  std::uniform_int_distribution<size_t> dist(0, charset.length() - 1);
+
+  for (int i = 0; i < length; i++) result[i] = charset[dist(rng)];
 
   return result;
 }
@@ -94,8 +503,6 @@ void Ossfs2TestSuite::SetUp() {
   // Code here will be called immediately after the constructor (right
   // before each test).
   LOG_INFO("Test setup.");
-  clean_test_dir();
-  setup_test_dir();
 
 #if defined(__SANITIZE_ADDRESS__)
   LOG_INFO("AddressSanitizer is enabled.");
@@ -106,11 +513,37 @@ void Ossfs2TestSuite::SetUp() {
   gtest_base_dir = GTEST_BASE_DIR_PREFIX + case_name;
   LOG_INFO("Test base dir: `", gtest_base_dir);
 
+  test_path_ = "/tmp/OssFs2Test/" + std::string(case_name) + "/";
+  LOG_INFO("Test tmp dir path: `", test_path_);
+  clean_test_dir();
+  setup_test_dir();
+
+  // Initialize HDFS test helper if in HDFS mode.
+  is_hdfs_mode_ = is_hdfs_test_mode();
+  if (is_hdfs_mode_) {
+    hdfs_helper_ = std::make_unique<HdfsTestHelper>(
+        FLAGS_oss_endpoint, FLAGS_oss_bucket, FLAGS_oss_access_key_id,
+        FLAGS_oss_access_key_secret);
+    bool ok = hdfs_helper_->init();
+    ASSERT_TRUE(ok) << "Failed to initialize HDFS test helper";
+    LOG_INFO("HDFS test mode enabled.");
+  }
+
   srand(time(nullptr));
-  FLAGS_write_with_fuse_bufvec = rand() % 2;
+  if (gflags::GetCommandLineFlagInfoOrDie("write_with_fuse_bufvec")
+          .is_default) {
+    FLAGS_write_with_fuse_bufvec = rand() % 2;
+  }
   LOG_INFO("write_with_fuse_bufvec: `", FLAGS_write_with_fuse_bufvec);
 
-  delete_dir("", FLAGS_oss_bucket_prefix);
+  int dr = delete_dir("", FLAGS_oss_bucket_prefix);
+  if (dr != 0) {
+    LOG_WARN("delete_dir failed (ec=`), retrying...", dr);
+    dr = delete_dir("", FLAGS_oss_bucket_prefix);
+    if (dr != 0) {
+      LOG_WARN("delete_dir retry also failed (ec=`)", dr);
+    }
+  }
   int r = create_dir("", FLAGS_oss_bucket_prefix);
   ASSERT_EQ(r, 0);
 }
@@ -147,9 +580,22 @@ void Ossfs2TestSuite::TearDown() {
   auto dirty_nodeids = fs_->get_dirty_nodeids().size();
   destroy();
 
+  // Explicitly reset HDFS helper to ensure SDK cleanup before next test
+  if (is_hdfs_mode_) {
+    hdfs_helper_.reset();
+  }
+
   g_fault_injector->clear_all_injections();
 
   ASSERT_EQ(dirty_nodeids, (size_t)0);
+
+  // Clean up local temp dir on success.
+  if (!HasFailure()) {
+    clean_test_dir();
+    if (!disk_cache_dir_.empty()) {
+      std::filesystem::remove_all(disk_cache_dir_);
+    }
+  }
 }
 
 void Ossfs2TestSuite::init(OssFsOptions fs_opts, int max_list_ret,
@@ -230,9 +676,12 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
       options.use_auth_cache = rand() % 2;
       options.enable_symlink = fs_opts.enable_symlink;
       options.proxy = FLAGS_http_proxy;
+      if (!hdfs_client_options_.empty()) {
+        options.hdfs_client_options = hdfs_client_options_;
+      }
       oss_options_ = options;
-      return new_oss_store(accessKeyId.c_str(), accessKeySecret.c_str(),
-                           oss_options_);
+      return OssFileSystem::new_obj_store(
+          accessKeyId.c_str(), accessKeySecret.c_str(), oss_options_);
     });
 
     bg_vcpu_env_.bg_obj_store_env->add_obj_store_env(executor, obj_store);
@@ -240,7 +689,20 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
 
   if (fs_opts.cache_type == CacheType::kDiskCache) {
     fs_opts.share_fd_read_buffer = true;
-    std::filesystem::remove_all(FLAGS_disk_cache_dir);
+    // Per-case isolation: use case-specific subdir to avoid conflicts in
+    // parallel execution.
+    auto case_name =
+        ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    bool is_eviction_test =
+        std::string(case_name).find("eviction") != std::string::npos;
+    if (!is_eviction_test && rand() % 2) {
+      LOG_INFO("Using tmpfs for disk cache");
+      disk_cache_dir_ = std::string("/dev/shm/ossfs2/cache/") + case_name;
+      disk_cache_io_engine = photon::fs::ioengine_psync;
+    } else {
+      disk_cache_dir_ = FLAGS_disk_cache_dir + "/" + std::string(case_name);
+    }
+    std::filesystem::remove_all(disk_cache_dir_);
     sigset_t oldset;
     int bas = block_all_signal(&oldset);
     DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
@@ -253,13 +715,22 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
     }
 
     auto bg_disk_cache_env = new OssFileSystem::BGVCpuDiskCacheEnv();
-    auto executor =
-        new photon::Executor(OSSFS_EVENT_ENGINE, photon_io_init,
-                             LIBAIO_PHOTON_OPTION, EXECUTOR_QUEUE_OPTION);
-    bg_disk_cache_env->set_executor(executor);
+    // libaio: random executor count in [1, 4]; psync: single primary
+    // executor (requests run inline).
+    int executor_num = 1;
+    if (io_engine_type == photon::fs::ioengine_libaio) {
+      executor_num = rand() % 4 + 1;
+    }
+    LOG_INFO("create ` background vcpu disk cache executors", executor_num);
+    for (int i = 0; i < executor_num; i++) {
+      auto executor =
+          new photon::Executor(OSSFS_EVENT_ENGINE, photon_io_init,
+                               LIBAIO_PHOTON_OPTION, EXECUTOR_QUEUE_OPTION);
+      bg_disk_cache_env->add_executor(executor);
+    }
 
-    OssFileSystem::DiskCacheOptions cache_opts(FLAGS_disk_cache_dir, 1,
-                                               1024 * 1024, io_engine_type);
+    OssFileSystem::DiskCacheOptions cache_opts(disk_cache_dir_, 1, 1024 * 1024,
+                                               io_engine_type);
     int r = bg_disk_cache_env->init(cache_opts);
     if (r != 0) {
       LOG_ERROR("Failed to init bg disk cache env.");
@@ -276,10 +747,12 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
   LOG_INFO("share_fd_read_buffer is: `",
            fs_opts.share_fd_read_buffer ? "enabled" : "disabled");
 
-  auto id_manager = OssFileSystem::create_heap_id_manager();
-  if (id_manager == nullptr) return -1;
+  // Set storage backend based on HDFS test mode.
+  if (is_hdfs_test_mode()) {
+    fs_opts.storage_backend = OssFileSystem::IObjStore::StorageBackend::kHDFS;
+  }
 
-  fs_ = new AuditableOssFs(fs_opts, bg_vcpu_env_, std::move(id_manager));
+  fs_ = new AuditableOssFs(fs_opts, bg_vcpu_env_, create_heap_id_manager());
   root_nodeid_ = fs_->mp_inode_->nodeid;
 
   return fs_->init();
@@ -348,7 +821,10 @@ int Ossfs2TestSuite::read_dir(uint64_t parent, std::vector<TestInode> &childs) {
 
   // fill all the nodes one time
   r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true, nullptr);
-  if (r < 0) return r;
+  if (r < 0) {
+    fs_->releasedir(parent, dirp);
+    return r;
+  }
 
   r = fs_->releasedir(parent, dirp);
   return r;
@@ -606,6 +1082,7 @@ ssize_t Ossfs2TestSuite::read_file_in_folder(uint64_t parent,
   uint64_t nodeid = 0;
   int r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
   if (r < 0) return r;
+
   DEFER(fs_->forget(nodeid, 1));
 
   void *handle = nullptr;
@@ -790,6 +1267,25 @@ int Ossfs2TestSuite::upload_file(const std::string &local_file,
                                  const std::string &target,
                                  const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
+
+  if (is_hdfs_mode_) {
+    std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
+    // HDFS SDK's jdo_open always creates a regular file, even if the
+    // path ends with '/'. To match OSS behavior where uploading to a
+    // path with trailing '/' creates a directory, use jdo_mkdir instead.
+    if (!hdfs_path.empty() && hdfs_path.back() == '/') {
+      return hdfs_helper_->create_dir(hdfs_path);
+    }
+    // Ensure parent directory exists (jdo_open does not create parents)
+    auto last_slash = hdfs_path.rfind('/');
+    if (last_slash != std::string::npos && last_slash > 0) {
+      std::string parent_dir = hdfs_path.substr(0, last_slash);
+      int mr = hdfs_helper_->create_dir(parent_dir);
+      if (mr != 0) return mr;
+    }
+    return hdfs_helper_->upload_file(local_file, hdfs_path);
+  }
+
   std::string cmd;
   std::string ossutil = lookup_ossutil();
 
@@ -810,6 +1306,12 @@ int Ossfs2TestSuite::upload_file(const std::string &local_file,
 
 int Ossfs2TestSuite::copy_file(const std::string &src, const std::string &dst,
                                const std::string &oss_prefix) {
+  if (is_hdfs_mode_) {
+    // HDFS does not support server-side copy; upload src to dst path.
+    LOG_ERROR("copy_file is not supported in HDFS mode");
+    return -ENOTSUP;
+  }
+
   std::string src_path = join_paths(oss_prefix, get_test_osspath(src));
   std::string dst_path = join_paths(oss_prefix, get_test_osspath(dst));
   std::string cmd;
@@ -833,6 +1335,12 @@ int Ossfs2TestSuite::copy_file(const std::string &src, const std::string &dst,
 int Ossfs2TestSuite::delete_file(const std::string &target,
                                  const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
+
+  if (is_hdfs_mode_) {
+    std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
+    return hdfs_helper_->delete_file(hdfs_path);
+  }
+
   std::string cmd;
   std::string ossutil = lookup_ossutil();
 
@@ -852,6 +1360,12 @@ int Ossfs2TestSuite::delete_file(const std::string &target,
 int Ossfs2TestSuite::create_dir(const std::string &target,
                                 const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
+
+  if (is_hdfs_mode_) {
+    std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
+    return hdfs_helper_->create_dir(hdfs_path);
+  }
+
   std::string cmd;
   std::string ossutil = lookup_ossutil();
 
@@ -859,7 +1373,6 @@ int Ossfs2TestSuite::create_dir(const std::string &target,
         FLAGS_oss_access_key_secret + " -e " + FLAGS_oss_endpoint +
         " mkdir \"oss://" + FLAGS_oss_bucket + "/" + osspath + "\"";
 
-  LOG_DEBUG("mkdir: `, cmd: `", target, cmd);
   int r;
   if ((r = system(cmd.c_str())) != 0) {
     LOG_ERROR("Fail to mkdir: `", target);
@@ -874,12 +1387,18 @@ int Ossfs2TestSuite::create_dir(const std::string &target,
 int Ossfs2TestSuite::delete_dir(const std::string &target,
                                 const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
+
+  if (is_hdfs_mode_) {
+    std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
+    return hdfs_helper_->delete_dir_recursive(hdfs_path);
+  }
+
   std::string cmd;
   std::string ossutil = lookup_ossutil();
 
   cmd = ossutil + " -i " + FLAGS_oss_access_key_id + " -k " +
         FLAGS_oss_access_key_secret + " -e " + FLAGS_oss_endpoint +
-        " rm \"oss://" + FLAGS_oss_bucket + "/" + osspath + "\" -r -f";
+        " rm \"oss://" + FLAGS_oss_bucket + "/" + osspath + "/\" -r -f";
 
   int r;
   if ((r = system(cmd.c_str())) != 0) {
@@ -894,6 +1413,12 @@ int Ossfs2TestSuite::delete_dir(const std::string &target,
 int Ossfs2TestSuite::stat_file(const std::string &target,
                                const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
+
+  if (is_hdfs_mode_) {
+    std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
+    return hdfs_helper_->stat_file(hdfs_path);
+  }
+
   std::string cmd;
   std::string ossutil = lookup_ossutil();
 
@@ -913,10 +1438,30 @@ int Ossfs2TestSuite::stat_file(const std::string &target,
 
 std::map<std::string, std::string> Ossfs2TestSuite::get_file_meta(
     const std::string &target, const std::string &oss_prefix) {
+  std::map<std::string, std::string> res;
+
+  if (is_hdfs_mode_) {
+    // HDFS: use SDK to get Content-Length and compute CRC64 by reading back.
+    std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
+    std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
+
+    int64_t file_size = 0;
+    int r = hdfs_helper_->stat_file_size(hdfs_path, file_size);
+    if (r == 0) {
+      res["Content-Length"] = std::to_string(file_size);
+    }
+
+    std::string crc = hdfs_helper_->read_file_crc64(hdfs_path);
+    if (!crc.empty()) {
+      res["X-Oss-Hash-Crc64ecma"] = crc;
+    }
+
+    return res;
+  }
+
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
   std::string cmd;
   std::string ossutil = lookup_ossutil();
-  std::map<std::string, std::string> res;
   int retry_times = 3;
   std::string output;
 
@@ -955,6 +1500,12 @@ int Ossfs2TestSuite::set_file_meta(const std::string &target,
                                    const std::string &key,
                                    const std::string &value,
                                    const std::string &oss_prefix) {
+  if (is_hdfs_mode_) {
+    // HDFS does not support OSS-style metadata headers; no-op.
+    LOG_DEBUG("set_file_meta: not supported in HDFS mode, skipping");
+    return 0;
+  }
+
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
   std::string cmd;
   std::string ossutil = lookup_ossutil();
@@ -977,10 +1528,17 @@ int Ossfs2TestSuite::set_file_meta(const std::string &target,
 std::vector<std::string> Ossfs2TestSuite::get_list_objects(
     const std::string &target, const std::string &oss_prefix,
     bool include_self) {
+  std::vector<std::string> res;
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
+
+  if (is_hdfs_mode_) {
+    std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
+    hdfs_helper_->list_dir(hdfs_path, res);
+    return res;
+  }
+
   std::string cmd;
   std::string ossutil = lookup_ossutil();
-  std::vector<std::string> res;
 
   cmd = ossutil + " -i " + FLAGS_oss_access_key_id + " -k " +
         FLAGS_oss_access_key_secret + " -e " + FLAGS_oss_endpoint +
@@ -1064,6 +1622,11 @@ int Ossfs2TestSuite::upload_file_tree(int depth, int width, int files,
 int Ossfs2TestSuite::create_oss_symlink(const std::string &object,
                                         const std::string &link,
                                         const std::string &oss_prefix) {
+  if (is_hdfs_mode_) {
+    LOG_ERROR("create_oss_symlink: not supported in HDFS mode");
+    return -ENOTSUP;
+  }
+
   std::string osspath = join_paths(oss_prefix, get_test_osspath(object));
   std::string cmd;
   std::string ossutil = lookup_ossutil();
@@ -1085,6 +1648,11 @@ int Ossfs2TestSuite::create_oss_symlink(const std::string &object,
 int Ossfs2TestSuite::read_oss_symlink(const std::string &object,
                                       std::string &link,
                                       const std::string &oss_prefix) {
+  if (is_hdfs_mode_) {
+    LOG_ERROR("read_oss_symlink: not supported in HDFS mode");
+    return -ENOTSUP;
+  }
+
   std::string osspath = join_paths(oss_prefix, get_test_osspath(object));
   std::string cmd;
   std::string ossutil = lookup_ossutil();

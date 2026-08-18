@@ -20,12 +20,15 @@
 #include <gflags/gflags.h>
 #include <linux/fs.h>
 #include <photon/common/iovector.h>
+#include <photon/common/utility.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <queue>
 #include <thread>
 
@@ -35,8 +38,10 @@
 #include "disk_cache.h"
 #include "error_codes.h"
 #include "file.h"
+#include "file_hdfs.h"
 #include "mem_cache.h"
 #include "metric/metrics.h"
+#include "random_write_context.h"
 
 #define GET_INODE_REF_ONLY_WITH_RET(id)                            \
   auto ref = get_inode_ref((id), InodeRefPathType::kPathTypeNone); \
@@ -70,10 +75,12 @@ gid_t Attribute::DEFAULT_GID = 0;
 uid_t Attribute::DEFAULT_UID = 0;
 mode_t Attribute::DEFAULT_DIR_MODE = 0755;
 mode_t Attribute::DEFAULT_FILE_MODE = 0644;
+blksize_t Attribute::DEFAULT_BLKSIZE = 4096;  // Default to OSS mode
 
 OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env,
              std::unique_ptr<IIdManager> id_manager)
     : options_(options),
+      write_mode_(compute_write_mode(options)),
       bg_vcpu_env_(bg_vcpu_env),
       id_manager_(std::move(id_manager)),
       prefetch_sem_(
@@ -99,6 +106,9 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env,
   upload_buffers_ = std::make_unique<FixedBlockMemoryPool>(
       options_.upload_buffer_size, options_.upload_concurrency + 4,
       options_.upload_concurrency + 4, options_.mempool_purge_interval_ms);
+  // Derive base part size: aligned to chunk_size so parts never split chunks.
+  random_write_base_part_size_ =
+      align_up(options_.upload_buffer_size, options_.random_write_chunk_size);
   if (enable_prefetching()) {
     size_t blocks_per_prefetch_chunk =
         (options_.prefetch_chunk_size + options_.cache_block_size - 1) /
@@ -331,14 +341,25 @@ retry_with_write_path_lock:
 
   invalidate_data_cache_if_needed(inode, stbuf, remote_etag);
   update_inode_etag(inode, remote_etag);
-  inode->update_attr(stbuf->st_size, stbuf->st_mtim);
+  inode->set_mode(stbuf->st_mode);
+  inode->set_uid(stbuf->st_uid);
+  inode->set_gid(stbuf->st_gid);
+  inode->update_attr(stbuf->st_size, stbuf->st_mtim, stbuf->st_atim);
+  resync_randwrite_remote_size(inode);
   inode->fill_statbuf(stbuf);
   return 0;
 }
 
-// inode's wlock
-// Only mtime and truncation to 0 are supported.
-int OssFs::setattr(uint64_t nodeid, struct stat *stbuf, int to_set) {
+// inode's wlock.
+// Routes to hdfs_setattr in HDFS mode; OSS only supports mtime and
+// truncation to 0.
+int OssFs::setattr(uint64_t nodeid, struct stat *stbuf, int to_set,
+                   struct fuse_file_info *fi, uid_t caller_uid,
+                   gid_t caller_gid) {
+  if (is_hdfs_mode()) {
+    return hdfs_setattr(nodeid, stbuf, to_set, fi, caller_uid, caller_gid);
+  }
+
   GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
   Inode *inode = ref.inode;
 
@@ -348,26 +369,329 @@ int OssFs::setattr(uint64_t nodeid, struct stat *stbuf, int to_set) {
   if (to_set & FUSE_SET_ATTR_MTIME) {
     inode->update_attr(inode->attr.size, stbuf->st_mtim);
   } else if (to_set & FUSE_SET_ATTR_SIZE) {
-    if (stbuf->st_size != 0) {
-      LOG_ERROR("nodeid ` truncate to non-zero is not supported.", nodeid);
-      return -ENOTSUP;
-    }
     if (inode->is_dir()) return -EISDIR;
 
-    if (inode->attr.size == 0) goto exit;
+    if (write_mode() == WriteMode::Random) {
+      RELEASE_ASSERT(stbuf->st_size >= 0);
+      uint64_t new_size = static_cast<uint64_t>(stbuf->st_size);
+      if (new_size != inode->attr.size) {
+        int r = random_write_truncate(static_cast<FileInode *>(inode),
+                                      ref.inode_path, new_size);
+        if (r < 0) return r;
+      }
+    } else {
+      if (stbuf->st_size != 0) {
+        LOG_WARN("nodeid ` truncate to non-zero is not supported.", nodeid);
+        return -ENOTSUP;
+      }
 
-    if (static_cast<FileInode *>(inode)->is_dirty_file()) {
-      LOG_ERROR("nodeid ` is dirty, cannot be truncated", nodeid);
-      return -EBUSY;
+      if (inode->attr.size == 0) goto exit;
+
+      if (static_cast<FileInode *>(inode)->is_dirty_file()) {
+        LOG_ERROR("nodeid ` is dirty, cannot be truncated", nodeid);
+        return -EBUSY;
+      }
+
+      int r = truncate_inode_data(inode, ref.inode_path, 0);
+      if (r < 0) return r;
     }
-
-    int r = truncate_inode_data(inode, ref.inode_path, 0);
-    if (r < 0) return r;
   }
 
 exit:
   // FUSE needs refill stat buffer.
   inode->fill_statbuf(stbuf);
+  return 0;
+}
+
+int OssFs::hdfs_setattr(uint64_t nodeid, struct stat *stbuf, int to_set,
+                        struct fuse_file_info *fi, uid_t caller_uid,
+                        gid_t caller_gid) {
+  GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
+  Inode *inode = ref.inode;
+
+  std::unique_lock<std::shared_mutex> l(inode->inode_lock);
+  if (inode->is_stale) return -ESTALE;
+
+  // setattr processes multiple flags sequentially. If any operation fails,
+  // subsequent operations are skipped but completed operations are NOT rolled
+  // back (partial failure). Order matches libfuse's fuse_lib_setattr
+  // (lib/fuse.c:2787): chmod -> chown -> truncate -> utimens.
+
+  // chmod.
+  if (to_set & FUSE_SET_ATTR_MODE) {
+    int r = do_hdfs_setattr_mode(nodeid, ref.inode_path, stbuf->st_mode, inode,
+                                 caller_uid, caller_gid);
+    if (r < 0) return r;
+  }
+
+  // chown.
+  if (to_set & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) {
+    int r = do_hdfs_setattr_uid_gid(nodeid, ref.inode_path, stbuf, to_set,
+                                    inode, caller_uid, caller_gid);
+    if (r < 0) return r;
+  }
+
+  // truncate.
+  if (to_set & FUSE_SET_ATTR_SIZE) {
+    int r;
+    if (fi && fi->fh) {
+      r = do_hdfs_ftruncate(nodeid, inode, stbuf->st_size, fi, caller_uid,
+                            caller_gid);
+    } else {
+      r = do_hdfs_setattr_size(nodeid, inode, ref.inode_path, stbuf->st_size,
+                               caller_uid, caller_gid);
+    }
+    if (r < 0) return r;
+  }
+
+  // utimensat.
+  if (to_set & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME)) {
+    int r = do_hdfs_setattr_times(inode, ref.inode_path, stbuf, to_set,
+                                  caller_uid, caller_gid);
+    if (r < 0) return r;
+  }
+
+  // Refresh attributes from backend so the setattr reply carries real values
+  // (equivalent to libfuse high-level API's automatic getattr after setattr).
+  // If stat fails, propagate the error.
+  int stat_ret = PERFORM_BACKGROUND_OBJ_REQUEST(this, stat, ref.inode_path,
+                                                stbuf, nullptr);
+  if (stat_ret < 0) return stat_ret;
+
+  inode->set_mode(stbuf->st_mode);
+  inode->set_uid(stbuf->st_uid);
+  inode->set_gid(stbuf->st_gid);
+  inode->update_attr(stbuf->st_size, stbuf->st_mtim, stbuf->st_atim);
+  inode->fill_statbuf(stbuf);
+  return 0;
+}
+
+int OssFs::do_hdfs_setattr_mode(uint64_t nodeid, std::string_view path,
+                                mode_t mode, Inode *inode, uid_t caller_uid,
+                                gid_t caller_gid) {
+  int r = check_permission(PermOp::Chmod, inode, caller_uid, caller_gid);
+  if (r < 0) return r;
+
+  r = PERFORM_BACKGROUND_OBJ_REQUEST(this, set_permission, path,
+                                     mode & kPermMask);
+  if (r < 0) {
+    LOG_ERROR("Failed to chmod, path: `, mode: 0o`, error: `", path,
+              OCT(mode & kPermMask), r);
+    return r;
+  }
+
+  inode->set_mode((inode->get_mode() & ~kPermMask) | (mode & kPermMask));
+  LOG_INFO("chmod success, nodeid: `, path: `, mode: 0o`", nodeid, path,
+           OCT(mode & kPermMask));
+  return 0;
+}
+
+int OssFs::do_hdfs_setattr_uid_gid(uint64_t nodeid, std::string_view path,
+                                   const struct stat *stbuf, int to_set,
+                                   Inode *inode, uid_t caller_uid,
+                                   gid_t caller_gid) {
+  int r = check_permission(PermOp::Chown, inode, caller_uid, caller_gid);
+  if (r < 0) return r;
+
+  uid_t uid = (to_set & FUSE_SET_ATTR_UID) ? stbuf->st_uid : inode->get_uid();
+  gid_t gid = (to_set & FUSE_SET_ATTR_GID) ? stbuf->st_gid : inode->get_gid();
+
+  // Convert FUSE flags to store layer flags.
+  int store_to_set = 0;
+  if (to_set & FUSE_SET_ATTR_UID) store_to_set |= IObjStore::kSetUid;
+  if (to_set & FUSE_SET_ATTR_GID) store_to_set |= IObjStore::kSetGid;
+
+  r = PERFORM_BACKGROUND_OBJ_REQUEST(this, set_owner, path, uid, gid,
+                                     store_to_set);
+  if (r < 0) {
+    LOG_ERROR("Failed to chown, path: `, uid: `, gid: `, error: `", path, uid,
+              gid, r);
+    return r;
+  }
+
+  if (to_set & FUSE_SET_ATTR_UID) inode->set_uid(stbuf->st_uid);
+  if (to_set & FUSE_SET_ATTR_GID) inode->set_gid(stbuf->st_gid);
+  LOG_INFO("chown success, nodeid: `, path: `, uid: `, gid: `", nodeid, path,
+           uid, gid);
+  return 0;
+}
+
+int OssFs::check_permission(PermOp op, Inode *inode, uid_t uid, gid_t gid) {
+  if (!is_hdfs_mode()) return 0;
+
+  struct stat stbuf;
+  inode->fill_statbuf(&stbuf);
+  return PERFORM_BACKGROUND_OBJ_REQUEST(this, check_permission, op, &stbuf, uid,
+                                        gid);
+}
+
+int OssFs::do_hdfs_setattr_times(Inode *inode, std::string_view path,
+                                 const struct stat *stbuf, int to_set,
+                                 uid_t caller_uid, gid_t caller_gid) {
+  // Save original timestamps for no-op detection.
+  struct timespec old_atime = inode->get_atime();
+  struct timespec old_mtime = inode->get_mtime();
+
+  // clock_gettime once to ensure both NOW timestamps use the same value.
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+
+  // Compute target timestamps.
+  struct timespec new_atime = old_atime;
+  struct timespec new_mtime = old_mtime;
+  if (to_set & FUSE_SET_ATTR_ATIME) {
+    new_atime = (to_set & FUSE_SET_ATTR_ATIME_NOW) ? now : stbuf->st_atim;
+  }
+  if (to_set & FUSE_SET_ATTR_MTIME) {
+    new_mtime = (to_set & FUSE_SET_ATTR_MTIME_NOW) ? now : stbuf->st_mtim;
+  }
+
+  // Convert to milliseconds first (HDFS only supports ms precision).
+  int64_t new_atime_ms = new_atime.tv_sec * 1000 + new_atime.tv_nsec / 1000000;
+  int64_t new_mtime_ms = new_mtime.tv_sec * 1000 + new_mtime.tv_nsec / 1000000;
+  int64_t old_atime_ms = old_atime.tv_sec * 1000 + old_atime.tv_nsec / 1000000;
+  int64_t old_mtime_ms = old_mtime.tv_sec * 1000 + old_mtime.tv_nsec / 1000000;
+
+  // Permission check: non-owner non-root.
+  if (caller_uid != 0 && caller_uid != inode->get_uid()) {
+    bool atime_now = (to_set & FUSE_SET_ATTR_ATIME_NOW) != 0;
+    bool mtime_now = (to_set & FUSE_SET_ATTR_MTIME_NOW) != 0;
+    if (atime_now && mtime_now) {
+      int r =
+          check_permission(PermOp::Utimensat, inode, caller_uid, caller_gid);
+      if (r < 0) return r;
+    } else if (new_atime_ms == old_atime_ms && new_mtime_ms == old_mtime_ms) {
+      // no-op: timestamps unchanged.
+    } else {
+      return -EPERM;
+    }
+  }
+
+  // Only call RPC if milliseconds actually changed.
+  if (new_atime_ms != old_atime_ms || new_mtime_ms != old_mtime_ms) {
+    int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, set_times, path, new_mtime_ms,
+                                           new_atime_ms);
+    if (r < 0) return r;
+
+    inode->set_atime(new_atime);
+    inode->set_mtime(new_mtime);
+    LOG_INFO("utimensat success, path: `, atime_ms: `, mtime_ms: `", path,
+             new_atime_ms, new_mtime_ms);
+  }
+  return 0;
+}
+
+int OssFs::do_hdfs_setattr_size(uint64_t nodeid, Inode *inode,
+                                std::string_view full_path, off_t target_size,
+                                uid_t caller_uid, gid_t caller_gid) {
+  if (inode->is_dir()) return -EISDIR;
+
+  int r = check_permission(PermOp::Truncate, inode, caller_uid, caller_gid);
+  if (r < 0) return r;
+
+  FileInode *file_inode = static_cast<FileInode *>(inode);
+  off_t current_size = static_cast<off_t>(inode->attr.size);
+
+  if (target_size == current_size) return 0;
+
+  if (target_size > current_size) {
+    RawObjHandle *raw_handle = nullptr;
+    int open_ret = PERFORM_BACKGROUND_OBJ_REQUEST(
+        this, open_object, full_path, O_WRONLY, (mode_t)0777, &raw_handle);
+    if (open_ret < 0) {
+      LOG_ERROR("Failed to open for fallocate, nodeid: `, ret: `", nodeid,
+                open_ret);
+      return open_ret;
+    }
+
+    DEFER({
+      if (raw_handle) {
+        int close_ret = raw_handle->close();
+        if (close_ret < 0) {
+          LOG_ERROR("Failed to close raw handle, nodeid: `, r: `", nodeid,
+                    close_ret);
+        }
+        delete raw_handle;
+      }
+    });
+
+    off_t extend_len = target_size - current_size;
+    r = raw_handle->fallocate(current_size, extend_len);
+    if (r < 0) {
+      LOG_ERROR("Failed to fallocate, nodeid: `, offset: `, len: `, r: `",
+                nodeid, current_size, extend_len, r);
+      return r;
+    }
+
+    inode->attr.size = target_size;
+    clock_gettime(CLOCK_REALTIME, &inode->attr.mtime);
+    return 0;
+  }
+
+  r = PERFORM_BACKGROUND_OBJ_REQUEST(this, truncate_object, full_path,
+                                     target_size);
+  if (r < 0) {
+    LOG_ERROR("Failed to truncate, nodeid: `, size: `, r: `", nodeid,
+              target_size, r);
+    return r;
+  }
+
+  file_inode->invalidate_data_cache = true;
+  file_inode->attr.size = target_size;
+  clock_gettime(CLOCK_REALTIME, &inode->attr.mtime);
+  LOG_INFO("truncate success, nodeid: `, path: `, target_size: `", nodeid,
+           full_path, target_size);
+  return 0;
+}
+
+int OssFs::do_hdfs_ftruncate(uint64_t nodeid, Inode *inode, off_t target_size,
+                             struct fuse_file_info *fi, uid_t caller_uid,
+                             gid_t caller_gid) {
+  if (!fi || !fi->fh) {
+    LOG_ERROR("ftruncate called without file handle, nodeid: `", nodeid);
+    return -EBADF;
+  }
+
+  int r = check_permission(PermOp::Ftruncate, inode, caller_uid, caller_gid);
+  if (r < 0) return r;
+
+  auto *handle = reinterpret_cast<IFileHandleFuseLL *>(fi->fh);
+  r = handle->ftruncate(target_size);
+  if (r < 0) return r;
+
+  // size is already updated by handle->ftruncate().
+  // Invalidate caches so next getattr fetches fresh mtime/size from backend.
+  auto *file_inode = static_cast<FileInode *>(inode);
+  file_inode->invalidate_data_cache = true;
+  inode->attr_time = 0;
+  LOG_INFO("ftruncate success, nodeid: `, target_size: `", nodeid, target_size);
+  return 0;
+}
+
+int OssFs::fallocate(uint64_t nodeid, off_t offset, off_t length, void *fh) {
+  if (!is_hdfs_mode()) return -ENOTSUP;
+
+  if (length > 0 && offset > std::numeric_limits<off_t>::max() - length) {
+    return -EFBIG;
+  }
+  off_t new_end = offset + length;
+
+  GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
+  Inode *inode = ref.inode;
+
+  std::unique_lock<std::shared_mutex> l(inode->inode_lock);
+  if (inode->is_stale) return -ESTALE;
+
+  auto *handle = static_cast<IFileHandleFuseLL *>(fh);
+  int r = handle->fallocate(offset, length);
+  if (r < 0) return r;
+
+  if (new_end > static_cast<off_t>(inode->attr.size)) {
+    inode->attr.size = new_end;
+    auto *file_inode = static_cast<FileInode *>(inode);
+    file_inode->invalidate_data_cache = true;
+    inode->attr_time = 0;
+  }
   return 0;
 }
 
@@ -389,6 +713,74 @@ int OssFs::statfs(struct statvfs *stbuf) {
 
   stbuf->f_namemax = kOssfsMaxFileNameLength;
 
+  return 0;
+}
+
+int OssFs::flush_dirty_inodes_for_rename(Inode *src_node,
+                                         std::string_view src_path) {
+  if (is_hdfs_mode()) return 0;
+
+  std::vector<FileInode *> dirty_inodes;
+  if (!src_node->is_dir()) {
+    FileInode *src_file_node = static_cast<FileInode *>(src_node);
+    if (src_file_node->is_dirty_file()) {
+      dirty_inodes.push_back(src_file_node);
+      LOG_INFO("rename for ` which is dirty inodes", src_path);
+    }
+  } else {
+    auto all_dirty_nodeids = get_dirty_nodeids();
+    std::lock_guard<std::mutex> l(inodes_map_lck_);
+
+    for (auto nodeid : all_dirty_nodeids) {
+      auto it = global_inodes_map_.find(nodeid);
+      if (it == global_inodes_map_.end()) continue;
+
+      Inode *inode = it->second;
+      while (inode && inode->nodeid != kMountPointNodeId) {
+        if (inode->is_stale) break;
+        if (inode == src_node) {
+          dirty_inodes.push_back(static_cast<FileInode *>(it->second));
+          break;
+        }
+        inode = inode->parent;
+      }
+    }
+    LOG_INFO("rename for ` found ` dirty inodes, total ` dirty nodes", src_path,
+             dirty_inodes.size(), all_dirty_nodeids.size());
+  }
+
+  // dirty_fh and rw_ctx alias one union slot; the write mode picks the member.
+  const bool random_mode = (write_mode() == WriteMode::Random);
+  for (auto &dinode : dirty_inodes) {
+    std::unique_lock<std::shared_mutex> wl(dinode->inode_lock, std::defer_lock);
+    if (dinode != src_node) wl.lock();
+    if (!random_mode && dinode->dirty_fh) {
+      auto file = dinode->dirty_fh;
+      int r = file->fdatasync_lock_held();
+      if (r < 0) {
+        LOG_ERROR("fail to fdatasync dirty file `, with error: `",
+                  dinode->nodeid, r);
+        return r;
+      }
+    } else if (dinode->is_dirty && dinode->rw_ctx) {
+      // Random mode: flush via a transient writer (see random_write_truncate).
+      auto writer = create_oss_writer(this, dinode->rw_ctx->upload_path, dinode,
+                                      /*flags=*/0);
+      int r = writer->open();
+      if (r < 0) {
+        LOG_ERROR("rename: transient writer open failed, nodeid `, r `",
+                  dinode->nodeid, r);
+        return r;
+      }
+      DEFER(writer->close());
+      r = writer->flush();
+      if (r < 0) {
+        LOG_ERROR("rename: transient writer flush failed, nodeid `, r `",
+                  dinode->nodeid, r);
+        return r;
+      }
+    }
+  }
   return 0;
 }
 
@@ -438,6 +830,19 @@ int OssFs::rename(uint64_t old_parent, std::string_view old_name,
   }
   if (src_node->is_stale) return -ESTALE;
 
+  return do_rename_locked(o_parent, n_parent, src_node, old_name, new_name,
+                          new_parent, ref.ref1.parent_path,
+                          ref.ref2.parent_path, flags);
+}
+
+// Caller must hold the unique inode_lock of both parents (locked in nodeid
+// order) and the unique inode_lock of src_node.
+int OssFs::do_rename_locked(DirInode *o_parent, DirInode *n_parent,
+                            Inode *src_node, std::string_view old_name,
+                            std::string_view new_name, uint64_t new_parent,
+                            std::string_view src_parent_path,
+                            std::string_view dst_parent_path,
+                            unsigned int flags) {
   // check dst
   Inode *dst_node = n_parent->find_child_node(new_name);
   DEFER(if (dst_node) dst_node->inode_lock.unlock());
@@ -456,8 +861,8 @@ int OssFs::rename(uint64_t old_parent, std::string_view old_name,
     }
   }
 
-  auto src_path = ref.ref1.parent_path;
-  auto dst_path = ref.ref2.parent_path;
+  std::string src_path(src_parent_path);
+  std::string dst_path(dst_parent_path);
   if (src_path.back() != '/') src_path.append("/");
   if (dst_path.back() != '/') dst_path.append("/");
   src_path.append(old_name.data(), old_name.size());
@@ -493,59 +898,22 @@ int OssFs::rename(uint64_t old_parent, std::string_view old_name,
     }
   }
 
-  std::vector<FileInode *> dirty_inodes;
-  if (!src_node->is_dir()) {
-    FileInode *src_file_node = static_cast<FileInode *>(src_node);
-    if (src_file_node->is_dirty_file()) {
-      dirty_inodes.push_back(src_file_node);
-      LOG_INFO("rename for ` which is dirty inodes", src_path);
-    }
-  } else {
-    // If this is a dir, we want to make sure all the dirty files are flushed,
-    // so we can copy the written data.
-    auto all_dirty_nodeids = get_dirty_nodeids();
-    // Grab global lock to make it exclusive with forget operations,
-    // as the inodes do not in the dir can be forgotten at the same time.
-    std::lock_guard<std::mutex> l(inodes_map_lck_);
+  int r = flush_dirty_inodes_for_rename(src_node, src_path);
+  if (r < 0) return r;
 
-    for (auto nodeid : all_dirty_nodeids) {
-      auto it = global_inodes_map_.find(nodeid);
-      if (it == global_inodes_map_.end()) continue;
-
-      Inode *inode = it->second;
-      while (inode && inode->nodeid != kMountPointNodeId) {
-        if (inode->is_stale) break;
-        if (inode == src_node) {
-          dirty_inodes.push_back(static_cast<FileInode *>(it->second));
-          break;
-        }
-        inode = inode->parent;
-      }
-    }
-    LOG_INFO("rename for ` found ` dirty inodes, total ` dirty nodes", src_path,
-             dirty_inodes.size(), all_dirty_nodeids.size());
+  // In random-write mode, hide an opened dst instead of overwriting it.
+  bool need_hide = write_mode() == WriteMode::Random && dst_node &&
+                   !dst_node->is_stale && dst_node->is_file() &&
+                   dst_node->open_ref_cnt > 0;
+  if (need_hide) {
+    r = hide_inode(n_parent, dst_node, dst_parent_path);
+    if (r < 0) return r;
   }
 
-  // All the inodes are dirty, so they must be valid now. Due to the
-  // path lock, they could not become clean during the rename process.
-  for (auto &dinode : dirty_inodes) {
-    std::unique_lock<std::shared_mutex> wl(dinode->inode_lock, std::defer_lock);
-    if (dinode != src_node /*we are renaming a dirty file*/) wl.lock();
-    auto file = dinode->dirty_fh;
-    RELEASE_ASSERT(file);
-    int r = file->fdatasync_lock_held();
-    if (r < 0) {
-      LOG_ERROR("fail to fdatasync dirty file `, with error: `", dinode->nodeid,
-                r);
-      return r;
-    }
-  }
-
-  int r = 0;
   if (src_node->is_dir()) {
-    r = rename_dir(src_path, dst_path);
+    r = rename_dir(src_path, dst_path, dst_node != nullptr);
   } else {
-    r = rename_file(src_path, dst_path);
+    r = rename_file(src_path, dst_path, dst_node != nullptr && !need_hide);
   }
   if (r < 0) {
     LOG_ERROR("fail to rename from ` to ` on the cloud", src_path, dst_path);
@@ -565,7 +933,7 @@ int OssFs::rename(uint64_t old_parent, std::string_view old_name,
     src_node->name = new_name;
 
     // Mark dst as stale and overwrite the dst then.
-    if (dst_node) {
+    if (dst_node && !need_hide) {
       dst_node->is_stale = true;
       n_parent->erase_child_node(new_name, dst_node->nodeid);
     }
@@ -594,16 +962,102 @@ int OssFs::rename(uint64_t old_parent, std::string_view old_name,
   return 0;
 }
 
-// parent's rlock + inode's wlock (for the whole func)
+// Rename a file to ".fuse_hiddenXXX" (libfuse naming: nodeid + seq) under
+// the same parent. Retries with a new seq on -EEXIST, -EBUSY after that.
+// Caller must hold the unique inode_lock of parent and src_node.
+int OssFs::hide_inode(DirInode *parent, Inode *src_node,
+                      std::string_view parent_path) {
+  RELEASE_ASSERT(!src_node->is_dir());
+  RELEASE_ASSERT(src_node->parent == parent);
+  RELEASE_ASSERT(src_node->open_ref_cnt > 0);
+
+  constexpr int kMaxRetry = 10;
+  for (int i = 0; i < kMaxRetry; ++i) {
+    char hidden_name[48];
+    snprintf(hidden_name, sizeof(hidden_name), ".fuse_hidden%08x%08x%08x",
+             (unsigned int)(src_node->nodeid >> 32),
+             (unsigned int)(src_node->nodeid & 0xffffffff),
+             hidden_inode_seq_.fetch_add(1));
+    LOG_INFO("hide_inode. parent: `, name: `, hidden_name: `", parent->nodeid,
+             src_node->name, hidden_name);
+    int r = do_rename_locked(parent, parent, src_node, src_node->name,
+                             hidden_name, parent->nodeid, parent_path,
+                             parent_path, RENAME_NOREPLACE);
+    if (r == 0) {
+      src_node->is_hidden = true;
+      return 0;
+    }
+    if (r != -EEXIST) return r;
+    LOG_WARN("hidden name ` already exists under `, retry", hidden_name,
+             parent->nodeid);
+  }
+
+  LOG_ERROR("fail to hide ` under ` after ` retries", src_node->name,
+            parent->nodeid, kMaxRetry);
+  return -EBUSY;
+}
+
+void OssFs::delete_hidden_inode(FileInode *inode, std::string_view inode_path) {
+  DirInode *parent = static_cast<DirInode *>(inode->parent);
+  std::unique_lock<std::shared_mutex> pl(parent->inode_lock);
+  std::unique_lock<std::shared_mutex> il(inode->inode_lock);
+
+  if (inode->open_ref_cnt != 0) return;
+
+  if (inode_path.empty()) {
+    LOG_ERROR("fail to delete hidden object, nodeid: `, empty path",
+              inode->nodeid);
+    return;
+  }
+
+  // Hold the parent lock until the delete lands so a concurrent readdirplus
+  // cannot fill the hidden entry with this inode while the object is being
+  // deleted, and a rename/create against the hidden name cannot take over
+  // the path first.
+  int dr = PERFORM_BACKGROUND_OBJ_REQUEST(this, delete_object, inode_path);
+  if (dr < 0 && dr != -ENOENT) {
+    LOG_ERROR("fail to delete hidden object `, error: `", inode_path, dr);
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> ml(inodes_map_lck_);
+    inode->is_stale = true;
+  }
+  LOG_INFO("deleted hidden object `, nodeid: `", inode_path, inode->nodeid);
+}
+
+void OssFs::mark_ghost_children_stale(DirInode *parent_inode) {
+  for (auto &cit : parent_inode->children) {
+    Inode *child = cit.second;
+    // Only files are reaped; a dir's local state may not be fully uploaded.
+    if (!child->is_file()) continue;
+
+    std::unique_lock<std::shared_mutex> cl(child->inode_lock);
+    if (child->is_stale || child->open_ref_cnt != 0) continue;
+    // A dirty file may not be visible in the remote listing yet.
+    if (static_cast<FileInode *>(child)->is_dirty) continue;
+
+    LOG_INFO("mark ghost child ` of dir ` stale after empty remote listing",
+             cit.first, parent_inode->nodeid);
+    {
+      std::lock_guard<std::mutex> l(inodes_map_lck_);
+      child->is_stale = true;
+    }
+  }
+}
+
+// parent's wlock + inode's wlock (for the whole func)
 // No need to delete the inode inside. FUSE kernel will handle it later
 // (forget).
-int OssFs::unlink(uint64_t parent, std::string_view name) {
+int OssFs::unlink(uint64_t parent, std::string_view name, uid_t caller_uid,
+                  gid_t caller_gid) {
   LOG_INFO("unlink. parent: `, name `", parent, name);
 
   GET_PARENT_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(parent, name);
   DirInode *parent_inode = ref.parent;
 
-  std::shared_lock<std::shared_mutex> pl(parent_inode->inode_lock);
+  std::unique_lock<std::shared_mutex> pl(parent_inode->inode_lock);
   if (parent_inode->is_stale) return -ESTALE;
 
   Inode *child = parent_inode->find_child_node(name);
@@ -616,6 +1070,21 @@ int OssFs::unlink(uint64_t parent, std::string_view name) {
   if (child->is_stale) {
     LOG_ERROR("unlink: stale child ` of `", name, parent);
     return -ESTALE;
+  }
+
+  if (is_hdfs_mode()) {
+    // HDFS-specific: check permission on the child inode rather than parent
+    // directory. HDFS NameNode enforces the real permission on unlink RPC;
+    // this pre-check is a fast-path rejection to avoid unnecessary RPCs.
+    int r = check_permission(PermOp::Unlink, child, caller_uid, caller_gid);
+    if (r < 0) return r;
+  }
+
+  // In random-write mode, hide an opened file instead of deleting it; the
+  // hidden object is removed on the last release.
+  if (write_mode() == WriteMode::Random && child->is_file() &&
+      child->open_ref_cnt > 0) {
+    return hide_inode(parent_inode, child, ref.parent_path);
   }
 
   auto full_path = ref.parent_path;
@@ -644,7 +1113,7 @@ int OssFs::creat(uint64_t parent, std::string_view name, int flags, mode_t mode,
   LOG_INFO("create. parent: `, name: `, flags: `, append: `", parent, name,
            flags, (flags & O_APPEND) > 0);
   return create_internal(parent, name, flags, nodeid, stbuf, fh,
-                         InodeType::kFile, "");
+                         InodeType::kFile, "", mode & kPermMask, uid, gid);
 }
 
 // inode's wlock
@@ -682,34 +1151,37 @@ int OssFs::open(uint64_t nodeid, int flags, void **fh, bool *keep_page_cache) {
     }
 
     inode->etag = remote_etag;
-    inode->update_attr(stbuf.st_size, stbuf.st_mtim);
+    inode->update_attr(stbuf.st_size, stbuf.st_mtim, stbuf.st_atim);
+    resync_randwrite_remote_size(inode);
   }
 
   if (inode->invalidate_data_cache) {
     evict_inode_cache(inode);
   }
 
-  if (inode->open_ref_cnt == 0 && options_.share_fd_read_buffer &&
-      inode->cache == nullptr) {
+  // Random write + prefetching needs shared cache so mark_clean() can drop it.
+  if (inode->open_ref_cnt == 0 && enable_prefetching() &&
+      (options_.share_fd_read_buffer || write_mode() == WriteMode::Random)) {
     inode->cache = create_inode_cache();
   }
 
   if (flags & O_TRUNC) {
-    // Currently we don't allow a file being written by more than one handle.
-    if (inode->is_dirty && inode->attr.size != 0) {
+    if (write_mode() != WriteMode::Random && inode->is_dirty &&
+        inode->attr.size != 0) {
       LOG_ERROR("file ` is being written, cannot be truncated", nodeid);
       return -EBUSY;
     }
   }
 
-  auto oss_fh = create_oss_file_handle(this, full_path, inode, flags);
-  auto r = oss_fh->open();
+  auto file_handle = create_file_handle(full_path, inode, flags,
+                                        inode->get_mode() & kPermMask);
+  auto r = file_handle->open();
   if (r < 0) {
-    oss_fh->release();
+    file_handle->release();
     return r;
   }
 
-  *fh = oss_fh;
+  *fh = file_handle;
   inode->open_ref_cnt++;
 
   *keep_page_cache = !inode->invalidate_data_cache;
@@ -733,29 +1205,39 @@ int OssFs::release(uint64_t nodeid, void *fh) {
   DEFER(return_inode_ref(ref));
 
   // No need to hold path lock as fh is valid definitely.
-  OssFileHandle *oss_fh = static_cast<OssFileHandle *>(fh);
-  RELEASE_ASSERT(oss_fh);
-  FileInode *inode = oss_fh->get_inode();
+  IFileHandleFuseLL *handle = static_cast<IFileHandleFuseLL *>(fh);
+  RELEASE_ASSERT(handle);
+  FileInode *inode = static_cast<FileInode *>(handle->get_inode());
 
   int r = 0;
+  bool delete_hidden = false;
   {
     std::unique_lock<std::shared_mutex> l(inode->inode_lock);
     inode->open_ref_cnt--;
 
-    r = oss_fh->close();
-    if (r < 0) {
-      LOG_ERROR("fail to close file ` due to error `", oss_fh->get_path(), r);
-      inode->invalidate_data_cache = true;
-    } else {
-      LOG_INFO("release file: `, nodeid: `", oss_fh->get_path(), nodeid);
+    if (inode->open_ref_cnt == 0 && inode->is_hidden) {
+      delete_hidden = true;
     }
 
-    if (inode->open_ref_cnt == 0 && inode->cache) {
-      inode->cache.reset();
+    r = handle->close();
+    if (r < 0) {
+      LOG_ERROR("fail to close file, nodeid: `, error: `", nodeid, r);
+      inode->invalidate_data_cache = true;
+    } else {
+      LOG_INFO("release file, nodeid: `", nodeid);
+    }
+
+    if (inode->open_ref_cnt == 0) {
+      if (inode->cache) inode->cache.reset();
     }
   }
 
-  oss_fh->release();
+  // Delete the hidden object only after close(), which may flush data to it.
+  if (delete_hidden) {
+    delete_hidden_inode(inode, ref.inode_path);
+  }
+
+  handle->release();
   return r;
 }
 
@@ -900,6 +1382,13 @@ int OssFs::readdir(uint64_t nodeid, off_t off, void *dh,
     if (r != 0) return r;
 
     r = readdir_fill_plus(parent_inode, odh, filler, filler_ctx);
+
+    // The listing ran from the start to the end without any entry: the
+    // remote dir is confirmed empty, so reap ghost file children left by
+    // remote deletions.
+    if (r == 0 && start == 0 && odh->telldir() == 0) {
+      mark_ghost_children_stale(parent_inode);
+    }
   } else {
     std::shared_lock<std::shared_mutex> prl(parent_inode->inode_lock);
     if (parent_inode->is_stale) return -ESTALE;
@@ -952,7 +1441,7 @@ int OssFs::mkdir(uint64_t parent, std::string_view name, mode_t mode, uid_t uid,
                  struct stat *stbuf) {
   LOG_INFO("mkdir. parent: `, name: `", parent, name);
   return create_internal(parent, name, 0, nodeid, stbuf, nullptr,
-                         InodeType::kDir, "");
+                         InodeType::kDir, "", mode & kPermMask, uid, gid);
 }
 
 // parent's rlock + inode's wlock
@@ -1021,12 +1510,41 @@ int OssFs::symlink(uint64_t parent, std::string_view name,
   LOG_INFO("symlink. parent: `, name: `, link: `", parent, name, link);
 
   if (!options_.enable_symlink) return -ENOTSUP;
+  if (link.empty()) return -EINVAL;
 
-  // Reject absolute path.
-  if (!link.empty() && link.front() == '/') return -EINVAL;
+  // Normalize link to handle '.', '..', consecutive '/', etc.
+  std::string normalized_link =
+      std::filesystem::path(link).lexically_normal().string();
+  std::string effective_link = normalized_link;
+
+  auto starts_with_mountpoint = [this](std::string_view path) {
+    // Normalized Mount point path(e.g., "/mnt/ossfs")
+    auto mp = options_.mountpoint;
+    if (mp.empty() || path.size() <= mp.size() + 1) return false;
+    return path.substr(0, mp.size()) == mp && path[mp.size()] == '/';
+  };
+
+  if (normalized_link.front() == '/') {
+    if (!starts_with_mountpoint(normalized_link)) {
+      LOG_WARN("Absolute symlink target not under mountpoint: `",
+               normalized_link);
+      return -EINVAL;
+    }
+
+    // Strip mountpoint: "/mnt/ossfs2/a/c/file" -> "a/c/file"
+    std::string mount_rel =
+        std::string(normalized_link.substr(options_.mountpoint.size() + 1));
+
+    // Make relative to symlink's parent directory.
+    GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(parent);
+    auto parent_rel = std::filesystem::path(ref.inode_path.substr(1));
+    effective_link = std::filesystem::path(mount_rel)
+                         .lexically_relative(parent_rel)
+                         .string();
+  }
 
   return create_internal(parent, name, 0, nodeid, stbuf, nullptr,
-                         InodeType::kSymlink, link);
+                         InodeType::kSymlink, effective_link, 0777, uid, gid);
 }
 
 ssize_t OssFs::readlink(uint64_t nodeid, char *buf, size_t size) {
@@ -1046,6 +1564,129 @@ ssize_t OssFs::readlink(uint64_t nodeid, char *buf, size_t size) {
   auto write_size = std::min(size, target.size());
   memcpy(buf, target.c_str(), write_size);
   return write_size;
+}
+
+int OssFs::mknod(uint64_t parent, std::string_view name, mode_t mode, uid_t uid,
+                 gid_t gid, uint64_t *nodeid, struct stat *stbuf) {
+  LOG_INFO("mknod. parent: `, name: `, mode: 0o`", parent, name, OCT(mode));
+
+  if (!is_hdfs_mode()) return -ENOSYS;
+
+  // Only regular file (S_IFREG or 0) is supported.
+  mode_t type = mode & S_IFMT;
+  if (type != 0 && type != S_IFREG) {
+    LOG_WARN("mknod: unsupported type 0o`", OCT(type));
+    return -ENOTSUP;
+  }
+
+  // mknod: fh=nullptr triggers immediate backend file creation, no handle.
+  return create_internal(parent, name, 0, nodeid, stbuf, nullptr,
+                         InodeType::kFile, "", mode & kPermMask, uid, gid);
+}
+
+int OssFs::flock(uint64_t nodeid, void *fh, int op, uint64_t lock_owner) {
+  if (!is_hdfs_mode()) return -ENOTSUP;
+
+  int real_op = op & ~LOCK_NB;
+
+  // LOCK_UN is always allowed (it's used to release locks).
+  // LOCK_EX and LOCK_SH require LOCK_NB (blocking mode not supported yet).
+  if (real_op != LOCK_UN && !(op & LOCK_NB)) {
+    return -ENOTSUP;
+  }
+
+  int16_t type;
+  if (real_op == LOCK_EX) {
+    type = static_cast<int16_t>(LockType::WrLock);
+  } else if (real_op == LOCK_SH) {
+    type = static_cast<int16_t>(LockType::RdLock);
+  } else if (real_op == LOCK_UN) {
+    type = static_cast<int16_t>(LockType::UnLock);
+  } else {
+    return -ENOTSUP;
+  }
+
+  GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
+  std::unique_lock<std::shared_mutex> l(ref.inode->inode_lock);
+  if (ref.inode->is_stale) return -ESTALE;
+  const auto &full_path = ref.inode_path;
+
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(
+      this, set_lock, full_path, static_cast<int64_t>(0),
+      static_cast<int64_t>(0), type, static_cast<int64_t>(getpid()),
+      lock_owner);
+
+  // Track flock state on the handle for release-on-close.
+  if (r == 0 && fh) {
+    auto *handle = static_cast<HdfsFileHandle *>(fh);
+    if (real_op == LOCK_UN) {
+      handle->clear_flock_held();
+    } else {
+      handle->set_flock_held(lock_owner);
+    }
+  }
+  return r;
+}
+
+int OssFs::setxattr(uint64_t nodeid, const char *name, const char *value,
+                    size_t size, int flags) {
+  if (!is_hdfs_mode() || !options_.enable_xattr) return -ENOTSUP;
+
+  GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
+  std::unique_lock<std::shared_mutex> l(ref.inode->inode_lock);
+  if (ref.inode->is_stale) return -ESTALE;
+  const auto &full_path = ref.inode_path;
+
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, set_xattr, full_path, name,
+                                         value, size, flags);
+  LOG_DEBUG("setxattr, nodeid: `, path: `, name: `, size: `, flags: `, r: `",
+            nodeid, full_path, name, size, flags, r);
+  return r;
+}
+
+int OssFs::getxattr(uint64_t nodeid, const char *name, char *value,
+                    size_t size) {
+  if (!is_hdfs_mode() || !options_.enable_xattr) return -ENOTSUP;
+
+  GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
+  std::shared_lock<std::shared_mutex> l(ref.inode->inode_lock);
+  if (ref.inode->is_stale) return -ESTALE;
+  const auto &full_path = ref.inode_path;
+
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, get_xattr, full_path, name,
+                                         value, size);
+  LOG_DEBUG("getxattr, nodeid: `, path: `, name: `, size: `, r: `", nodeid,
+            full_path, name, size, r);
+  return r;
+}
+
+int OssFs::listxattr(uint64_t nodeid, char *list, size_t size) {
+  if (!is_hdfs_mode() || !options_.enable_xattr) return -ENOTSUP;
+
+  GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
+  std::shared_lock<std::shared_mutex> l(ref.inode->inode_lock);
+  if (ref.inode->is_stale) return -ESTALE;
+  const auto &full_path = ref.inode_path;
+
+  int r =
+      PERFORM_BACKGROUND_OBJ_REQUEST(this, list_xattr, full_path, list, size);
+  LOG_DEBUG("listxattr, nodeid: `, path: `, size: `, r: `", nodeid, full_path,
+            size, r);
+  return r;
+}
+
+int OssFs::removexattr(uint64_t nodeid, const char *name) {
+  if (!is_hdfs_mode() || !options_.enable_xattr) return -ENOTSUP;
+
+  GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(nodeid);
+  std::unique_lock<std::shared_mutex> l(ref.inode->inode_lock);
+  if (ref.inode->is_stale) return -ESTALE;
+  const auto &full_path = ref.inode_path;
+
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, remove_xattr, full_path, name);
+  LOG_DEBUG("removexattr, nodeid: `, path: `, name: `, r: `", nodeid, full_path,
+            name, r);
+  return r;
 }
 
 ssize_t OssFs::read(uint64_t nodeid, void *fh, size_t size, off_t off,
@@ -1247,7 +1888,12 @@ int OssFs::lookup_update_local_cache(
         invalidate_data_cache_if_needed(child_inode, stbuf, remote_etag);
         update_inode_etag(child_inode, remote_etag);
 
-        child_inode->update_attr(stbuf->st_size, stbuf->st_mtim);
+        child_inode->set_mode(stbuf->st_mode);
+        child_inode->set_uid(stbuf->st_uid);
+        child_inode->set_gid(stbuf->st_gid);
+        child_inode->update_attr(stbuf->st_size, stbuf->st_mtim,
+                                 stbuf->st_atim);
+        resync_randwrite_remote_size(child_inode);
       }
 
       child_inode->fill_statbuf(stbuf);
@@ -1282,9 +1928,8 @@ void OssFs::lookup_create_new_inode(DirInode *parent_inode,
                                     const uint64_t allocated_nodeid,
                                     struct stat *stbuf, time_t *attr_time) {
   bool is_dir = S_ISDIR(stbuf->st_mode);
-  if (is_dir) {
-    // st_mtim is always 1970.01.01 when using photon OSS SDK.
-    // We set it to now.
+  if (is_dir && !is_hdfs_mode()) {
+    // OSS SDK returns epoch 0 for dir mtime. Use current time instead.
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     stbuf->st_mtim = now;
@@ -1294,12 +1939,13 @@ void OssFs::lookup_create_new_inode(DirInode *parent_inode,
   Inode *child_inode = create_new_inode(
       allocated_nodeid, name, stbuf->st_size, stbuf->st_mtim,
       Inode::mode_to_inode_type(stbuf->st_mode), false, parent, parent_inode,
-      remote_etag);  // new node, no need to lock
+      remote_etag, stbuf->st_mode & kPermMask, stbuf->st_uid, stbuf->st_gid);
 
   // A new inode may be created and forgotten and inserted to the staged cache
   // after lookup_try_local_attr_cache and before lookup_update_local_cache, so
   // we also need to try to remove it from the staged cache.
   increment_inode_lookupcnt(child_inode, parent, name);
+  child_inode->update_attr(stbuf->st_size, stbuf->st_mtim, stbuf->st_atim);
   child_inode->fill_statbuf(stbuf);
 
   if (attr_time) child_inode->attr_time = *attr_time;
@@ -1368,7 +2014,8 @@ void OssFs::increment_inode_lookupcnt(Inode *inode, uint64_t parent_nodeid,
 // Common logic for create, mkdir and symlink.
 int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
                            uint64_t *nodeid, struct stat *stbuf, void **fh,
-                           InodeType type, std::string_view link) {
+                           InodeType type, std::string_view link, mode_t mode,
+                           uid_t uid, gid_t gid) {
   GET_INODE_REF_AND_LOCK_PATH_IF_NEEDED_WITH_RET(parent);
   if (name.size() > kOssfsMaxFileNameLength) return -ENAMETOOLONG;
 
@@ -1431,8 +2078,9 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
   if (type == InodeType::kDir) {
     iovec iov{nullptr, 0};
     uint64_t expected_crc64 = 0;
-    r = PERFORM_BACKGROUND_OBJ_REQUEST(
-        this, put_object, add_backslash(full_path), &iov, 1, &expected_crc64);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, put_object,
+                                       add_backslash(full_path), &iov, 1,
+                                       &expected_crc64, mode & kPermMask);
     if (r < 0) {
       LOG_ERROR("fail to mkdir from cloud. path ` with error `", full_path, r);
       return r;
@@ -1446,27 +2094,45 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
     }
     file_size = r;
   } else {
-    // Empty body. The upload of the regular file is delayed and performed in
-    // flush().
+    // kFile
+    if (fh == nullptr) {
+      // mknod: create empty file on backend immediately.
+      iovec iov{nullptr, 0};
+      uint64_t expected_crc64 = 0;
+      r = PERFORM_BACKGROUND_OBJ_REQUEST(this, put_object, full_path, &iov, 1,
+                                         &expected_crc64, mode & kPermMask);
+      if (r < 0) {
+        LOG_ERROR("mknod: put_object failed, path `, r: `", full_path, r);
+        return r;
+      }
+    }
+    // creat (fh != nullptr): empty body, upload delayed to flush().
   }
 
   struct timespec now;
   clock_gettime(CLOCK_REALTIME, &now);
   Inode *child_inode;
   child_inode = create_new_inode(id_manager_->next_id(), name, file_size, now,
-                                 type, false, parent, parent_inode, "");
+                                 type, false, parent, parent_inode, "",
+                                 mode & kPermMask, uid, gid);
 
   // A create request is equivalent to mknod + open, so we need to open the
-  // regular file here.
-  if (type == InodeType::kFile) {
+  // regular file here. For mknod (fh == nullptr), skip file handle creation.
+  if (type == InodeType::kFile && fh != nullptr) {
     FileInode *child_file_inode = static_cast<FileInode *>(child_inode);
 
-    auto oss_fh = create_oss_file_handle(this, full_path, child_file_inode,
-                                         flags | O_CREAT);
-    r = oss_fh->open();  // this will never return error
-    RELEASE_ASSERT(r == 0);
+    auto file_handle = create_file_handle(full_path, child_file_inode,
+                                          flags | O_CREAT, mode & kPermMask);
+    r = file_handle->open();  // this will never return error.
+    if (r < 0) {
+      LOG_ERROR("fail to open file after create. path ` with error `",
+                full_path, r);
+      file_handle->release();
+      delete child_inode;
+      return r;
+    }
 
-    *fh = oss_fh;
+    *fh = file_handle;
     child_file_inode->open_ref_cnt++;
   }
 
@@ -1486,6 +2152,16 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
   }
 
   if (negative_cache_) negative_cache_->erase(full_path);
+
+  if (options_.hdfs_set_owner_on_create && is_hdfs_mode() && (uid || gid)) {
+    int r2 =
+        PERFORM_BACKGROUND_OBJ_REQUEST(this, set_owner, full_path, uid, gid,
+                                       IObjStore::kSetUid | IObjStore::kSetGid);
+    if (r2 < 0) {
+      LOG_WARN("set_owner on create failed, path: `, uid: `, gid: `, r: `",
+               full_path, uid, gid, r2);
+    }
+  }
 
   return 0;
 }
@@ -1511,9 +2187,9 @@ void OssFs::construct_inodes_if_needed(DirInode *parent_inode,
     struct stat st;
     memset(&st, 0, sizeof(st));
     InodeType inode_type = Inode::dirent_type_to_inode_type(oss_ent.type());
-    st.st_mode = Attribute::get_mode(inode_type);
+    st.st_mode = Attribute::get_default_full_mode(inode_type);
     st.st_size = oss_ent.size();
-    st.st_mtim = timespec{oss_ent.mtime(), 0};
+    st.st_mtim = oss_ent.mtime();
 
     Inode *child_inode = parent_inode->find_child_node(oss_ent.name());
     // Update the attr of the existing non-stale children.
@@ -1528,7 +2204,9 @@ void OssFs::construct_inodes_if_needed(DirInode *parent_inode,
       }
 
       if (!(child_inode->is_stale)) {
-        try_update_inode_attr_from_list(child_inode, &st, oss_ent.etag());
+        try_update_inode_attr_from_list(child_inode, &st, oss_ent.etag(),
+                                        oss_ent.mode(), oss_ent.uid(),
+                                        oss_ent.gid());
         // Add an extra lookup_cnt to prevent this child_inode from being
         // forgot. Make sure inodes with extra lookup_cnt are all in the
         // pending_fill_nodeids_. Make sure one child_inode's lookup are not
@@ -1560,9 +2238,8 @@ void OssFs::construct_inodes_if_needed(DirInode *parent_inode,
       }
     }
 
-    if (inode_type == InodeType::kDir) {
-      // st_mtim is always 1970.01.01 when using photon OSS SDK.
-      // Set it to now.
+    if (inode_type == InodeType::kDir && !is_hdfs_mode()) {
+      // OSS SDK returns epoch 0 for dir mtime. Use current time instead.
       struct timespec now;
       clock_gettime(CLOCK_REALTIME, &now);
       st.st_mtim = now;
@@ -1574,7 +2251,8 @@ void OssFs::construct_inodes_if_needed(DirInode *parent_inode,
 
     auto new_child_node = create_new_inode(
         allocated_nodeid, oss_ent.name(), st.st_size, st.st_mtim, inode_type,
-        false, parent_inode->nodeid, parent_inode, oss_ent.etag());
+        false, parent_inode->nodeid, parent_inode, oss_ent.etag(),
+        oss_ent.mode(), oss_ent.uid(), oss_ent.gid());
     new_child_node->fill_statbuf(&st);
     {
       std::lock_guard<std::mutex> l(inodes_map_lck_);
@@ -1648,9 +2326,8 @@ int OssFs::get_dirty_children(DirInode *parent_inode,
       // For readdirplus, these attributes are not used actually. Attributes are
       // obtained from the Inodes when being filled.
       dirty_children_.emplace(
-          cit.first,
-          ObjDirent(child->name, child->attr.size, child->attr.mtime.tv_sec,
-                    DT_REG, get_inode_etag(child)));
+          cit.first, ObjDirent(child->name, child->attr.size, child->attr.mtime,
+                               DT_REG, get_inode_etag(child)));
     }
   }
 
@@ -1681,6 +2358,10 @@ int OssFs::refresh_dir_plus(DirInode *parent_inode, OssDirHandle *odh) {
   if ((r = odh->refresh_dir(dirty_children)) != 0) {
     return r;
   }
+
+  FAULT_INJECTION(FI_Readdir_Delay_Before_Construct, []() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+  });
 
   // refresh_dir will trigger listobj
   construct_inodes_if_needed(parent_inode, odh);
@@ -1719,6 +2400,9 @@ int OssFs::seek_dir_plus(DirInode *parent_inode, OssDirHandle *odh,
   bool is_offset_tuned = false;
   if (!odh->out_of_order(target_offset, &is_offset_tuned)) {
     if (is_offset_tuned) {
+      // TODO: constructing from the cached listing snapshot may resurrect
+      // locally deleted children as ghost inodes if a deletion landed after
+      // the snapshot. Fix with a listing-freshness guard in a future version.
       // Since the inodes in last_response could have been forgotten, so it's
       // necessary to construct inodes for them.
       construct_inodes_if_needed(parent_inode, odh);
@@ -1869,10 +2553,10 @@ int OssFs::readdir_fill(DirInode *parent_inode, OssDirHandle *odh,
     // +3 here includes . and ..
     struct stat st;
     memset(&st, 0, sizeof(st));
-    st.st_mode =
-        Attribute::get_mode(Inode::dirent_type_to_inode_type(dent->type()));
+    st.st_mode = Attribute::get_default_full_mode(
+        Inode::dirent_type_to_inode_type(dent->type()));
     st.st_size = dent->size();
-    st.st_mtim = timespec{dent->mtime(), 0};
+    st.st_mtim = dent->mtime();
     st.st_ino = TEMP_NODEID;
     r = filler(filler_ctx, TEMP_NODEID, dent->name_cstr(), &st,
                odh->telldir() + 3);
@@ -1893,7 +2577,8 @@ int OssFs::readdir_fill(DirInode *parent_inode, OssDirHandle *odh,
 }
 
 void OssFs::try_update_inode_attr_from_list(Inode *inode, struct stat *stbuf,
-                                            std::string_view remote_etag) {
+                                            std::string_view remote_etag,
+                                            mode_t perm, uid_t uid, gid_t gid) {
   assert(inode);
   assert(stbuf);
 
@@ -1903,7 +2588,11 @@ void OssFs::try_update_inode_attr_from_list(Inode *inode, struct stat *stbuf,
 
   invalidate_data_cache_if_needed(inode, stbuf, remote_etag);
   update_inode_etag(inode, remote_etag);
-  inode->update_attr(stbuf->st_size, stbuf->st_mtim);
+  inode->set_mode((inode->get_mode() & ~kPermMask) | (perm & kPermMask));
+  inode->set_uid(uid);
+  inode->set_gid(gid);
+  inode->update_attr(stbuf->st_size, stbuf->st_mtim, stbuf->st_atim);
+  resync_randwrite_remote_size(inode);
 }
 
 // [WARNING] MUST NOT be inside any lock.
@@ -2022,7 +2711,8 @@ Inode *OssFs::create_new_inode(uint64_t nodeid, std::string_view name,
                                uint64_t size, struct timespec mtime,
                                InodeType type, bool is_dirty,
                                uint64_t parent_nodeid, Inode *parent_node,
-                               std::string_view remote_etag) {
+                               std::string_view remote_etag, mode_t perm,
+                               uid_t uid, gid_t gid) {
   Inode *inode = nullptr;
   if (type == InodeType::kDir) {
     inode = new DirInode(nodeid, name, mtime, parent_nodeid, parent_node);
@@ -2033,6 +2723,14 @@ Inode *OssFs::create_new_inode(uint64_t nodeid, std::string_view name,
   if (inode == nullptr) {
     LOG_ERROR("fail to create a new inode.");
     return nullptr;
+  }
+
+  if (is_hdfs_mode()) {
+    inode->ensure_posix_ext();
+    inode->set_mode(Attribute::build_mode(type, perm & kPermMask));
+    inode->set_uid(uid);
+    inode->set_gid(gid);
+    inode->set_atime(mtime);
   }
 
   return inode;
@@ -2109,7 +2807,7 @@ bool OssFs::lookup_from_staged_cache_if_enabled(uint64_t parent_nodeid,
     if (stbuf) {
       stbuf->st_size = entry->size;
       stbuf->st_mtim = entry->mtime;
-      stbuf->st_mode = Attribute::get_mode(entry->type);
+      stbuf->st_mode = Attribute::get_default_full_mode(entry->type);
       stbuf->st_ino = entry->nodeid;
     }
 
@@ -2174,18 +2872,64 @@ int OssFs::init() {
 
   if (r < 0) {
     LOG_ERROR("fail to check bucket with error `", r);
+    return r;
+  }
+
+  if (is_hdfs_mode()) {
+    init_hdfs_root_inode();
+    Attribute::DEFAULT_BLKSIZE = 512;
+
+    if (options_.max_inode_cache_count > 0 && options_.attr_timeout > 0) {
+      LOG_WARN("Staged inode cache disabled in HDFS mode (TODO: PosixExtAttr)");
+      return -EINVAL;
+    }
   }
 
   return r;
+}
+
+void OssFs::init_hdfs_root_inode() {
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+  mp_inode_->ensure_posix_ext();
+  mp_inode_->set_mode(Attribute::build_mode(InodeType::kDir, 0755));
+  mp_inode_->set_uid(kReservedUnresolvedUid);
+  mp_inode_->set_gid(kReservedUnresolvedGid);
+  mp_inode_->set_atime(now);
+}
+
+IFileHandleFuseLL *OssFs::create_file_handle(const std::string &path,
+                                             FileInode *inode, int flags,
+                                             mode_t mode) {
+  // Dispatch to appropriate file handle based on storage backend type.
+  switch (get_backend_type()) {
+    case IObjStore::StorageBackend::kHDFS:
+      return new HdfsFileHandle(this, path, inode, flags, mode);
+    case IObjStore::StorageBackend::kOSS:
+    default:
+      return create_oss_file_handle(this, path, inode, flags);
+  }
+}
+
+int OssFs::access(uint64_t nodeid, int mask, uid_t caller_uid,
+                  gid_t caller_gid) {
+  // OSS mode: kernel handles permissions via default_permissions.
+  if (!is_hdfs_mode()) {
+    return 0;
+  }
+
+  // HDFS mode: perform custom permission check.
+  struct stat stbuf;
+  int r = getattr(nodeid, &stbuf);
+  if (r < 0) return r;
+  return check_hdfs_access(&stbuf, mask, caller_uid, caller_gid);
 }
 
 std::shared_ptr<ICache> OssFs::create_inode_cache() {
   std::shared_ptr<ICache> cache = nullptr;
   switch (options_.cache_type) {
     case CacheType::kFhCache:
-      if (options_.share_fd_read_buffer) {
-        cache = std::make_shared<BlockCache>(download_buffers_);
-      }
+      cache = std::make_shared<BlockCache>(download_buffers_);
       break;
     case CacheType::kDiskCache:
       cache = std::make_shared<DiskCache>(bg_vcpu_env_.bg_disk_cache_env,
@@ -2251,7 +2995,7 @@ int OssFs::truncate_inode_data(Inode *inode, std::string_view full_path,
     uint64_t expected_crc64 = 0;
 
     ssize_t ret = 0;
-    if (options_.enable_appendable_object) {
+    if (write_mode() == WriteMode::Appendable) {
       ret = obj_store->delete_object(full_path);
       if (ret < 0) {
         LOG_ERROR("Failed to unlink file: `, nodeid: ` r: `", full_path,
@@ -2281,8 +3025,128 @@ int OssFs::truncate_inode_data(Inode *inode, std::string_view full_path,
 
   file_inode->invalidate_data_cache = true;
   file_inode->etag.clear();
-  file_inode->update_attr(0, stbuf.st_mtim);
+  file_inode->update_attr(0, stbuf.st_mtim, stbuf.st_atim);
   return 0;
+}
+
+// Realign the remote_size snapshot after a remote attr.size refresh; a stale
+// one makes flush zero-fill [remote_size, attr.size) over remote data.
+void OssFs::resync_randwrite_remote_size(Inode *inode) {
+  if (write_mode() != WriteMode::Random || inode->is_dir()) return;
+  auto *file_inode = static_cast<FileInode *>(inode);
+  if (file_inode->is_dirty || !file_inode->rw_ctx) return;
+
+  auto *ctx = file_inode->rw_ctx;
+  if (ctx->remote_size != static_cast<uint64_t>(file_inode->attr.size)) {
+    LOG_INFO("resync remote_size ` -> `, nodeid `, path `", ctx->remote_size,
+             file_inode->attr.size, file_inode->nodeid, ctx->upload_path);
+    ctx->remote_size = file_inode->attr.size;
+  }
+}
+
+// Inode wlock + path rlock held outside.
+int OssFs::random_write_truncate(FileInode *inode, std::string_view full_path,
+                                 uint64_t new_size) {
+  const auto max_size = options_.random_write_max_file_size;
+  if (new_size > max_size) {
+    LOG_ERROR("truncate exceeds max file size `: file: ` nodeid `, new_size `",
+              max_size, full_path, inode->nodeid, new_size);
+    return -EFBIG;
+  }
+
+  // With no open dirty writer to flush this truncate later, flush it now so
+  // the file's dirty/clean status does not change.
+  const bool needs_sync_flush = (inode->rw_ctx == nullptr || !inode->is_dirty);
+
+  // Creates a transient writer for the file.
+  auto writer = create_oss_writer(this, full_path, inode, /*flags=*/0);
+
+  int r = writer->open();
+  if (r < 0) {
+    LOG_ERROR("random truncate: open failed, nodeid `, r `", inode->nodeid, r);
+    return r;
+  }
+  DEFER(writer->close());
+
+  r = writer->truncate(new_size);
+  if (r < 0) return r;
+
+  if (needs_sync_flush) {
+    r = writer->flush();
+    if (r < 0) {
+      LOG_ERROR("random truncate: flush failed, nodeid `, r `", inode->nodeid,
+                r);
+    }
+  }
+  return r;
+}
+
+int OssFs::staging_disk_avail(int staging_fd, uint64_t *avail_out) {
+  // Free bytes of the staging filesystem from one fstatvfs call.
+  auto query_avail = [](int fd, uint64_t *out) -> int {
+    struct statvfs vfs;
+    if (::fstatvfs(fd, &vfs) < 0) {
+      int r = -errno;
+      LOG_ERROR("fstatvfs failed for staging file fd `: `", fd, r);
+      return r;
+    }
+    *out = static_cast<uint64_t>(vfs.f_bavail) *
+           static_cast<uint64_t>(vfs.f_frsize);
+    return 0;
+  };
+
+  // Compensate a snapshot with staging growth since it was taken.
+  auto effective = [&](uint64_t avail, uint64_t usage_snap) -> uint64_t {
+    uint64_t usage_now = staging_disk_usage_.load(std::memory_order_relaxed);
+    uint64_t growth = usage_now > usage_snap ? usage_now - usage_snap : 0;
+    return avail > growth ? avail - growth : 0;
+  };
+
+  // Refresh and publish the snapshot. usage_now is sampled BEFORE fstatvfs
+  // to keep the estimate conservative: bytes flushed during the fstatvfs
+  // call may be absent from its result but are counted in usage_now, so the
+  // growth compensation slightly understates avail. Sampling after fstatvfs
+  // would overstate avail instead, which could let a budget check pass on
+  // an almost-full disk.
+  auto refresh_cache = [&]() -> int {
+    uint64_t usage_now = staging_disk_usage_.load(std::memory_order_relaxed);
+    uint64_t avail = 0;
+    int r = query_avail(staging_fd, &avail);
+    if (r < 0) return r;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    SCOPED_LOCK(staging_avail_lock_);
+    staging_avail_bytes_ = avail;
+    staging_avail_usage_snap_ = usage_now;
+    staging_avail_ts_ns_ =
+        static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+    *avail_out = effective(staging_avail_bytes_, staging_avail_usage_snap_);
+    return 0;
+  };
+
+  struct timespec now_ts;
+  clock_gettime(CLOCK_MONOTONIC, &now_ts);
+  uint64_t now_ns =
+      static_cast<uint64_t>(now_ts.tv_sec) * 1000000000ULL + now_ts.tv_nsec;
+  {
+    SCOPED_LOCK(staging_avail_lock_);
+    if (staging_avail_ts_ns_ != 0 &&
+        now_ns - staging_avail_ts_ns_ < staging_avail_refresh_ns_) {
+      *avail_out = effective(staging_avail_bytes_, staging_avail_usage_snap_);
+      return 0;
+    }
+  }
+
+  // Cache stale: elect one refresher to publish the new snapshot. Losers
+  // still need an accurate value (the stale snapshot may miss disk space
+  // consumed by others, e.g. after a long idle period), so they run their
+  // own fstatvfs without touching the cache.
+  if (!staging_avail_refreshing_.exchange(true)) {
+    int r = refresh_cache();
+    staging_avail_refreshing_.store(false);
+    return r;
+  }
+  return query_avail(staging_fd, avail_out);
 }
 
 bool OssFs::mark_dir_stale_recursively(DirInode *dir_inode,
@@ -2360,10 +3224,11 @@ void OssFs::mark_inode_stale_if_needed(Inode *inode, bool recursively) {
   // clang-format on
 }
 
-int OssFs::rename_file(std::string_view old_path, std::string_view new_path) {
-  int r =
-      PERFORM_BACKGROUND_OBJ_REQUEST(this, rename_object, old_path, new_path,
-                                     options_.set_mime_for_rename_dst);
+int OssFs::rename_file(std::string_view old_path, std::string_view new_path,
+                       bool dst_exists) {
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(
+      this, rename_object, old_path, new_path, options_.set_mime_for_rename_dst,
+      dst_exists);
   if (r != 0) {
     LOG_ERROR("fail to rename file from ` to ` with error: `", old_path,
               new_path, r);
@@ -2389,7 +3254,33 @@ struct RenameContext {
   std::atomic<int> *job_status = nullptr;
 };
 
-int OssFs::rename_dir(std::string_view old_path, std::string_view new_path) {
+int OssFs::rename_dir(std::string_view old_path, std::string_view new_path,
+                      bool dst_exists) {
+  if (is_hdfs_mode()) {
+    return do_rename_dir(old_path, new_path, dst_exists);
+  }
+  return rename_dir_copy_delete(old_path, new_path);
+}
+
+int OssFs::do_rename_dir(std::string_view old_path, std::string_view new_path,
+                         bool dst_exists) {
+  estring old_obj_parent, new_obj_parent;
+  old_obj_parent.appends(old_path, "/");
+  new_obj_parent.appends(new_path, "/");
+
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, rename_dir, old_obj_parent,
+                                         new_obj_parent, dst_exists);
+  if (r != 0) {
+    LOG_ERROR("fail to atomically rename directory ` to ` r = `", old_path,
+              new_path, r);
+    return r;
+  }
+
+  return 0;
+}
+
+int OssFs::rename_dir_copy_delete(std::string_view old_path,
+                                  std::string_view new_path) {
   std::vector<std::string> list_results;
   auto checker = [&]() -> bool {
     // TODO: check if the file length is valid after copying.
@@ -2566,11 +3457,11 @@ void *OssFs::do_rename_task(void *arg) {
   return nullptr;
 }
 
-void OssFs::update_max_oss_rw_lat(uint64_t latency_us) {
+void OssFs::update_max_refill_range_lat(uint64_t latency_us) {
   if (!options_.enable_transmission_control) return;
 
   tc_lock_.lock();
-  max_oss_rw_lat_us_ = std::max(max_oss_rw_lat_us_, latency_us);
+  max_refill_range_lat_us_ = std::max(max_refill_range_lat_us_, latency_us);
   tc_lock_.unlock();
 }
 
@@ -2589,15 +3480,15 @@ uint64_t OssFs::transmission_control() {
   LOG_INFO("Start transmission control");
   while (!is_stopping_) {
     tc_lock_.lock();
-    if (max_oss_rw_lat_us_ > MAX_LAT_THRESHOLD) {
+    if (max_refill_range_lat_us_ > MAX_LAT_THRESHOLD) {
       curr_prefetch_concurrency =
           std::max(curr_prefetch_concurrency / 2, MIN_PREFETCH_CONCURRENCY);
-    } else if (max_oss_rw_lat_us_ < MAX_LAT_THRESHOLD / 2) {
+    } else if (max_refill_range_lat_us_ < MAX_LAT_THRESHOLD / 2) {
       curr_prefetch_concurrency = std::min(curr_prefetch_concurrency + 4,
                                            options_.prefetch_concurrency);
     }
 
-    max_oss_rw_lat_us_ = 0;
+    max_refill_range_lat_us_ = 0;
     tc_lock_.unlock();
 
     int remain = options_.prefetch_concurrency - curr_prefetch_concurrency;
@@ -2863,6 +3754,14 @@ void OssFs::run_health_check() {
              get_physical_memory_KiB());
     LOG_INFO("[SystemInfo] active file handles: `",
              active_file_handles_.load());
+    if (write_mode() == WriteMode::Random) {
+      uint64_t usage = staging_disk_usage_.load(std::memory_order_relaxed);
+      // clang-format off
+      LOG_INFO(
+          "[SystemInfo] staging disk usage: ` bytes (` MiB), free space threshold: ` bytes",
+          usage, usage >> 20, options_.temp_dir_free_bytes);
+      // clang-format on
+    }
     if (enable_staged_cache()) {
       staged_inodes_cache_->print_staged_cache_status();
     }
@@ -2886,24 +3785,24 @@ void OssFs::update_creds(const ObjCredentials &creds) {
   }
 }
 
-int OssFs::validate_creds(const ObjCredentials &creds) {
+int OssFs::validate_creds(const ObjCredentials &creds, bool allow_auto_create) {
   auto options = PERFORM_BACKGROUND_OBJ_REQUEST(this, get_options);
   std::unique_ptr<IObjStore> obj_store =
       std::unique_ptr<IObjStore>(new_oss_store("", "", options));
   obj_store->set_credentials(
       {creds.accessKeyId, creds.accessKeySecret, creds.securityToken});
-  int r = obj_store->check_bucket();
+  int r = obj_store->check_bucket(allow_auto_create);
   if (r != 0) {
     LOG_ERROR("Fail to check bucket with ak ` error `", creds.accessKeyId, r);
   }
   return r;
 }
 
-std::pair<int, uint64_t> OssFs::do_refresh_creds() {
+std::pair<int, uint64_t> OssFs::do_refresh_creds(bool allow_auto_create) {
   int r = -EINVAL;
   auto info =
       creds_provider_->refresh_credentials([&](const ObjCredentials &creds) {
-        r = validate_creds(creds);
+        r = validate_creds(creds, allow_auto_create);
         return r == 0;
       });
   if (info.creds != nullptr) {
@@ -2919,7 +3818,7 @@ uint64_t OssFs::refresh_creds() {
 void OssFs::start_creds_refresher(std::promise<int> &result_promise) {
   INIT_PHOTON();
 
-  auto [result, next] = do_refresh_creds();
+  auto [result, next] = do_refresh_creds(true);
   result_promise.set_value(result);
 
   photon::Timer timer(next, {this, &OssFs::refresh_creds}, true);

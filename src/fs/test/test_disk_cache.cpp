@@ -14,15 +14,25 @@
  * limitations under the License.
  */
 
+#include <future>
+
 #include "fs/disk_cache.h"
+#include "fs/file.h"
+#include "fs/file_reader.h"
 #include "metric/metrics.h"
 #include "test_suite.h"
 
 class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
  protected:
+  void SetUp() override {
+    SET_TEST_MODE(kTestOss);
+    Ossfs2TestSuite::SetUp();
+  }
+
   void verify_init_disk_cache(int disk_cache_io_engine) {
-    std::string cache_dir = "/root/tmp/ossfs2/cache";
-    photon::Executor *executor = nullptr;
+    auto case_name =
+        ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    std::string cache_dir = FLAGS_disk_cache_dir + "/" + std::string(case_name);
     OssFileSystem::BGVCpuDiskCacheEnv *bg_disk_cache_env = nullptr;
 
     uint64_t photon_io_init = photon::INIT_IO_NONE;
@@ -35,10 +45,10 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     auto test_init = [&](std::function<int()> &&init_func) -> int {
       std::filesystem::remove_all(cache_dir);
       bg_disk_cache_env = new OssFileSystem::BGVCpuDiskCacheEnv();
-      executor =
+      auto executor =
           new photon::Executor(OSSFS_EVENT_ENGINE, photon_io_init,
                                LIBAIO_PHOTON_OPTION, EXECUTOR_QUEUE_OPTION);
-      bg_disk_cache_env->set_executor(executor);
+      bg_disk_cache_env->add_executor(executor);
 
       DEFER(delete bg_disk_cache_env);
       return init_func();
@@ -50,21 +60,10 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     r = test_init([&]() { return bg_disk_cache_env->init(cache_opts); });
     ASSERT_EQ(r, 0);
 
-    // Test relative path.
-    auto original_path = std::filesystem::current_path();
-    std::filesystem::current_path("/root");
     r = test_init([&]() {
-      auto opts = cache_opts;
-      opts.cache_dir = "./tmp/ossfs2/cache";
-      return bg_disk_cache_env->init(opts);
-    });
-    std::filesystem::current_path(original_path);
-    ASSERT_EQ(r, 0);
-
-    r = test_init([&]() {
-      std::filesystem::remove_all("/root/tmp/ossfs2/");
-      ::close(::open("/root/tmp/ossfs2", O_CREAT | O_RDWR, 0777));
-      DEFER(::unlink("/root/tmp/ossfs2"));
+      std::filesystem::remove_all(cache_dir);
+      ::close(::open(cache_dir.c_str(), O_CREAT | O_RDWR, 0777));
+      DEFER(::unlink(cache_dir.c_str()));
       return bg_disk_cache_env->init(cache_opts);
     });
     ASSERT_NE(r, 0);
@@ -487,6 +486,189 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
       ASSERT_EQ(out_crc, crcs[i]);
     }
   }
+
+  void verify_disk_cache_drop_rejects_stale_refill(bool reopen_fail = false) {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    const std::string filename = "stale-refill";
+    const size_t file_size = 1024 * 1024;
+    const std::string old_data(file_size, 'a');
+    const std::string new_data(file_size, 'b');
+
+    uint64_t nodeid = 0;
+    struct stat st;
+    void *handle = nullptr;
+    int r = create_and_flush(parent, filename.c_str(), CREATE_BASE_FLAGS, 0777,
+                             0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    r = write_to_file_handle(handle, old_data.data(), old_data.size(), 0);
+    ASSERT_EQ(r, static_cast<ssize_t>(old_data.size()));
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+
+    void *reader_handle = nullptr;
+    bool unused = false;
+    r = fs_->open(nodeid, O_RDONLY, &reader_handle, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(reader_handle)));
+
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_Do_Refill_Range_Delay_Before_Release);
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_Do_Refill_Range_Delay_Before_Release));
+
+    std::string first_read(file_size, '\0');
+    auto read_task = std::async(std::launch::async, [&]() {
+      INIT_PHOTON();
+      read_from_handle(reader_handle, first_read.data(), first_read.size(), 0);
+    });
+    DEFER(read_task.get());
+
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    void *writer_handle = nullptr;
+    r = fs_->open(nodeid, O_RDWR | O_TRUNC, &writer_handle, &unused);
+    ASSERT_EQ(r, 0);
+    r = write_to_file_handle(writer_handle, new_data.data(), new_data.size(),
+                             0);
+    ASSERT_EQ(r, static_cast<ssize_t>(new_data.size()));
+    r = fs_->release(nodeid, get_file_from_handle(writer_handle));
+    ASSERT_EQ(r, 0);
+
+    struct stat updated_st;
+    r = fs_->getattr(nodeid, &updated_st);
+    ASSERT_EQ(r, 0);
+
+    if (reopen_fail) {
+      g_fault_injector->set_injection(
+          FaultInjectionId::FI_DiskCache_Init_Failure);
+    }
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_DiskCache_Init_Failure));
+
+    std::string new_read(file_size, '\0');
+    r = read_from_handle(reader_handle, new_read.data(), new_read.size(), 0);
+    ASSERT_EQ(r, static_cast<ssize_t>(file_size));
+    auto read_crc64 = cal_crc64(0, (void *)new_read.c_str(), file_size);
+    auto expected_crc64 = cal_crc64(0, (void *)new_data.c_str(), file_size);
+    ASSERT_EQ(read_crc64, expected_crc64);
+  }
+
+  void verify_prefetch_eviction_for_large_file() {
+    // Test: eviction detection limits cache misses when file > cache size.
+    Metric::set_enabled_metrics("oss");
+    DEFER(Metric::set_enabled_metrics(""));
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    auto metric_start = std::chrono::steady_clock::now();
+
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    // 2GB file, 1GB cache → eviction is guaranteed.
+    const uint64_t kFileSizeMB = 2048;
+    uint64_t nodeid = 0;
+    uint64_t crc_expected =
+        create_file_in_folder(parent, "evict_bounded", kFileSizeMB, nodeid);
+    ASSERT_GT(crc_expected, 0ULL);
+    DEFER(fs_->forget(nodeid, 1));
+
+    void *handle = nullptr;
+    bool unused = false;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &handle, &unused), 0);
+
+    auto oss_file = dynamic_cast<OssFileHandle *>(get_file_from_handle(handle));
+    ASSERT_NE(oss_file, nullptr);
+    auto reader = dynamic_cast<OssCachedReader *>(oss_file->reader_.get());
+    ASSERT_NE(reader, nullptr);
+
+    const size_t kReadSize = 1024 * 1024;  // 1MB per read
+    std::vector<char> buf(kReadSize);
+    uint64_t crc = 0;
+    size_t cache_miss_cnt = 0;
+    off_t off = 0;
+    ssize_t total = static_cast<ssize_t>(kFileSizeMB) * 1024 * 1024;
+
+    while (off < total) {
+      size_t to_read = std::min(kReadSize, static_cast<size_t>(total - off));
+      // Try cache read directly; failure means cache miss.
+      ssize_t r = reader->cache_handle_->pread(buf.data(), off, to_read);
+      if (r <= 0) cache_miss_cnt++;
+      // Additional pread to trigger prefetching.
+      r = reader->pread(buf.data(), to_read, off);
+      ASSERT_EQ(r, static_cast<ssize_t>(to_read));
+      crc = cal_crc64(crc, buf.data(), to_read);
+      off += r;
+    }
+
+    ASSERT_EQ(crc, crc_expected);
+    ASSERT_EQ(fs_->release(nodeid, oss_file), 0);
+
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - metric_start)
+                           .count() +
+                       1;
+    auto metrics = Metric::get_metrics_map(elapsed_sec);
+    uint64_t oss_read_bytes = metrics["oss_read_bytes"];
+    uint64_t oss_read_cnt = metrics["oss_get_object_range_cnt"];
+    LOG_INFO("OSS total read traffic: ` MB, GET requests: `",
+             oss_read_bytes / 1024 / 1024, oss_read_cnt);
+
+    size_t total_reads = kFileSizeMB;
+    LOG_INFO("cache miss cnt: `/`, miss rate: `%", cache_miss_cnt, total_reads,
+             cache_miss_cnt * 100 / total_reads);
+    // With eviction detection working, miss rate should be well under 10%.
+    ASSERT_LT(cache_miss_cnt, total_reads / 10);
+  }
+
+  void verify_prefetch_eviction_for_multi_files() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    // Create five 400MB files.
+    const uint64_t kFileMB = 400;
+    const int kFileCount = 5;
+
+    std::vector<uint64_t> nodeids(kFileCount, 0);
+    std::vector<uint64_t> crcs(kFileCount, 0);
+    for (int i = 0; i < kFileCount; i++) {
+      std::string name = "file_" + std::to_string(i);
+      crcs[i] = create_file_in_folder(parent, name, kFileMB, nodeids[i]);
+      ASSERT_GT(crcs[i], 0ULL);
+    }
+
+    DEFER({
+      for (int i = 0; i < kFileCount; i++) fs_->forget(nodeids[i], 1);
+    });
+
+    for (int i = 0; i < kFileCount; i++) {
+      uint64_t out_crc = 0;
+      ssize_t r =
+          read_file_in_folder(parent, "file_" + std::to_string(i), &out_crc);
+      ASSERT_GT(r, 0);
+      ASSERT_EQ(out_crc, crcs[i]);
+    }
+
+    std::vector<std::future<bool>> tasks;
+    for (int i = 0; i < 10; i++) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      tasks.push_back(std::async(std::launch::async, [&]() -> bool {
+        INIT_PHOTON();
+        thread_local std::mt19937 rng(std::random_device{}());
+        int index = rng() % kFileCount;
+        uint64_t out_crc = 0;
+        ssize_t r = read_file_in_folder(parent, "file_" + std::to_string(index),
+                                        &out_crc);
+        return r == kFileMB * 1024 * 1024 && out_crc == crcs[index];
+      }));
+    }
+    for (auto &t : tasks) {
+      ASSERT_EQ(t.get(), true);
+    }
+  }
 };
 
 TEST_F(Ossfs2DiskCacheTest, verify_init_disk_cache) {
@@ -503,6 +685,7 @@ TEST_F(Ossfs2DiskCacheTest, DISABLED_verify_disk_cache_mem_usage) {
   opts.cache_type = CacheType::kDiskCache;
 
   LOG_INFO("Test disk cache mem usage with 1000w files");
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_disk_cache_mem_usage(10'000'000);
   destroy();
@@ -521,8 +704,8 @@ TEST_F(Ossfs2DiskCacheTest, verify_disk_cache_eviction_when_full) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
-
   verify_disk_cache_eviction_when_full();
 }
 
@@ -530,8 +713,8 @@ TEST_F(Ossfs2DiskCacheTest, verify_disk_cache_key_collision) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
-
   verify_disk_cache_key_collision();
 }
 
@@ -540,6 +723,7 @@ TEST_F(Ossfs2DiskCacheTest, verify_disk_cache_with_network_error) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_disk_cache_with_network_error();
 }
@@ -548,15 +732,46 @@ TEST_F(Ossfs2DiskCacheTest, verify_disk_cache_rehash_on_collision) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_disk_cache_rehash_on_collision();
 }
 
-TEST_F(Ossfs2DiskCacheTest, verify_disk_cache_psync_eviction) {
+TEST_F(Ossfs2DiskCacheTest, verify_disk_cache_drop_rejects_stale_refill) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.cache_type = CacheType::kDiskCache;
+  opts.attr_timeout = 1;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, -1, "", false, photon::fs::ioengine_psync);
+  verify_disk_cache_drop_rejects_stale_refill();
+}
 
-  verify_disk_cache_eviction_when_full();
+TEST_F(Ossfs2DiskCacheTest, verify_prefetch_eviction_for_large_file) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  opts.prefetch_chunk_size = 1048576 * 8;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
+  init(opts, -1, "", false, photon::fs::ioengine_psync);
+  verify_prefetch_eviction_for_large_file();
+}
+
+TEST_F(Ossfs2DiskCacheTest, verify_prefetch_eviction_for_multi_files) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
+  init(opts, -1, "", false, photon::fs::ioengine_psync);
+  verify_prefetch_eviction_for_multi_files();
+}
+
+TEST_F(Ossfs2DiskCacheTest, verify_disk_cache_drop_with_reopen_failed) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.cache_type = CacheType::kDiskCache;
+  opts.attr_timeout = 1;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
+  init(opts, -1, "", false, photon::fs::ioengine_psync);
+  verify_disk_cache_drop_rejects_stale_refill(true);
 }

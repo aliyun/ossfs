@@ -16,12 +16,16 @@
 
 #include "oss_store.h"
 
+#include <photon/common/checksum/crc64ecma.h>
 #include <photon/common/iovector.h>
 #include <photon/thread/timer.h>
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <filesystem>
+#include <memory>
 
 #include "common/fault_injector.h"
 #include "common/logger.h"
@@ -50,6 +54,85 @@ namespace OssFileSystem {
 static constexpr mode_t kOssDirMode = (S_IFDIR | 0755);
 static constexpr mode_t kOssFileMode = (S_IFREG | 0755);
 static constexpr mode_t kOssSymlinkMode = (S_IFLNK | 0777);
+
+namespace {
+struct FdWriterCtx {
+  int fd;
+  off_t base_offset;
+  size_t count;
+  uint64_t *crc64_acc = nullptr;
+};
+
+// BodyWriter callback: pread from fd, write to output IStream.
+// Photon SDK returns error if the returned val != content-length.
+// Consistent with BodyWriteStream::writev: return -1 if the written bytes !=
+// expected bytes.
+ssize_t fd_body_writer_cb(void *ctx_ptr, IStream *output) {
+  auto *ctx = static_cast<FdWriterCtx *>(ctx_ptr);
+  // The HTTP layer re-invokes this callback on retry; reset the accumulator
+  // so the CRC always reflects exactly the body of the final attempt.
+  if (ctx->crc64_acc) *ctx->crc64_acc = 0;
+  constexpr size_t kBufSize = 128 * 1024;
+  char buf[kBufSize];
+  size_t remaining = ctx->count;
+  off_t offset = 0;  // offset relative to ctx->base_offset
+  while (remaining > 0) {
+    size_t to_read = std::min(remaining, kBufSize);
+    ssize_t n;
+    do {
+      n = ::pread(ctx->fd, buf, to_read, ctx->base_offset + offset);
+    } while (n < 0 && errno == EINTR);
+    if (n <= 0) return -1;
+    if (ctx->crc64_acc) {
+      *ctx->crc64_acc = crc64ecma(buf, n, *ctx->crc64_acc);
+    }
+    FAULT_INJECTION(FI_Modify_Staging_Data,
+                    [&]() { buf[0] = static_cast<char>(buf[0] + 1); });
+    ssize_t w = output->write(buf, n);
+    // Simulate a connection reset mid-body: the chunk has already been
+    // CRC-accumulated above, and this failure forces an HTTP-layer retry.
+    FAULT_INJECTION(FI_Upload_BodyWriter_Partial_Fail, [&]() {
+      w = -1;
+      errno = ECONNRESET;
+    });
+    if (w != n) return -1;
+    offset += n;
+    remaining -= n;
+  }
+  return ctx->count;
+}
+
+struct FdReaderCtx {
+  int fd;
+  off_t base_offset;
+  size_t count;
+};
+
+// BodyReader callback: read from input IStream, pwrite to fd.
+// Photon SDK returns error if the returned val != content-length.
+// Consistent with BodyReadStream::readv: return the actual bytes read if
+// short-read.
+ssize_t fd_body_reader_cb(void *ctx_ptr, IStream *input) {
+  auto *ctx = static_cast<FdReaderCtx *>(ctx_ptr);
+  constexpr size_t kBufSize = 128 * 1024;
+  char buf[kBufSize];
+  size_t total = 0;
+  while (total < ctx->count) {
+    size_t to_read = std::min(ctx->count - total, kBufSize);
+    ssize_t n = input->read(buf, to_read);
+    if (n < 0) return n;
+    if (n == 0) break;
+    ssize_t w;
+    do {
+      w = ::pwrite(ctx->fd, buf, n, ctx->base_offset + total);
+    } while (w < 0 && errno == EINTR);
+    if (w < 0) return w;
+    total += static_cast<size_t>(w);
+    if (w != n) break;
+  }
+  return static_cast<ssize_t>(total);
+}
+}  // namespace
 
 static bool is_obj_name_valid(std::string_view obj) {
   if (obj.size() == 0) return false;
@@ -82,20 +165,23 @@ int OssStore::head_object(std::string_view path, ObjHeaderMeta &meta) {
 
 ssize_t OssStore::get_object_range(std::string_view path,
                                    const struct iovec *iov, int iovcnt,
-                                   off_t offset) {
+                                   off_t offset, std::string *response_etag) {
   auto time_before_req = std::chrono::steady_clock::now();
 
   iovector_view view((struct iovec *)iov, iovcnt);
   auto cnt = view.sum();
 
   ssize_t r = 0;
+  ObjectHeaderMeta meta;
+  ObjectHeaderMeta *meta_ptr = response_etag ? &meta : nullptr;
 
   if (opts_.prefix.empty()) {
-    r = DO_OSS_CALL(get_object_range, path.substr(1), iov, iovcnt, offset);
+    r = DO_OSS_CALL(get_object_range, path.substr(1), iov, iovcnt, offset,
+                    meta_ptr);
   } else {
     estring obj_path;
     obj_path.appends(opts_.prefix, path);
-    r = DO_OSS_CALL(get_object_range, obj_path, iov, iovcnt, offset);
+    r = DO_OSS_CALL(get_object_range, obj_path, iov, iovcnt, offset, meta_ptr);
   }
 
   // Got partial data means oss object has been truncated to smaller size
@@ -109,12 +195,47 @@ ssize_t OssStore::get_object_range(std::string_view path,
   if (r > 0) {
     REPORT_ALL_METRIC_SUCCESSFUL(oss_read, Metric::kOssMetrics, time_before_req,
                                  r);
+    if (response_etag && meta.has_etag()) {
+      *response_etag = meta.etag;
+    }
+  }
+  return r;
+}
+
+ssize_t OssStore::get_object_range_to_fd(std::string_view path, int fd,
+                                         off_t fd_offset, off_t obj_offset,
+                                         size_t count) {
+  auto time_before_req = std::chrono::steady_clock::now();
+
+  FdReaderCtx ctx{fd, fd_offset, count};
+  BodyReader reader{&ctx, &fd_body_reader_cb};
+
+  ssize_t r = 0;
+  if (opts_.prefix.empty()) {
+    r = DO_OSS_CALL(get_object_range, path.substr(1), obj_offset, count,
+                    reader);
+  } else {
+    estring obj_path;
+    obj_path.appends(opts_.prefix, path);
+    r = DO_OSS_CALL(get_object_range, obj_path, obj_offset, count, reader);
+  }
+
+  if (r > 0 && r != static_cast<ssize_t>(count)) {
+    LOG_ERROR("Got unexpected size of object `, offset `, expected `, got `",
+              path, obj_offset, count, r);
+    return -EINVAL;
+  }
+
+  if (r > 0) {
+    REPORT_ALL_METRIC_SUCCESSFUL(oss_read_to_disk, Metric::kOssMetrics,
+                                 time_before_req, r);
   }
   return r;
 }
 
 ssize_t OssStore::put_object(std::string_view path, const struct iovec *iov,
-                             int iovcnt, uint64_t *expected_crc64) {
+                             int iovcnt, uint64_t *expected_crc64,
+                             mode_t /*mode*/) {
   auto time_before_req = std::chrono::steady_clock::now();
   ssize_t r = 0;
   if (opts_.prefix.empty()) {
@@ -127,6 +248,32 @@ ssize_t OssStore::put_object(std::string_view path, const struct iovec *iov,
 
   if (r > 0) {
     REPORT_ALL_METRIC_SUCCESSFUL(oss_write, Metric::kOssMetrics,
+                                 time_before_req, r);
+  }
+  return r;
+}
+
+ssize_t OssStore::put_object_from_fd(std::string_view path, int fd,
+                                     off_t offset, size_t count,
+                                     uint64_t *expected_crc64,
+                                     std::string *etag) {
+  auto time_before_req = std::chrono::steady_clock::now();
+  FdWriterCtx ctx{fd, offset, count, expected_crc64};
+  BodyWriter writer{&ctx, &fd_body_writer_cb};
+  ObjectUploadOptions opts;
+  opts.expected_crc64 = expected_crc64;
+  opts.etag = etag;
+  ssize_t r = 0;
+  if (opts_.prefix.empty()) {
+    r = DO_OSS_CALL(put_object, path.substr(1), count, writer, opts);
+  } else {
+    estring obj_path;
+    obj_path.appends(opts_.prefix, path);
+    r = DO_OSS_CALL(put_object, obj_path, count, writer, opts);
+  }
+
+  if (r > 0) {
+    REPORT_ALL_METRIC_SUCCESSFUL(oss_write_from_disk, Metric::kOssMetrics,
                                  time_before_req, r);
   }
   return r;
@@ -190,14 +337,41 @@ ssize_t OssStore::upload_part(void *context, const struct iovec *iov,
   return r;
 }
 
-int OssStore::upload_part_copy(void *context, off_t offset, size_t count,
-                               int part_number) {
-  return DO_OSS_CALL(upload_part_copy, context, offset, count, part_number);
+ssize_t OssStore::upload_part_from_fd(void *context, int fd, off_t offset,
+                                      size_t count, int part_number,
+                                      uint64_t *expected_crc64) {
+  FdWriterCtx ctx{fd, offset, count, expected_crc64};
+  BodyWriter writer{&ctx, &fd_body_writer_cb};
+  ObjectUploadOptions opts;
+  opts.expected_crc64 = expected_crc64;
+  auto time_before_req = std::chrono::steady_clock::now();
+  ssize_t r =
+      DO_OSS_CALL(upload_part, context, count, part_number, writer, opts);
+  if (r > 0) {
+    REPORT_ALL_METRIC_SUCCESSFUL(oss_write_from_disk, Metric::kOssMetrics,
+                                 time_before_req, r);
+  }
+  return r;
 }
 
-int OssStore::complete_multipart_upload(void *context,
-                                        uint64_t *expected_crc64) {
-  return DO_OSS_CALL(complete_multipart_upload, context, expected_crc64);
+int OssStore::upload_part_copy(void *context, off_t offset, size_t count,
+                               int part_number, uint64_t *crc64_out) {
+  int r = DO_OSS_CALL(upload_part_copy, context, offset, count, part_number,
+                      std::string_view{}, crc64_out);
+  // Simulate a copy-part response without the CRC64 header: photon leaves
+  // the sentinel untouched in that case.
+  FAULT_INJECTION(FI_RandomWrite_Copy_Part_No_Crc, [&]() {
+    if (r == 0 && crc64_out) *crc64_out = ~0ULL;
+  });
+  return r;
+}
+
+int OssStore::complete_multipart_upload(void *context, uint64_t *expected_crc64,
+                                        std::string *etag) {
+  ObjectUploadOptions opts;
+  opts.expected_crc64 = expected_crc64;
+  opts.etag = etag;
+  return DO_OSS_CALL(complete_multipart_upload, context, opts);
 }
 
 int OssStore::abort_multipart_upload(void *context) {
@@ -205,7 +379,8 @@ int OssStore::abort_multipart_upload(void *context) {
 }
 
 int OssStore::rename_object(std::string_view src_path,
-                            std::string_view dst_path, bool set_mime) {
+                            std::string_view dst_path, bool set_mime,
+                            bool /*dst_exists*/) {
   if (opts_.prefix.empty())
     return DO_OSS_CALL(rename_object, src_path.substr(1), dst_path.substr(1),
                        set_mime);
@@ -252,7 +427,7 @@ int OssStore::list_dir(std::string_view path, ObjectList &results,
     if (params.is_com_prefix) {
       if (name.size() > 0 && name.back() == '/') name.remove_suffix(1);
       if (is_obj_name_valid(name)) {
-        results.emplace_back(name, 0, 0, DT_DIR, "");
+        results.emplace_back(name, 0, timespec{}, DT_DIR, "");
       } else {
         LOG_WARN("skipped dir obj ` in list results under prefix `", params.key,
                  dir_prefix);
@@ -268,7 +443,8 @@ int OssStore::list_dir(std::string_view path, ObjectList &results,
           // Compute relative symlink size.
           file_size = symlink_size_with_root_backtrack(file_size, dir_depth);
         }
-        results.emplace_back(name, file_size, params.mtime, type, params.etag);
+        results.emplace_back(name, file_size, timespec{params.mtime, 0}, type,
+                             params.etag);
       } else if (name.size() > 0) {
         LOG_WARN("skipped file obj ` in list results under prefix `",
                  params.key, dir_prefix);
@@ -286,15 +462,30 @@ int OssStore::list_dir(std::string_view path, ObjectList &results,
                           0 /*default max-keys*/, context);
 }
 
-int OssStore::check_bucket() {
+int OssStore::check_bucket(bool allow_auto_create) {
   auto noop = [](const ListObjectsCBParameters &) { return 0; };
   std::string marker;  // provide marker to do one time list only
-  if (opts_.prefix.empty())
-    return oss_list_objects({}, noop, false, 1, &marker);
-
   estring obj_path;
-  obj_path.appends(opts_.prefix, "/");
-  return oss_list_objects(obj_path, noop, false, 1, &marker);
+  if (!opts_.prefix.empty()) obj_path.appends(opts_.prefix, "/");
+
+  int r = oss_list_objects(obj_path, noop, false, 1, &marker);
+  FAULT_INJECTION(FI_Check_Bucket_List_Not_Found, [&]() { r = -ENOENT; });
+  if (r == -ENOENT && opts_.auto_create_bucket && allow_auto_create) {
+    LOG_INFO("bucket ` not found, auto creating (agentic_bucket=`)",
+             opts_.bucket, opts_.agentic_bucket);
+    int cr = DO_OSS_CALL(put_bucket, opts_.agentic_bucket);
+    // -ENOTSUP maps from HTTP 409 (bucket already exists), treat as success.
+    if (cr < 0 && cr != -ENOTSUP) {
+      LOG_ERROR("failed to auto create bucket `, error `", opts_.bucket, cr);
+      return cr;
+    }
+    return 0;
+  }
+  return r;
+}
+
+int OssStore::delete_bucket() {
+  return DO_OSS_CALL(delete_bucket);
 }
 
 int OssStore::is_dir_empty(std::string_view path, bool &is_empty) {
@@ -559,6 +750,27 @@ bool OssStore::is_oss_symlink_target_valid(std::string_view target,
   return true;
 }
 
+int OssStore::truncate_object(std::string_view path, size_t to_size) {
+  // OSS only supports truncate to 0.
+  if (to_size != 0) {
+    LOG_WARN("OSS only supports truncate to 0, path: `, to_size: `", path,
+             to_size);
+    return -ENOTSUP;
+  }
+
+  // Write empty object (equivalent to delete and create empty file).
+  // Only supports Normal object.
+  iovec iov{nullptr, 0};
+  uint64_t expected_crc64 = 0;
+  ssize_t ret = put_object(path, &iov, 1, &expected_crc64);
+  if (ret < 0) {
+    LOG_ERROR("Failed to truncate OSS object to 0, path: `, ret: `", path, ret);
+    return ret;
+  }
+
+  return 0;
+}
+
 IObjStore *new_oss_store(const char *key, const char *key_secret,
                          const ObjStoreOptions &options) {
   auto auth = new_basic_oss_authenticator({key, key_secret});
@@ -566,6 +778,23 @@ IObjStore *new_oss_store(const char *key, const char *key_secret,
     auth = new_cached_oss_authenticator(auth);
   }
   return new OssStore(options, auth);
+}
+
+int OssStore::rename_dir(std::string_view src_path, std::string_view dst_path,
+                         bool /*dst_exists*/) {
+  LOG_ERROR("rename_dir is not supported in OSS mode");
+  return -ENOTSUP;
+}
+
+int OssStore::set_permission(std::string_view path, mode_t mode) {
+  LOG_WARN("OSS does not support chmod. path: `", path);
+  return -ENOTSUP;
+}
+
+int OssStore::set_owner(std::string_view path, uid_t uid, gid_t gid,
+                        int to_set) {
+  LOG_WARN("OSS does not support chown. path: `", path);
+  return -ENOTSUP;
 }
 
 }  // namespace OssFileSystem

@@ -16,7 +16,7 @@
 
 #include "test_suite.h"
 
-class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
+class Ossfs2AppendableObjectTest : public OssOnlyTestSuite {
  protected:
   void verify_enable_appendable_object() {
     struct stat st;
@@ -288,7 +288,9 @@ class Ossfs2AppendableObjectTest : public Ossfs2TestSuite {
     ASSERT_EQ(r, 0);
 
     file = get_file_from_handle(handle);
-    ASSERT_EQ((dynamic_cast<OssFileHandle *>(file))->get_is_dirty(), false);
+    if (!is_hdfs_test_mode()) {
+      ASSERT_EQ((dynamic_cast<OssFileHandle *>(file))->get_is_dirty(), false);
+    }
 
     meta = get_file_meta(filepath, FLAGS_oss_bucket_prefix);
     ASSERT_EQ("Appendable", meta["X-Oss-Object-Type"]);
@@ -872,6 +874,20 @@ TEST_F(Ossfs2AppendableObjectTest, verify_enable_appendable_object) {
   OssFsOptions opts;
   opts.enable_appendable_object = true;
   opts.upload_buffer_size = 1048576;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
+  init(opts);
+  verify_enable_appendable_object();
+}
+
+// Same as verify_enable_appendable_object but disables prefetching so reads go
+// through OssAppendableDirectReader instead of the cached reader.
+TEST_F(Ossfs2AppendableObjectTest,
+       verify_enable_appendable_object_direct_read) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.enable_appendable_object = true;
+  opts.upload_buffer_size = 1048576;
+  opts.prefetch_concurrency = 0;
   init(opts);
   verify_enable_appendable_object();
 }
@@ -902,12 +918,14 @@ TEST_F(Ossfs2AppendableObjectTest, verify_random_read_write_appendable_object) {
   OssFsOptions opts;
   opts.enable_appendable_object = true;
   opts.upload_buffer_size = 1048576;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_random_read_write_appendable_object();
 }
 
 TEST_F(Ossfs2AppendableObjectTest,
        verify_random_read_write_appendable_object_with_disk_cache) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
@@ -942,6 +960,7 @@ TEST_F(Ossfs2AppendableObjectTest, verify_write_to_flushed_stale_file) {
   OssFsOptions opts;
   opts.enable_appendable_object = true;
   opts.upload_buffer_size = 1048576;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_write_to_flushed_stale_file();
 }

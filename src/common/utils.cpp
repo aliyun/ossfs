@@ -29,8 +29,11 @@
 #include <wordexp.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
 
 #include "common/logger.h"
@@ -458,4 +461,108 @@ std::string cityhash128_base64url(std::string_view data) {
   }
   while (!ret.empty() && ret.back() == '=') ret.pop_back();
   return ret;
+}
+
+std::string normalize_path(std::string_view path) {
+  if (path.empty()) return {};
+  std::error_code ec;
+  std::filesystem::path abs =
+      std::filesystem::absolute(std::filesystem::path(path), ec);
+  if (ec) return {};
+  std::string s = abs.lexically_normal().string();
+  if (s.size() > 1 && s.back() == '/') s.pop_back();
+  return s;
+}
+
+bool normalize_dir_flag(std::string &dir) {
+  if (dir.empty()) return true;
+  if (dir[0] != '/') {
+    fprintf(stderr, "ERROR: directory must be an absolute path: %s\n",
+            dir.c_str());
+    return false;
+  }
+  std::string normalized = normalize_path(dir);
+  if (normalized.empty()) {
+    fprintf(stderr, "ERROR: cannot normalize directory: %s\n", dir.c_str());
+    return false;
+  }
+  dir = normalized;
+  return true;
+}
+
+// Check that a directory exists (creating it if absent) and is accessible.
+static bool ensure_dir(const std::string &dir) {
+  std::error_code ec;
+  if (::access(dir.c_str(), R_OK | W_OK | X_OK) == 0) {
+    if (!std::filesystem::is_directory(dir, ec)) {
+      if (ec) {
+        fprintf(stderr, "ERROR: cannot check %s: %s\n", dir.c_str(),
+                ec.message().c_str());
+      } else {
+        fprintf(stderr, "ERROR: %s is not a directory\n", dir.c_str());
+      }
+      return false;
+    }
+    return true;
+  }
+  bool created = std::filesystem::create_directories(dir, ec);
+  if (!created && ec) {
+    fprintf(stderr, "ERROR: cannot create directory %s: %s\n", dir.c_str(),
+            ec.message().c_str());
+    return false;
+  }
+  if (!created) {
+    // Directory already exists (TOCTOU race), re-check accessibility.
+    if (::access(dir.c_str(), R_OK | W_OK | X_OK) != 0) {
+      fprintf(stderr, "ERROR: directory %s is not accessible: %s\n",
+              dir.c_str(), strerror(errno));
+      return false;
+    }
+  }
+  return true;
+}
+
+// Reject if a and b are the same or nested in either direction.
+static bool dir_conflict(const std::string &a, const std::string &b) {
+  if (a.empty() || b.empty()) return false;
+  if (a == b) {
+    fprintf(stderr, "ERROR: %s cannot be the same as %s\n", a.c_str(),
+            b.c_str());
+    return true;
+  }
+  if (is_subdir(a, b) || is_subdir(b, a)) {
+    fprintf(stderr, "ERROR: %s and %s cannot be nested\n", a.c_str(),
+            b.c_str());
+    return true;
+  }
+  return false;
+}
+
+bool validate_dir_params(std::string_view log_dir, std::string_view cache_dir,
+                         std::string_view temp_dir,
+                         std::string_view mountpoint) {
+  std::string log(log_dir), cache(cache_dir), temp(temp_dir), mp(mountpoint);
+
+  // Reject the root directory.
+  for (const auto &dir : {log, cache, temp}) {
+    if (dir == "/") {
+      fprintf(stderr, "ERROR: directory cannot be the root directory\n");
+      return false;
+    }
+  }
+
+  // Any dir and mountpoint must not be the same or nested in either direction.
+  if (dir_conflict(log, mp)) return false;
+  if (dir_conflict(cache, mp)) return false;
+  if (dir_conflict(temp, mp)) return false;
+
+  // log_dir and cache_dir must not be the same or nested.
+  if (dir_conflict(log, cache)) return false;
+
+  // Ensure each directory exists and is accessible.
+  if (!log.empty() && !ensure_dir(log)) return false;
+  if (!cache.empty() && !ensure_dir(cache)) return false;
+  if (!temp.empty() && !ensure_dir(temp)) return false;
+
+  return true;
 }

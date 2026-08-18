@@ -25,8 +25,7 @@ template <typename Derived>
 EnableFilePrefetching<Derived>::EnableFilePrefetching(OssFs *fs)
     : fs_(fs),
       prefetch_chunk_size_(fs_->options_.prefetch_chunk_size),
-      next_prefetch_size_(fs_->options_.prefetch_chunk_size),
-      running_download_tasks_(0) {}
+      next_prefetch_size_(fs_->options_.prefetch_chunk_size) {}
 
 template <typename Derived>
 EnableFilePrefetching<Derived>::~EnableFilePrefetching() {
@@ -88,6 +87,7 @@ template <typename Derived>
 void EnableFilePrefetching<Derived>::reset_prefetch(off_t remote_size,
                                                     off_t offset) {
   is_prefetching_scheduled_ = false;
+  last_reset_prefetch_chunk_idx_ = offset / prefetch_chunk_size_;
   auto alignment = prefetch_chunk_size_;
   next_prefetch_off_ =
       std::min(align_up(offset, alignment), (uint64_t)remote_size);
@@ -147,7 +147,7 @@ void EnableFilePrefetching<Derived>::schedule_prefetch(off_t remote_size) {
   is_prefetching_scheduled_ = true;
   auto start = next_prefetch_off_;
 
-  auto running_tsks = running_download_tasks_.load();
+  auto running_tsks = in_flight_count();
   uint64_t max_tsks = std::min(
       static_cast<uint64_t>(fs_->options_.prefetch_concurrency_per_file),
       expected_task_count);
@@ -164,33 +164,44 @@ void EnableFilePrefetching<Derived>::schedule_prefetch(off_t remote_size) {
 
   if (num == 0) return;
 
-  running_download_tasks_.fetch_add(num);
+  auto start_chunk = start / prefetch_chunk_size_;
+  std::vector<uint32_t> to_download;
+  to_download.reserve(num);
+  {
+    SCOPED_LOCK(in_flight_lock_);
+    for (uint32_t i = 0; i < num; i++) {
+      if (in_flight_chunks_.insert(start_chunk + i).second) {
+        to_download.push_back(start_chunk + i);
+      }
+    }
+  }
+
+  next_prefetch_size_ =
+      std::min(next_prefetch_size_ * 2, fs_->max_prefetch_size_per_handle_);
+
+  if (to_download.empty()) return;
+
   auto ctx = new PrefetchContext;
   ctx->prefetcher = this;
-  ctx->offset = start;
-  ctx->num = num;
+  ctx->chunk_indices = std::move(to_download);
 
   auto th = photon::thread_create(prefetch_tsk, ctx);
   photon::thread_migrate(
       th, ctx->prefetcher->fs_->bg_vcpu_env_.bg_obj_store_env->get_vcpu_next());
-
-  next_prefetch_size_ =
-      std::min(next_prefetch_size_ * 2, fs_->max_prefetch_size_per_handle_);
 }
 
 template <typename Derived>
 void *EnableFilePrefetching<Derived>::prefetch_tsk(void *args) {
   auto ctx = (PrefetchContext *)args;
-  auto start = ctx->offset;
   FAULT_INJECTION(FI_First_Prefetch_Delay, [&]() {
-    if (start == 0) photon::thread_sleep(1);
+    if (!ctx->chunk_indices.empty() && ctx->chunk_indices.front() == 0)
+      photon::thread_sleep(1);
   });
-  for (int i = 0; i < ctx->num; i++) {
+  for (auto index : ctx->chunk_indices) {
     ctx->prefetcher->fs_->prefetch_sem_->wait(1);
     auto sub_ctx = new PrefetchContext;
     sub_ctx->prefetcher = ctx->prefetcher;
-    sub_ctx->offset = start;
-    start += ctx->prefetcher->prefetch_chunk_size_;
+    sub_ctx->chunk_indices = {index};
 
     // TODO: use photon::threadpool with pooled_stack_allocator
     auto th = photon::thread_create(do_prefetch_tsk, sub_ctx);
@@ -206,13 +217,19 @@ void *EnableFilePrefetching<Derived>::prefetch_tsk(void *args) {
 template <typename Derived>
 void *EnableFilePrefetching<Derived>::do_prefetch_tsk(void *args) {
   auto ctx = (PrefetchContext *)args;
+  auto prefetcher = ctx->prefetcher;
+  auto chunk_size = prefetcher->prefetch_chunk_size_;
+  auto chunk_index = ctx->chunk_indices.front();
   thread_local auto back_fs =
-      ctx->prefetcher->fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store();
-  ctx->prefetcher->do_prefetch_range(back_fs, ctx->offset,
-                                     ctx->prefetcher->prefetch_chunk_size_);
-  ctx->prefetcher->fs_->prefetch_sem_->signal(1);
+      prefetcher->fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store();
+  prefetcher->do_prefetch_range(back_fs, chunk_index * chunk_size, chunk_size);
 
-  ctx->prefetcher->running_download_tasks_.fetch_sub(1);
+  prefetcher->fs_->prefetch_sem_->signal(1);
+
+  {
+    SCOPED_LOCK(prefetcher->in_flight_lock_);
+    prefetcher->in_flight_chunks_.erase(chunk_index);
+  }
 
   delete ctx;
   return nullptr;
@@ -255,8 +272,31 @@ ssize_t EnableFilePrefetching<Derived>::do_prefetch_range(IObjStore *obj_store,
 
 template <typename Derived>
 void EnableFilePrefetching<Derived>::wait_prefetch_done() {
-  while (running_download_tasks_.load() > 0) {
+  while (in_flight_count() > 0) {
     AUTO_USLEEP(3000);
+  }
+}
+
+template <typename Derived>
+void EnableFilePrefetching<Derived>::detect_eviction_on_cache_miss(
+    off_t remote_size, off_t offset) {
+  photon::scoped_lock lock(prefetch_mutex_);
+  if (offset >= next_prefetch_off_) return;
+
+  uint32_t chunk_idx = offset / prefetch_chunk_size_;
+  // Suppress redundant detections.
+  if (chunk_idx == last_reset_prefetch_chunk_idx_) return;
+  // Data should have been cached (offset < next_prefetch_off_) but is not
+  // currently being downloaded (not in-flight) -> eviction detected.
+  bool in_flight = false;
+  {
+    SCOPED_LOCK(in_flight_lock_);
+    in_flight = in_flight_chunks_.find(chunk_idx) != in_flight_chunks_.end();
+  }
+  if (!in_flight) {
+    LOG_DEBUG("eviction detected at offset `, next_prefetch_off: `", offset,
+              next_prefetch_off_);
+    reset_prefetch(remote_size, offset);
   }
 }
 

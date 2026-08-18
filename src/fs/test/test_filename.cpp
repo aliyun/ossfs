@@ -387,6 +387,7 @@ class Ossfs2FilenameTest : public Ossfs2TestSuite {
 };
 
 TEST_F(Ossfs2FilenameTest, verify_test_special_characters_in_url) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
 
   OssFsOptions opts;
@@ -397,11 +398,13 @@ TEST_F(Ossfs2FilenameTest, verify_test_special_characters_in_url) {
 TEST_F(Ossfs2FilenameTest, verify_long_file_name) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_long_file_name();
 }
 
 TEST_F(Ossfs2FilenameTest, verify_exceeds_oss_length_limit) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -409,6 +412,7 @@ TEST_F(Ossfs2FilenameTest, verify_exceeds_oss_length_limit) {
 }
 
 TEST_F(Ossfs2FilenameTest, verify_remote_obj_with_multiple_slashes) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);

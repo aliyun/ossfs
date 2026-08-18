@@ -23,6 +23,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -219,6 +220,42 @@ class StdLogOutput final : public BaseLogOutput {
   }
 };
 
+class SyslogLogOutput final : public BaseLogOutput {
+ public:
+  SyslogLogOutput() = default;
+
+  ~SyslogLogOutput() {
+    closelog();
+  }
+
+  void destruct() override {}
+
+  void write(int level, const char *begin, const char *end) override {
+    int priority;
+    switch (level) {
+      case ALOG_DEBUG:
+        priority = LOG_DEBUG;
+        break;
+      case ALOG_INFO:
+        priority = LOG_INFO;
+        break;
+      case ALOG_WARN:
+        priority = LOG_WARNING;
+        break;
+      case ALOG_ERROR:
+        priority = LOG_ERR;
+        break;
+      case ALOG_FATAL:
+        priority = LOG_CRIT;
+        break;
+      default:
+        priority = LOG_INFO;
+        break;
+    }
+    syslog(priority, "%.*s", (int)(end - begin), begin);
+  }
+};
+
 static StdLogOutput _ossfs_log_output_stdout;
 ILogOutput *const ossfs_log_output_stdout = &_ossfs_log_output_stdout;
 
@@ -242,6 +279,20 @@ int set_ossfs_log_setting(const char *fn, uint64_t rotate_limit,
 void set_ossfs_log_to_stdout(int log_level) {
   ossfs_logger.log_level = log_level;
   ossfs_logger_ptr = &ossfs_logger;
+}
+
+static SyslogLogOutput _ossfs_log_output_syslog;
+
+void set_ossfs_log_to_syslog(int log_level) {
+  openlog("ossfs2", LOG_PID | LOG_NDELAY, LOG_USER);
+  ossfs_logger.log_output = &_ossfs_log_output_syslog;
+  ossfs_logger.log_level = log_level;
+  ossfs_logger_ptr = &ossfs_logger;
+}
+
+void set_default_logger_output_to_syslog(int log_level) {
+  default_logger.log_output = &_ossfs_log_output_syslog;
+  default_logger.log_level = log_level;
 }
 
 void set_default_logger_output_to_ossfs_log_file(int log_level) {

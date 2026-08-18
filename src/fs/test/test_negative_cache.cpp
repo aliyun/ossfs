@@ -30,7 +30,11 @@ class Ossfs2NegativeCacheTest : public Ossfs2TestSuite {
     void *handle = nullptr;
     struct stat st;
 
-    const int oss_call_fault_cnt = oss_options_.retry_times + 1;
+    // In HDFS mode, each stat call makes exactly 1 SDK call (no HTTP retry),
+    // so it consumes 1 FI count. In OSS mode, retry_times retries cause
+    // (retry_times + 1) FI counts per stat call.
+    const int oss_call_fault_cnt =
+        is_hdfs_mode_ ? 1 : (oss_options_.retry_times + 1);
 
     // case 1. lookup a not-existing file, add it to the negative cache,
     //         the following create does need to send an OSS req
@@ -119,7 +123,8 @@ class Ossfs2NegativeCacheTest : public Ossfs2TestSuite {
 
     void *handle = nullptr;
     struct stat st;
-    const int oss_call_fault_cnt = oss_options_.retry_times + 1;
+    const int oss_call_fault_cnt =
+        is_hdfs_mode_ ? 1 : (oss_options_.retry_times + 1);
     int r = 0;
 
     uint64_t nodeid;
@@ -229,6 +234,11 @@ class Ossfs2NegativeCacheTest : public Ossfs2TestSuite {
     create_random_file(local_file, 3);
 
     std::string new_parent_name = parent_name + "_renamed";
+    // Clean up leftover _renamed dir from a previous aborted run
+    if (is_hdfs_mode_) {
+      hdfs_helper_->delete_dir_recursive(
+          hdfs_helper_->full_uri("/" + new_parent_name));
+    }
     uint64_t newpid;
     struct stat st;
     int r = fs_->mkdir(root_nodeid_, new_parent_name.c_str(), 0777, 0, 0, 0,
@@ -293,6 +303,7 @@ TEST_F(Ossfs2NegativeCacheTest, verify_negative_cache_create) {
   opts.attr_timeout = 2;
   opts.oss_negative_cache_size = 1000;
   opts.oss_negative_cache_timeout = 1;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_negative_cache_create();
 }
@@ -303,6 +314,7 @@ TEST_F(Ossfs2NegativeCacheTest, verify_negative_cache_lookup) {
   opts.attr_timeout = 2;
   opts.oss_negative_cache_size = 3;
   opts.oss_negative_cache_timeout = 1;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_negative_cache_lookup();
 }
@@ -313,6 +325,7 @@ TEST_F(Ossfs2NegativeCacheTest, verify_negative_cache_renamedir) {
   opts.attr_timeout = 2;
   opts.oss_negative_cache_size = 1000;
   opts.oss_negative_cache_timeout = 1;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_negative_cache_renamedir();
 }

@@ -19,6 +19,8 @@
 #include <photon/fs/cache/cache.h>
 #include <photon/fs/filesystem.h>
 
+#include <string_view>
+
 #include "bg_vcpu_env.h"
 #include "cache.h"
 #include "mem_pool.h"
@@ -31,7 +33,10 @@ class DiskCache : public ICache {
  public:
   DiskCache(BGVCpuDiskCacheEnv *env,
             std::shared_ptr<FixedBlockMemoryPool> memory_pool)
-      : env_(env), memory_pool_(std::move(memory_pool)) {}
+      : env_(env),
+        memory_pool_(std::move(memory_pool)),
+        dispatch_to_bg_vcpu_(env->io_engine_type_ !=
+                             photon::fs::ioengine_psync) {}
 
   ~DiskCache();
 
@@ -40,7 +45,7 @@ class DiskCache : public ICache {
   }
 
   CacheHandle *get(std::string_view name, std::string_view etag,
-                   off_t actual_size = 0) override;
+                   size_t size = 0) override;
   void release(CacheHandle *h, uint64_t count) override;
 
   size_t capacity() override {
@@ -57,6 +62,10 @@ class DiskCache : public ICache {
 
   BGVCpuDiskCacheEnv *env_ = nullptr;
   std::shared_ptr<FixedBlockMemoryPool> memory_pool_ = nullptr;
+
+  // True when disk cache requests are dispatched to a background executor
+  // (libaio); false when they run inline on the caller vCPU (psync).
+  bool dispatch_to_bg_vcpu_ = false;
 
   int ref_cnt_ = 0;
   DiskCacheStore *cache_store_ = nullptr;

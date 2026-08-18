@@ -206,4 +206,6 @@ int set_ossfs_log_setting(const char *fn, uint64_t rotate_limit = UINT64_MAX,
                           int log_level = ALOG_INFO);
 
 void set_ossfs_log_to_stdout(int log_level);
+void set_ossfs_log_to_syslog(int log_level);
+void set_default_logger_output_to_syslog(int log_level);
 void set_default_logger_output_to_ossfs_log_file(int log_level);

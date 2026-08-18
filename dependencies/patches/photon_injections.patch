@@ -1,11 +1,23 @@
+diff --git a/ecosystem/oss_constants.h b/ecosystem/oss_constants.h
+index c3f51d9..451c952 100644
+--- a/ecosystem/oss_constants.h
++++ b/ecosystem/oss_constants.h
+@@ -25,6 +25,7 @@ static const char OSS_HEADER_KEY_X_OSS_METADATA_DIRECTIVE[] = "x-oss-metadata-di
+ static const char OSS_HEADER_KEY_X_OSS_RANGE_BEHAVIOR[]     = "x-oss-range-behavior";
+ static const char OSS_HEADER_KEY_X_OSS_FORBID_OVERWRITE[]   = "x-oss-forbid-overwrite";
+ static const char OSS_HEADER_KEY_X_OSS_SYMLINK_TARGET[]   = "x-oss-symlink-target";
++static const char OSS_HEADER_KEY_X_OSS_AGENTIC_BUCKET[]   = "x-oss-agentic-bucket";
+ 
+ static const char OSS_PARAM_KEY_CONTINUATION_TOKEN[]        = "continuation-token";
+ static const char OSS_PARAM_KEY_OBJECT_META[]     = "objectMeta";
 diff --git a/ecosystem/oss.cpp b/ecosystem/oss_patched.cpp
-similarity index 98%
+similarity index 97%
 rename from ecosystem/oss.cpp
 rename to ecosystem/oss_patched.cpp
-index b9accd7..8a08d20 100644
+index 4cf5e3d..109c7cd 100644
 --- a/ecosystem/oss.cpp
 +++ b/ecosystem/oss_patched.cpp
-@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
+@@ -14,7 +14,7 @@
  limitations under the License.
  */
  
@@ -14,7 +26,7 @@ index b9accd7..8a08d20 100644
  
  #include <netinet/in.h>
  #include <photon/common/alog-stdstring.h>
-@@ -34,8 +34,11 @@ limitations under the License.
+@@ -34,8 +34,11 @@
  #include <string>
  #include <unordered_map>
  
@@ -27,7 +39,7 @@ index b9accd7..8a08d20 100644
  
  // unused constants will trigger compile error in photon,
  // unless they are defined in a header file
-@@ -203,6 +206,14 @@ static int error_http_status_to_errno(int status_code) {
+@@ -203,6 +206,14 @@
  static int do_http_call(HTTP_STACK_OP& op, const ClientOptions& options,
                          std::string_view object) {
    int ret = -1;
@@ -42,7 +54,7 @@ index b9accd7..8a08d20 100644
    auto retry_times = options.retry_times;
    auto retry_interval = options.retry_base_interval_us;
  
-@@ -214,6 +225,11 @@ __retry:
+@@ -214,6 +225,11 @@
    int __saved_errno = errno;
    {
      int r = 0;
@@ -54,7 +66,7 @@ index b9accd7..8a08d20 100644
      auto start_time = std::chrono::steady_clock::now();
      LOG_DEBUG("Sending oss request ` ` Range[`]", verbstr[op.req.verb()],
                op.req.target(), op.req.headers["Range"]);
-@@ -228,6 +244,11 @@ __retry:
+@@ -228,6 +244,11 @@
          "Got oss response ` ` Range[`], code=` content_length=` latency_us=`",
          verbstr[op.req.verb()], op.req.target(), op.req.headers["Range"],
          op.resp.status_code(), op.resp.headers.content_length(), latency);
@@ -66,7 +78,7 @@ index b9accd7..8a08d20 100644
      if (r < 0) {
        if (retry_times-- > 0) {
          photon::thread_usleep(retry_interval);
-@@ -237,6 +258,11 @@ __retry:
+@@ -237,6 +258,11 @@
          goto __retry;
        }
      }
@@ -78,7 +90,7 @@ index b9accd7..8a08d20 100644
    }
  
    if (op.status_code != 200 && op.status_code != 206 && op.status_code != 204) {
-@@ -252,6 +278,9 @@ __retry:
+@@ -252,6 +278,9 @@
            error_res["EC"].to_string_view());
        // clang-format on
  
@@ -88,7 +100,28 @@ index b9accd7..8a08d20 100644
        if (code_view.find("QpsLimitExceeded") != std::string::npos) {
          if (qps_limit_retry_interval > 0) {
            photon::thread_usleep(qps_limit_retry_interval);
-@@ -507,9 +536,12 @@ int OssClient::walk_list_results(const SimpleDOM::Node& list_bucket_result,
+@@ -335,6 +364,10 @@
+   OssClientImpl(const ClientOptions& options, Authenticator* authenticator);
+   ~OssClientImpl();
+ 
++  int put_bucket(std::string_view agent_bucket);
++
++  int delete_bucket();
++
+   int list_objects(std::string_view prefix, ListObjectsCallback cb,
+                    ListObjectsParameters = {}, std::string* marker = nullptr);
+ 
+@@ -367,7 +400,8 @@
+                       ObjectUploadOptions& opts);
+ 
+   int upload_part_copy(void* context, off_t offset, size_t count,
+-                       int part_number, std::string_view from = {});
++                       int part_number, std::string_view from = {},
++                       uint64_t *crc64_out = nullptr);
+ 
+   int complete_multipart_upload(void* context, ObjectUploadOptions& opts);
+ 
+@@ -527,9 +561,12 @@
      auto mtime = NodeStrValue(child["LastModified"]);
      auto etag = NodeStrValue(child["ETag"]);
      auto type = NodeStrValue(child["Type"]);
@@ -102,7 +135,7 @@ index b9accd7..8a08d20 100644
        LOG_ERROR_RETURN(EINVAL, -1,
                         "unexpected response: missing required fields");
  
-@@ -717,6 +749,8 @@ retry:
+@@ -737,6 +774,8 @@
      if (key) deleted_size++;
    }
  
@@ -111,22 +144,66 @@ index b9accd7..8a08d20 100644
    if (deleted_size != to_delete_size) {
      // Partial deletion happens when OSS server side is with pressure.
      // If this is the case , we just have another try. It's OK if some keys
-@@ -896,6 +930,7 @@ retry:
-   uint64_t content_length = op.resp.headers.content_length();
-   auto ret = op.resp.readv(iov, iovcnt);
+@@ -789,6 +828,20 @@
+   return r;
+ }
  
++int OssClient::put_bucket(std::string_view agent_bucket) {
++  OssUrl oss_url(m_endpoint, m_bucket, {}, m_is_http);
++  DEFINE_ONSTACK_OP(m_client, Verb::PUT, oss_url.url());
++  if (!agent_bucket.empty())
++    op.req.headers.insert(OSS_HEADER_KEY_X_OSS_AGENTIC_BUCKET, agent_bucket);
++  return sign_and_call(op, Verb::PUT, oss_url);
++}
++
++int OssClient::delete_bucket() {
++  OssUrl oss_url(m_endpoint, m_bucket, {}, m_is_http);
++  DEFINE_ONSTACK_OP(m_client, Verb::DELETE, oss_url.url());
++  return sign_and_call(op, Verb::DELETE, oss_url);
++}
++
+ int OssClient::delete_objects(const std::vector<std::string_view>& objects,
+                               std::string_view obj_prefix) {
+   size_t start = 0;
+@@ -913,6 +966,7 @@
+ 
+   uint64_t content_length = op.resp.headers.content_length();
+   auto ret = reader(&op.resp);
 +  FAULT_INJECTION(FI_OssError_Read_Partial, [&]() { ret--; });
    // we have encountered partial read issue because of the socket was
    // unexpectedly closed
    if (ret != static_cast<ssize_t>(content_length)) {
+@@ -1380,7 +1434,8 @@
+ }
+ 
+ int OssClient::upload_part_copy(void* context, off_t offset, size_t count,
+-                                int part_number, std::string_view from) {
++                                int part_number, std::string_view from,
++                                uint64_t *crc64_out) {
+   assert(context);
+   oss_multipart_context* ctx = (oss_multipart_context*)context;
+   assert(!ctx->upload_id.empty());
+@@ -1409,6 +1464,12 @@
+   op.req.headers.insert(OSS_HEADER_KEY_X_OSS_COPY_SOURCE_RANGE, range);
+   int r = sign_and_call(op, Verb::PUT, oss_url, query_params);
+   if (r < 0) return r;
++
++  if (crc64_out) {
++    auto it = op.resp.headers.find("x-oss-hash-crc64ecma");
++    if (it != op.resp.headers.end())
++      estring_view(it.second()).to_uint64_check(crc64_out);
++  }
+ 
+   auto reader = get_xml_node(op);
+   if (!reader) LOG_ERROR_RETURN(EINVAL, -1, "failed to parse xml resp_body");
 diff --git a/ecosystem/oss.h b/ecosystem/oss_patched.h
-similarity index 99%
+similarity index 97%
 rename from ecosystem/oss.h
 rename to ecosystem/oss_patched.h
-index 2952cfd..e8816aa 100644
+index 9fd71de..cceee5f 100644
 --- a/ecosystem/oss.h
 +++ b/ecosystem/oss_patched.h
-@@ -28,7 +28,7 @@ limitations under the License.
+@@ -30,7 +30,7 @@
  #include <vector>
  
  namespace photon {
@@ -135,7 +212,42 @@ index 2952cfd..e8816aa 100644
  
  using StringKV = ordered_string_kv;
  
-@@ -323,5 +323,5 @@ Authenticator* new_cached_oss_authenticator(Authenticator* auth,
+@@ -166,6 +166,12 @@
+ 
+ class Client : public Object {
+  public:
++  // Create the bucket configured in ClientOptions (standard OSS PutBucket).
++  virtual int put_bucket(std::string_view agent_bucket = {}) = 0;
++
++  // Delete the bucket configured in ClientOptions (standard OSS DeleteBucket).
++  virtual int delete_bucket() = 0;
++
+   virtual int list_objects(std::string_view prefix, ListObjectsCallback cb,
+                            ListObjectsParameters = {},
+                            std::string* marker = nullptr) = 0;
+@@ -282,7 +288,8 @@
+                               ObjectUploadOptions& opts) = 0;
+ 
+   virtual int upload_part_copy(void* context, off_t offset, size_t count,
+-                               int part_number, std::string_view from = {}) = 0;
++                               int part_number, std::string_view from = {},
++                               uint64_t *crc64_out = nullptr) = 0;
+ 
+   // if expected_crc64 is specified, we will compare the value with the
+   // returned object crc64 to validate the object integrity.
+@@ -311,8 +318,9 @@
+     }
+ 
+     int copy(off_t offset, size_t count, int part_number,
+-             std::string_view from = {}) {
+-      return _client->upload_part_copy(_ctx, offset, count, part_number, from);
++             std::string_view from = {}, uint64_t *crc64_out = nullptr) {
++      return _client->upload_part_copy(_ctx, offset, count, part_number, from,
++                                       crc64_out);
+     }
+ 
+     int complete(uint64_t* expected_crc64) {
+@@ -386,5 +394,5 @@
      auth_->set_credentials(std::move(credentials));
    }
  };*/

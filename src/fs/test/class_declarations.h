@@ -35,6 +35,10 @@ class Ossfs2MetricsTest;
 class Ossfs2CredentialsTest;
 class Ossfs2SymlinkTest;
 class Ossfs2PrefetchWindowTest;
+class Ossfs2PrefetchTest;
+class Ossfs2HdfsErrorPathsTest;
+class Ossfs2HdfsReadWriteTest;
+class Ossfs2RandomWriteTest;
 
 #define DECLARE_TEST_FRIENDS_CLASSES         \
   friend class ::Ossfs2BasicTest;            \
@@ -55,4 +59,8 @@ class Ossfs2PrefetchWindowTest;
   friend class ::Ossfs2MetricsTest;          \
   friend class ::Ossfs2CredentialsTest;      \
   friend class ::Ossfs2SymlinkTest;          \
-  friend class ::Ossfs2PrefetchWindowTest;
+  friend class ::Ossfs2PrefetchWindowTest;   \
+  friend class ::Ossfs2PrefetchTest;         \
+  friend class ::Ossfs2HdfsErrorPathsTest;   \
+  friend class ::Ossfs2HdfsReadWriteTest;    \
+  friend class ::Ossfs2RandomWriteTest;

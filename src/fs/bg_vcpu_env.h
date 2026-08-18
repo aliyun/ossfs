@@ -118,18 +118,25 @@ struct BGVCpuObjStoreEnv : public VCpuObjStoreEnv {
 };
 
 //
-// A background vCPU environment for disk cache operations.
+// A background vCPU environment for disk cache operations. Local store
+// requests are dispatched round-robin to the registered executors (libaio
+// only; psync runs them inline on the caller vCPU). The primary executor
+// (index 0) owns the disk cache env and its recycle timer.
 //
 struct BGVCpuDiskCacheEnv {
   int init(const OssFileSystem::DiskCacheOptions &opts) {
-    if (executor == nullptr) {
+    if (executors_.empty()) {
       return -1;
     }
     io_engine_type_ = opts.io_engine_type;
-    return executor->perform([&]() {
-      if (io_engine_type_ == photon::fs::ioengine_libaio) {
-        photon::libaio_wrapper_init();
+    if (io_engine_type_ == photon::fs::ioengine_libaio) {
+      // libaio wrapper must be initialized on every executor vCPU.
+      for (auto e : executors_) {
+        e->perform([]() { photon::libaio_wrapper_init(); });
       }
+    }
+    // The env is created on the primary executor which owns its lifecycle.
+    return executors_[0]->perform([&]() {
       disk_cache_env = new OssFileSystem::DiskCacheEnv(opts);
       int r = disk_cache_env->init();
       if (r != 0) {
@@ -141,27 +148,31 @@ struct BGVCpuDiskCacheEnv {
   }
 
   ~BGVCpuDiskCacheEnv() {
-    if (executor) {
-      executor->perform([&]() {
-        delete disk_cache_env;
-        if (io_engine_type_ == photon::fs::ioengine_libaio) {
-          photon::libaio_wrapper_fini();
+    if (!executors_.empty()) {
+      // Env dies on the primary executor; libaio fini pairs with init per
+      // executor vCPU.
+      executors_[0]->perform([&]() { delete disk_cache_env; });
+      if (io_engine_type_ == photon::fs::ioengine_libaio) {
+        for (auto e : executors_) {
+          e->perform([]() { photon::libaio_wrapper_fini(); });
         }
-      });
-      delete executor;
+      }
+      for (auto e : executors_) delete e;
     }
   }
 
   int io_engine_type_ = photon::fs::ioengine_libaio;
   OssFileSystem::DiskCacheEnv *disk_cache_env = nullptr;
-  photon::Executor *executor = nullptr;
+  std::vector<photon::Executor *> executors_;
+  std::atomic<uint64_t> executor_id_{0};
 
-  void set_executor(photon::Executor *executor) {
-    this->executor = executor;
+  void add_executor(photon::Executor *executor) {
+    executors_.push_back(executor);
   }
 
-  photon::Executor *get_executor() const {
-    return executor;
+  photon::Executor *get_executor_next() {
+    auto next_id = executor_id_.fetch_add(1) % executors_.size();
+    return executors_[next_id];
   }
 
   photon::fs::ICachePool *get_disk_cache_pool() const {

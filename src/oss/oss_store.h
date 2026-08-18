@@ -29,6 +29,8 @@ namespace OssFileSystem {
 
 using namespace photon::objstore_from_photon;
 
+class RawObjHandle;
+
 //
 // OssStore implements IObjStore for OSS object store backend.
 // Translates filesystem paths to OSS object paths and manages credentials.
@@ -42,6 +44,10 @@ class OssStore : public IObjStore {
 
   ~OssStore() override = default;
 
+  StorageBackend get_backend_type() const override {
+    return StorageBackend::kOSS;
+  }
+
   // IObjStore interface implementation
   void set_credentials(ObjCredentials &&creds) override;
 
@@ -52,10 +58,24 @@ class OssStore : public IObjStore {
   int head_object(std::string_view path, ObjHeaderMeta &meta) override;
 
   ssize_t get_object_range(std::string_view path, const struct iovec *iov,
-                           int iovcnt, off_t offset) override;
+                           int iovcnt, off_t offset,
+                           std::string *response_etag = nullptr) override;
+
+  ssize_t get_object_range_to_fd(std::string_view path, int fd, off_t fd_offset,
+                                 off_t obj_offset, size_t count) override;
 
   ssize_t put_object(std::string_view path, const struct iovec *iov, int iovcnt,
-                     uint64_t *expected_crc64 = nullptr) override;
+                     uint64_t *expected_crc64 = nullptr,
+                     mode_t mode = 0755) override;
+
+  int open_object(std::string_view path, int flags, mode_t mode,
+                  RawObjHandle **out_handle) override {
+    return -ENOTSUP;
+  }
+
+  ssize_t put_object_from_fd(std::string_view path, int fd, off_t offset,
+                             size_t count, uint64_t *expected_crc64 = nullptr,
+                             std::string *etag = nullptr) override;
 
   ssize_t append_object(std::string_view path, const struct iovec *iov,
                         int iovcnt, off_t position,
@@ -65,7 +85,10 @@ class OssStore : public IObjStore {
                   bool overwrite = false, bool set_mime = false) override;
 
   int rename_object(std::string_view src_path, std::string_view dst_path,
-                    bool set_mime = false) override;
+                    bool set_mime = false, bool dst_exists = false) override;
+
+  int rename_dir(std::string_view src_path, std::string_view dst_path,
+                 bool dst_exists = false) override;
 
   int delete_object(std::string_view path) override;
 
@@ -74,7 +97,9 @@ class OssStore : public IObjStore {
   int list_dir(std::string_view path, ObjectList &results,
                std::string *context = nullptr) override;
 
-  int check_bucket() override;
+  int check_bucket(bool allow_auto_create = true) override;
+
+  int delete_bucket() override;
 
   int is_dir_empty(std::string_view path, bool &is_empty) override;
 
@@ -84,11 +109,15 @@ class OssStore : public IObjStore {
                       int part_number,
                       uint64_t *expected_crc64 = nullptr) override;
 
-  int upload_part_copy(void *context, off_t offset, size_t count,
-                       int part_number) override;
+  ssize_t upload_part_from_fd(void *context, int fd, off_t offset, size_t count,
+                              int part_number,
+                              uint64_t *expected_crc64 = nullptr) override;
 
-  int complete_multipart_upload(void *context,
-                                uint64_t *expected_crc64) override;
+  int upload_part_copy(void *context, off_t offset, size_t count,
+                       int part_number, uint64_t *crc64_out = nullptr) override;
+
+  int complete_multipart_upload(void *context, uint64_t *expected_crc64,
+                                std::string *etag = nullptr) override;
 
   int abort_multipart_upload(void *context) override;
 
@@ -103,6 +132,35 @@ class OssStore : public IObjStore {
 
   int get_symlink(std::string_view path, std::string &target) override;
   ssize_t put_symlink(std::string_view path, std::string_view target) override;
+
+  int truncate_object(std::string_view path, size_t to_size) override;
+
+  int set_permission(std::string_view path, mode_t mode) override;
+  int set_owner(std::string_view path, uid_t uid, gid_t gid,
+                int to_set) override;
+
+  int set_lock(std::string_view, int64_t, int64_t, int16_t, int64_t,
+               uint64_t) override {
+    return -ENOTSUP;
+  }
+  int get_lock(std::string_view, int64_t &, int64_t &, int16_t &, int64_t &,
+               uint64_t) override {
+    return -ENOTSUP;
+  }
+
+  int set_xattr(std::string_view, const char *, const char *, size_t,
+                int) override {
+    return -ENOTSUP;
+  }
+  int get_xattr(std::string_view, const char *, char *, size_t) override {
+    return -ENOTSUP;
+  }
+  int list_xattr(std::string_view, char *, size_t) override {
+    return -ENOTSUP;
+  }
+  int remove_xattr(std::string_view, const char *) override {
+    return -ENOTSUP;
+  }
 
  private:
   int oss_stat_file(std::string_view path, struct stat *buf, std::string *etag);

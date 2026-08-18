@@ -100,15 +100,20 @@ DECLARE_bool(allow_mark_dir_stale_recursively);
 DECLARE_bool(allow_rename_dir);
 DECLARE_uint64(rename_dir_limit);
 DECLARE_bool(allow_other);
+DECLARE_bool(default_permissions);
 DECLARE_int32(seq_read_detect_count);
 DECLARE_bool(sync_upload);
 DECLARE_bool(enable_symlink);
+DECLARE_bool(enable_xattr);
+DECLARE_bool(hdfs_set_owner_on_create);
 
 // ==================== Oss Bucket Options ====================
 DECLARE_string(oss_endpoint);
 DECLARE_string(oss_bucket);
 DECLARE_string(oss_bucket_prefix);
 DECLARE_string(oss_region);
+DECLARE_bool(auto_create_bucket);
+DECLARE_string(agentic_bucket);
 
 // ==================== Oss Credential Options ====================
 DECLARE_string(oss_access_key_id);
@@ -136,6 +141,7 @@ DECLARE_string(disk_data_cache_dir);
 DECLARE_string(disk_data_cache_size);
 DECLARE_string(disk_data_cache_io_engine);
 DECLARE_string(disk_available_space);
+DECLARE_int32(libaio_vcpu_count);
 
 // ==================== Oss Client Options ====================
 DECLARE_string(upload_buffer_size);
@@ -148,11 +154,17 @@ DECLARE_int32(prefetch_chunks);
 DECLARE_uint64(min_reserved_buffer_size_per_file);
 DECLARE_bool(enable_appendable_object);
 DECLARE_uint64(appendable_object_autoswitch_threshold);
+DECLARE_string(temp_dir);
+DECLARE_string(random_write_chunk_size);
+DECLARE_string(random_write_max_file_size);
+DECLARE_string(temp_dir_free_bytes);
+DECLARE_uint32(temp_dir_free_percent);
 DECLARE_bool(enable_crc64);
 DECLARE_uint64(oss_vcpu_count);
 DECLARE_bool(use_list_obj_v2);
 DECLARE_int32(max_list_ret_count);
 DECLARE_uint64(oss_request_timeout_ms);
+DECLARE_string(oss_hdfs_client_options);
 DECLARE_string(bind_ips);
 DECLARE_bool(set_mime_for_rename_dst);
 DECLARE_bool(use_auth_cache);

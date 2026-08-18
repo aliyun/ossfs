@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 
 #include "cache.h"
@@ -43,11 +44,30 @@ class IReader {
   virtual ssize_t pread(void *buf, size_t count, off_t offset) = 0;
   virtual ssize_t pin(off_t offset, size_t count, void **buf) = 0;
   virtual void unpin(off_t offset) = 0;
-  virtual std::string_view get_path() = 0;
+
+  virtual std::string get_path() = 0;
+  virtual void set_path(std::string_view path) = 0;
 };
 
-class OssCachedReader final : public IReader,
-                              public EnableFilePrefetching<OssCachedReader> {
+class OssReader : public IReader {
+ public:
+  OssReader(FileInode *inode, std::string_view path);
+
+  std::string get_path() override {
+    return path_;
+  }
+
+  void set_path(std::string_view path) override {
+    path_ = path;
+  }
+
+ protected:
+  FileInode *inode_ = nullptr;
+  std::string path_;
+};
+
+class OssCachedReader : public OssReader,
+                        public EnableFilePrefetching<OssCachedReader> {
  public:
   OssCachedReader(OssFs *fs, std::string_view path, FileInode *inode,
                   std::shared_ptr<ICache> cache, CacheHandle *cache_handle);
@@ -63,11 +83,12 @@ class OssCachedReader final : public IReader,
   // With inode lock held outside.
   int close() override;
 
-  virtual ~OssCachedReader();
+  // Overrides the base get_path() and set_path() with a thread-safe version
+  // that serializes with attr_lock_.
+  std::string get_path() override;
+  void set_path(std::string_view path) override;
 
-  std::string_view get_path() override {
-    return path_;
-  }
+  virtual ~OssCachedReader();
 
  private:
   // Memory usage thresholds for prefetch window control.
@@ -98,13 +119,33 @@ class OssCachedReader final : public IReader,
                           uint64_t refill_size, size_t count, char *input,
                           off_t offset, bool from_bg_prefetch);
 
+  // TODO: extend ETag verification to streaming/appendable modes.
+  // Currently only OssRandWriterCachedReader overrides this with full
+  // ETag comparison.
+  virtual ssize_t do_verified_refill_get(IObjStore *obj_store,
+                                         const struct iovec *iov, int iovcnt,
+                                         uint64_t refill_off);
+
+ protected:
   ssize_t do_pread(void *buf, size_t count, off_t offset, size_t refill_unit);
 
-  // Needs inode's rlock.
-  ssize_t read_from_dirty_inode(void *buf, size_t count, off_t offset);
-
-  off_t get_remote_size();
   void set_remote_size(off_t size);
+
+  // Sync anchored attrs from the inode and drop cache on change.
+  // Must be called under the inode rlock.
+  bool refresh_attr_if_needed_and_drop_cache();
+
+  photon::spinlock attr_lock_;
+  // remote_size is a cached copy of the inode file size, stored per file
+  // handle. It is primarily used in prefetching and caching code paths to avoid
+  // repeatedly acquiring the inode lock. The following value is only updated
+  // during refresh_attr_if_needed_and_invoke.
+  off_t remote_size_ = 0;
+  timespec mtime_ = {0, 0};
+  std::string etag_;
+
+ private:
+  off_t get_remote_size();
 
   bool refresh_attr_if_needed_and_invoke(std::function<void()> &&callback);
 
@@ -120,23 +161,44 @@ class OssCachedReader final : public IReader,
   // And the prefetch window size is determined by this value.
   uint64_t total_blocks_ = 0;
 
-  photon::spinlock attr_lock_;
-  // remote_size is a cached copy of the inode file size, stored per file
-  // handle. It is primarily used in prefetching and caching code paths to avoid
-  // repeatedly acquiring the inode lock. The following value is only updated
-  // during refresh_attr_if_needed_and_invoke.
-  off_t remote_size_ = 0;
-  timespec mtime_ = {0, 0};
-
-  FileInode *inode_ = nullptr;
-  const std::string path_;
-
   friend class EnableFilePrefetching<OssCachedReader>;
 
   DECLARE_TEST_FRIENDS_CLASSES;
 };
 
-class OssDirectReader final : public IReader {
+// Reader variant used in WriteMode::Appendable. It overrides the rlocked read
+// hook to serve not-yet-uploaded appended data from the dirty file handle
+// before falling back to the cached read path.
+class OssAppendableCachedReader final : public OssCachedReader {
+ public:
+  using OssCachedReader::OssCachedReader;
+
+  ssize_t pread_rlocked(void *buf, size_t count, off_t offset) override;
+
+ private:
+  // Needs inode's rlock.
+  ssize_t read_from_appendable_dirty_inode(void *buf, size_t count,
+                                           off_t offset);
+
+  void note_clean_size(off_t size);
+  ssize_t read_clean_range(void *buf, size_t count, off_t offset);
+};
+
+// Reader variant used in WriteMode::Random. It overrides the rlocked
+// read hook to serve chunk-level reads for files with an active random-write
+// context: dirty chunks from the staging file, clean chunks directly from OSS.
+class OssRandWriterCachedReader final : public OssCachedReader {
+ public:
+  using OssCachedReader::OssCachedReader;
+
+  ssize_t pread_rlocked(void *buf, size_t count, off_t offset) override;
+
+ private:
+  ssize_t do_verified_refill_get(IObjStore *obj_store, const struct iovec *iov,
+                                 int iovcnt, uint64_t refill_off) override;
+};
+
+class OssDirectReader : public OssReader {
  public:
   OssDirectReader(OssFs *fs, std::string_view path, FileInode *inode);
 
@@ -153,15 +215,39 @@ class OssDirectReader final : public IReader {
     return 0;
   }
 
-  std::string_view get_path() override {
-    return path_;
-  }
+ protected:
+  ssize_t read_range_from_oss(void *buf, size_t count, off_t offset);
+
+  OssFs *fs_ = nullptr;
+  std::atomic<off_t> file_size_ = {0};
+};
+
+// Reader variant used in WriteMode::Appendable when caching is
+// disabled. It serves not-yet-uploaded appended data from the dirty file handle
+// and reads the already-uploaded prefix straight from OSS.
+class OssAppendableDirectReader final : public OssDirectReader {
+ public:
+  using OssDirectReader::OssDirectReader;
+
+  ssize_t pread_rlocked(void *buf, size_t count, off_t offset) override;
 
  private:
-  OssFs *fs_ = nullptr;
-  FileInode *inode_ = nullptr;
-  const std::string path_;
-  std::atomic<off_t> file_size_ = {0};
+  // Needs inode's rlock.
+  ssize_t read_from_appendable_dirty_inode(void *buf, size_t count,
+                                           off_t offset);
+
+  void note_clean_size(off_t size);
+  ssize_t read_clean_range(void *buf, size_t count, off_t offset);
+};
+
+// Direct-reader variant used in WriteMode::Random when caching is
+// disabled. It routes per-chunk reads for files with an active random-write
+// context: dirty chunks from the staging file, clean chunks directly from OSS.
+class OssRandWriterDirectReader final : public OssDirectReader {
+ public:
+  using OssDirectReader::OssDirectReader;
+
+  ssize_t pread_rlocked(void *buf, size_t count, off_t offset) override;
 };
 
 std::unique_ptr<IReader> create_oss_reader(OssFs *fs, std::string_view path,

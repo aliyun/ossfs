@@ -18,9 +18,78 @@
 
 #include <photon/fs/filesystem.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <functional>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
+
+// Reserved uid/gid for unresolved names (nobody user).
+// Used by backend when username/groupname resolution fails.
+// Also used by FUSE adapter to replace backend reserved values with req.
+// context.
+constexpr uid_t kReservedUnresolvedUid = 99;
+constexpr gid_t kReservedUnresolvedGid = 99;
+
+// Permission bits mask (lower 9 bits: rwxrwxrwx).
+constexpr mode_t kPermMask = 0777;
+
+// Test-only mapping table for uid/gid <-> username/groupname.
+// Used by FAULT_INJECTION(FI_Hdfs_UserGroup_Mapping) to mock NSS lookups
+// in unit tests without requiring real system users/groups.
+struct UserGroupMapping {
+  std::unordered_map<uid_t, std::string> uid_to_name;
+  std::unordered_map<std::string, uid_t> name_to_uid;
+  std::unordered_map<gid_t, std::string> gid_to_name;
+  std::unordered_map<std::string, gid_t> name_to_gid;
+  // gid -> list of usernames in that group (simulates gr_mem)
+  std::unordered_map<gid_t, std::vector<std::string>> group_members;
+};
+extern UserGroupMapping g_test_user_mapping;
+
+// Resolve uid to username string. Returns empty string on failure.
+// Uses FI_Hdfs_UserGroup_Mapping for test mocking when enabled.
+std::string uid_to_username(uid_t uid);
+
+// Resolve gid to groupname string. Returns empty string on failure.
+// Uses FI_Hdfs_UserGroup_Mapping for test mocking when enabled.
+std::string gid_to_groupname(gid_t gid);
+
+// HDFS permission check. Uses OR check for loose pre-checking.
+// Supplementary group membership is checked via getgrgid_r + gr_mem.
+int check_hdfs_access(const struct stat *stbuf, int mask, uid_t current_uid,
+                      gid_t current_gid);
+
+// Permission check operation types.
+// Covers all operations that VFS default_permissions would check.
+// The actual permission enforcement strategy is backend-specific:
+// some backends may implement all checks at the store layer,
+// while others rely on VFS default_permissions for most operations.
+enum class PermOp : int {
+  // File content access.
+  Open,       // open() - R/W based on flags
+  Truncate,   // truncate() - W_OK on file
+  Ftruncate,  // ftruncate() - W_OK on file
+  // Metadata modification.
+  Chmod,      // chmod() - owner or CAP_FOWNER
+  Chown,      // chown() - CAP_CHOWN
+  Utimensat,  // utimensat() - owner/W_OK/EPERM
+  Setxattr,   // setxattr() - owner check
+  // Directory operations (parent dir W_OK+X_OK)
+  Mkdir,
+  Rmdir,
+  Mknod,
+  Create,  // open(O_CREAT)
+  Link,
+  Symlink,
+  // Removal / rename
+  Unlink,
+  Rename,
+};
 
 struct fuse_bufvec;
 struct fuse_buf;
@@ -52,6 +121,11 @@ class IFileHandleFuseLL {
 
   virtual ssize_t write_buf(struct fuse_bufvec *bufv, off_t offset) = 0;
 
+  virtual int ftruncate(off_t length) = 0;
+  virtual int fallocate(off_t offset, off_t length) = 0;
+
+  virtual void *get_inode() = 0;
+
  protected:
   virtual ~IFileHandleFuseLL() {}
 };
@@ -69,12 +143,15 @@ class IFileSystemFuseLL {
                      struct stat *stbuf) = 0;
   virtual int forget(uint64_t nodeid, uint64_t nlookup) = 0;
   virtual int getattr(uint64_t nodeid, struct stat *stbuf) = 0;
-  virtual int setattr(uint64_t nodeid, struct stat *stbuf, int to_set) = 0;
+  virtual int setattr(uint64_t nodeid, struct stat *stbuf, int to_set,
+                      struct fuse_file_info *fi = nullptr, uid_t caller_uid = 0,
+                      gid_t caller_gid = 0) = 0;
   virtual int statfs(struct statvfs *stbuf) = 0;
   virtual int rename(uint64_t old_parent, std::string_view old_name,
                      uint64_t new_parent, std::string_view new_name,
                      unsigned int flags) = 0;
-  virtual int unlink(uint64_t parent, std::string_view name) = 0;
+  virtual int unlink(uint64_t parent, std::string_view name,
+                     uid_t caller_uid = 0, gid_t caller_gid = 0) = 0;
 
   virtual int open(uint64_t nodeid, int flags, void **fh,
                    bool *keep_page_cache) = 0;
@@ -108,6 +185,41 @@ class IFileSystemFuseLL {
                       std::string_view link, uid_t uid, gid_t gid,
                       uint64_t *nodeid, struct stat *stbuf) = 0;
   virtual ssize_t readlink(uint64_t nodeid, char *buf, size_t size) = 0;
+
+  // TODO: Mark functions below as pure virtual.
+  virtual int mknod(uint64_t parent, std::string_view name, mode_t mode,
+                    uid_t uid, gid_t gid, uint64_t *nodeid,
+                    struct stat *stbuf) {
+    return -ENOSYS;
+  }
+
+  virtual int access(uint64_t nodeid, int mask, uid_t caller_uid,
+                     gid_t caller_gid) {
+    return -ENOSYS;
+  }
+
+  virtual int fallocate(uint64_t nodeid, off_t offset, off_t length, void *fh) {
+    return -ENOSYS;
+  }
+
+  virtual int flock(uint64_t nodeid, void *fh, int op, uint64_t lock_owner) {
+    return -ENOSYS;
+  }
+
+  virtual int setxattr(uint64_t nodeid, const char *name, const char *value,
+                       size_t size, int flags) {
+    return -ENOSYS;
+  }
+  virtual int getxattr(uint64_t nodeid, const char *name, char *value,
+                       size_t size) {
+    return -ENOSYS;
+  }
+  virtual int listxattr(uint64_t nodeid, char *list, size_t size) {
+    return -ENOSYS;
+  }
+  virtual int removexattr(uint64_t nodeid, const char *name) {
+    return -ENOSYS;
+  }
 
   struct fuse_session *fuse_se_ = nullptr;
 };

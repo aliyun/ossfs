@@ -24,3 +24,11 @@
 #define E_CONTINUE_READ 806
 #define E_CONTINUE_PIN 807
 #define E_DISK_CACHE_COLLISION 808
+// Verified refill GET found that the anchored path no longer exists.
+#define E_REFILL_PATH_ENOENT 809
+// Verified refill GET found an ETag mismatch against the anchored version.
+#define E_REFILL_ETAG_MISMATCH 810
+
+static inline bool is_refill_verify_error(ssize_t r) {
+  return r == -E_REFILL_PATH_ENOENT || r == -E_REFILL_ETAG_MISMATCH;
+}

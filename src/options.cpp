@@ -24,6 +24,7 @@ OptionsRegistry::ContainerType OptionsRegistry::options_;
 const std::set<std::string> OptionsRegistry::kSensitiveOptions = {
     "oss_access_key_id",
     "oss_access_key_secret",
+    "http_proxy",
 };
 
 const std::string_view OptionsRegistry::kCategoryNames[] = {
@@ -110,8 +111,10 @@ DEFINE_validator(fuse_threads, &validate_fuse_threads);
 
 DEFINE_OPTION(readdirplus, bool, true, "Enable FUSE readdirplus optimization",
               kFileSystemOptions, false, false);
-DEFINE_OPTION(ignore_fsync, bool, true, "Ignore FUSE fsync requests",
-              kFileSystemOptions, true, true);
+DEFINE_OPTION(ignore_fsync, bool, true,
+              "Ignore FUSE fsync requests. Defaults to false in random-write "
+              "mode for correct POSIX semantics",
+              kFileSystemOptions, false, false);
 DEFINE_OPTION(allow_mark_dir_stale_recursively, bool, false,
               "Allow marking directory cache as stale recursively",
               kFileSystemOptions, true, true);
@@ -126,12 +129,23 @@ DEFINE_OPTION(allow_other, bool, true,
               "Allow other users, including root, to access the filesystem",
               kFileSystemOptions, false, false);
 
+DEFINE_OPTION(default_permissions, bool, false,
+              "Let kernel handle permission checks (HDFS mode only, forced "
+              "true in OSS mode)",
+              kFileSystemOptions, false, false);
+
 DEFINE_OPTION(seq_read_detect_count, int32, 3,
               "The number of sequential reads required to trigger prefetching",
               kFileSystemOptions, false, true);
 
 DEFINE_OPTION(enable_symlink, bool, false, "Enable symlink support",
               kFileSystemOptions, false, false);
+DEFINE_OPTION(enable_xattr, bool, true, "Enable xattr support (HDFS only)",
+              kFileSystemOptions, false, false);
+DEFINE_OPTION(
+    hdfs_set_owner_on_create, bool, false,
+    "Explicitly set file owner on HDFS backend after create/mkdir/mknod",
+    kFileSystemOptions, false, false);
 
 static bool validate_seq_read_detect_count(const char *flagname,
                                            int32_t value) {
@@ -156,6 +170,12 @@ DEFINE_OPTION(oss_bucket_prefix, string, "", "OSS bucket prefix path",
               kOssBucketOptions, false, false);
 DEFINE_OPTION(oss_region, string, "",
               "OSS region ID. Used with the OSS signature v4",
+              kOssBucketOptions, false, false);
+DEFINE_OPTION(auto_create_bucket, bool, false,
+              "Auto create the bucket at mount time if it does not exist",
+              kOssBucketOptions, false, false);
+DEFINE_OPTION(agentic_bucket, string, "",
+              "Agentic bucket name attached when auto creating the bucket",
               kOssBucketOptions, false, false);
 
 // ==================== Oss Credential Options ====================
@@ -299,6 +319,15 @@ static bool validate_disk_data_cache_io_engine(const char *flagname,
 DEFINE_validator(disk_data_cache_io_engine,
                  &validate_disk_data_cache_io_engine);
 
+DEFINE_OPTION(libaio_vcpu_count, int32, 4,
+              "Experimental: the number of background vCPUs for disk data "
+              "cache, only effective with the libaio io engine",
+              kCachingOptions, true, true);
+static bool validate_libaio_vcpu_count(const char *flagname, int32_t value) {
+  return value >= 1 && value <= 64;
+}
+DEFINE_validator(libaio_vcpu_count, &validate_libaio_vcpu_count);
+
 DEFINE_OPTION(disk_available_space, string, "1G",
               "Available space threshold for disk (default 1G)",
               kCachingOptions, true, true);
@@ -390,6 +419,69 @@ static bool validate_appendable_object_autoswitch_threshold(
 DEFINE_validator(appendable_object_autoswitch_threshold,
                  &validate_appendable_object_autoswitch_threshold);
 
+DEFINE_OPTION(temp_dir, string, "",
+              "Local directory for staging files of disk-backed random write. "
+              "Setting a non-empty path enables random-write mode. Empty "
+              "disables the feature. Mutually exclusive with "
+              "enable_appendable_object.",
+              kFileSystemOptions, false, false);
+
+DEFINE_OPTION(random_write_chunk_size, string, "2097152",
+              "Logical chunk size of the random-write context (bytes). "
+              "Range [1 MiB, 256 MiB]. Default 2 MiB.",
+              kFileSystemOptions, true, false);
+static bool validate_random_write_chunk_size(const char *flagname,
+                                             const std::string &value) {
+  auto size = parse_bytes_string(value);
+  if (!size.has_value()) return false;
+  return size.value() >= 1048576 && size.value() <= 256ULL * 1024 * 1024;
+}
+DEFINE_validator(random_write_chunk_size, &validate_random_write_chunk_size);
+
+DEFINE_OPTION(random_write_max_file_size, string, "107374182400",
+              "Maximum logical size of a single file in random-write mode "
+              "(bytes). Writes/truncates extending a file beyond this limit "
+              "fail with EFBIG. Default 100 GiB. Raise it for larger files; "
+              "hard upper bound is the OSS multipart capacity (10000 parts "
+              "x 5 GiB, about 48.8 TiB).",
+              kFileSystemOptions, false, false);
+static bool validate_random_write_max_file_size(const char *flagname,
+                                                const std::string &value) {
+  auto size = parse_bytes_string(value);
+  if (!size.has_value()) return false;
+  // [1 MiB, 10000 parts x 5 GiB OSS multipart capacity].
+  return size.value() >= 1048576 && size.value() <= 53687091200000ULL;
+}
+DEFINE_validator(random_write_max_file_size,
+                 &validate_random_write_max_file_size);
+
+DEFINE_OPTION(temp_dir_free_bytes, string, "1073741824",
+              "Free disk space (bytes) to keep on the temp_dir filesystem. "
+              "Default 1 GiB. Minimum 64 MiB. When both temp_dir_free_bytes "
+              "and temp_dir_free_percent are set, the larger reserved size "
+              "wins.",
+              kFileSystemOptions, false, false);
+static bool validate_temp_dir_free_bytes(const char *flagname,
+                                         const std::string &value) {
+  auto size = parse_bytes_string(value);
+  if (!size.has_value()) return false;
+  return size.value() >= 64ULL * 1024 * 1024;  // 64 MiB minimum
+}
+DEFINE_validator(temp_dir_free_bytes, &validate_temp_dir_free_bytes);
+
+DEFINE_OPTION(
+    temp_dir_free_percent, uint32, 0,
+    "Percentage (integer, 0-99) of the temp_dir filesystem's usable capacity "
+    "to keep free. Default 0 (disabled). The effective ratio is "
+    "temp_dir_free_percent / 100. When both temp_dir_free_bytes and "
+    "temp_dir_free_percent are set, the larger reserved size wins.",
+    kFileSystemOptions, false, false);
+static bool validate_temp_dir_free_percent(const char *flagname,
+                                           uint32_t value) {
+  return value < 100;
+}
+DEFINE_validator(temp_dir_free_percent, &validate_temp_dir_free_percent);
+
 DEFINE_OPTION(sync_upload, bool, true,
               "Synchronized uploading before file closing", kFileSystemOptions,
               true, false);
@@ -425,6 +517,27 @@ static bool validate_oss_request_timeout_ms(const char *flagname,
   return value >= 1000 && value <= 900000;
 }
 DEFINE_validator(oss_request_timeout_ms, &validate_oss_request_timeout_ms);
+
+DEFINE_OPTION(
+    oss_hdfs_client_options, string, "",
+    "Comma-separated JindoSDK client options as key=value pairs (HDFS only). "
+    "Use sdk.config.file=/path to load options from a properties file.",
+    kOssClientOptions, false, false);
+static bool validate_oss_hdfs_client_options(const char *flagname,
+                                             const std::string &value) {
+  if (value.empty()) return true;
+  for (auto token : split_string(value, ",")) {
+    if (token.empty()) continue;
+    auto eq = token.find('=');
+    if (eq == std::string_view::npos || eq == 0) {
+      fprintf(stderr, "invalid %s token: '%.*s', expected key=value format\n",
+              flagname, (int)token.size(), token.data());
+      return false;
+    }
+  }
+  return true;
+}
+DEFINE_validator(oss_hdfs_client_options, &validate_oss_hdfs_client_options);
 
 DEFINE_OPTION(bind_ips, string, "",
               "Comma-separated list of IPs to bind(e.g. 127.0.0.1,127.0.0.2)",

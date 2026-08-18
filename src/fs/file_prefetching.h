@@ -21,6 +21,8 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <unordered_set>
+#include <vector>
 
 namespace OssFileSystem {
 
@@ -43,8 +45,7 @@ class EnableFilePrefetching {
  public:
   struct PrefetchContext {
     EnableFilePrefetching *prefetcher;
-    off_t offset = 0;
-    int num = 0;
+    std::vector<uint32_t> chunk_indices;
   };
 
   EnableFilePrefetching(OssFs *fs);
@@ -60,6 +61,9 @@ class EnableFilePrefetching {
   inline static size_t get_prefetch_window_size(size_t prefetch_buffer_size) {
     return prefetch_buffer_size / 3 * 2;
   }
+
+  // Called from read path on cache miss to detect and handle eviction.
+  void detect_eviction_on_cache_miss(off_t remote_size, off_t offset);
 
  protected:
   Derived *derived() {
@@ -78,6 +82,12 @@ class EnableFilePrefetching {
 
   bool is_prefetch_too_far_ahead() const;
 
+  // Returns the number of chunks currently being downloaded.
+  size_t in_flight_count() {
+    SCOPED_LOCK(in_flight_lock_);
+    return in_flight_chunks_.size();
+  }
+
   static void *prefetch_tsk(void *args);
   static void *do_prefetch_tsk(void *args);
 
@@ -92,11 +102,15 @@ class EnableFilePrefetching {
 
   // For prefetching tasks.
   bool is_prefetching_scheduled_ = false;
-  std::atomic<size_t> prefetch_window_size_ = 0;
+  std::atomic<size_t> prefetch_window_size_ = {0};
   size_t prefetch_chunk_size_ = 0;
   off_t next_prefetch_off_ = 0;
   size_t next_prefetch_size_ = 0;
-  std::atomic<uint64_t> running_download_tasks_ = {0};
+
+  // Tracks chunk indices currently being downloaded.
+  photon::spinlock in_flight_lock_;
+  std::unordered_set<uint32_t> in_flight_chunks_;
+  uint32_t last_reset_prefetch_chunk_idx_ = 0;
 };
 
 };  // namespace OssFileSystem

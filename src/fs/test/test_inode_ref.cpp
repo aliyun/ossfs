@@ -635,6 +635,7 @@ class Ossfs2InodeRefTest : public Ossfs2TestSuite {
 TEST_F(Ossfs2InodeRefTest, verify_concurrent_inode_refs) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_concurrent_inode_refs();
 }
@@ -642,6 +643,7 @@ TEST_F(Ossfs2InodeRefTest, verify_concurrent_inode_refs) {
 TEST_F(Ossfs2InodeRefTest, verify_queued_path2_inode_refs) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_queued_path2_inode_refs();
 }
@@ -651,6 +653,7 @@ TEST_F(Ossfs2InodeRefTest, verify_get_inode_ref_err) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.attr_timeout = 1;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_get_inode_ref_err();
 }
@@ -658,6 +661,7 @@ TEST_F(Ossfs2InodeRefTest, verify_get_inode_ref_err) {
 TEST_F(Ossfs2InodeRefTest, DISABLED_verify_get_path_performance) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_get_path_performance();
 }

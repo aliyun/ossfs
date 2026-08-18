@@ -20,19 +20,12 @@
 #include <unistd.h>
 
 #include "common/fuse.h"
+#include "common/fuse_buf_utils.h"
 #include "common/macros.h"
 #include "error_codes.h"
 #include "fs.h"
 
 namespace OssFileSystem {
-
-static size_t fuse_bufv_size(const struct fuse_bufvec *bufv) {
-  size_t size = 0;
-  for (size_t i = 0; i < bufv->count; i++) {
-    size += bufv->buf[i].size;
-  }
-  return size;
-}
 
 OssFileHandle::OssFileHandle(OssFs *fs, std::string_view path, FileInode *inode,
                              std::unique_ptr<IReader> reader,
@@ -63,7 +56,15 @@ int OssFileHandle::close() {
   closed_ = true;
 
   reader_->close();
-  return fdatasync_lock_held();
+  int r = fdatasync_lock_held();
+  if (writer_) writer_->close();
+
+  // Detach to avoid a dangling dirty_fh; never set in Random mode.
+  if (fs_->write_mode() != WriteMode::Random && inode_->dirty_fh == this) {
+    inode_->dirty_fh = nullptr;
+  }
+
+  return r;
 }
 
 ssize_t OssFileHandle::pwrite(const void *buf, size_t count, off_t offset) {
@@ -100,7 +101,7 @@ retry_with_path_lock:
     goto retry_with_path_lock;
   }
 
-  if (r > 0) {
+  if (r > 0 && fs_->write_mode() != WriteMode::Random) {
     if (!inode_->dirty_fh) {
       inode_->dirty_fh = this;
     }
@@ -113,16 +114,31 @@ int OssFileHandle::open() {
   if (!writer_) return 0;
   auto r = writer_->open();
   if (r < 0) return r;
-  if (writer_->get_is_dirty()) {
+  if (fs_->write_mode() != WriteMode::Random && writer_->get_is_dirty() &&
+      !inode_->dirty_fh) {
     inode_->dirty_fh = this;
   }
   return 0;
 }
 
 ssize_t OssFileHandle::pread(void *buf, size_t count, off_t offset) {
+  bool path_refreshed = false;
+
+retry_with_path_lock:
+  // Resolve the current path.
+  InodeRef ref;
+  if (path_refreshed) {
+    ref = fs_->get_inode_ref(inode_->nodeid,
+                             OssFs::InodeRefPathType::kPathTypeRead);
+    if (!ref.inode) return -ESTALE;  // inode unlinked
+    reader_->set_path(ref.inode_path);
+  }
+  DEFER(fs_->return_inode_ref(ref));
+
+  ssize_t r;
   {
     std::shared_lock<std::shared_mutex> l(inode_->inode_lock);
-    if (!fs_->options_.enable_appendable_object && writer_) {
+    if (fs_->write_mode() == WriteMode::Streaming && writer_) {
       if (writer_->get_is_dirty()) {
         LOG_EVERY_N(1000, ALOG_ERROR,
                     "Fail to read dirty file: `, offset: `, count: `",
@@ -130,9 +146,20 @@ ssize_t OssFileHandle::pread(void *buf, size_t count, off_t offset) {
         return -EBUSY;
       }
     }
-    auto r = reader_->pread_rlocked(buf, count, offset);
-    if (r != -E_CONTINUE_READ) return r;
+    r = reader_->pread_rlocked(buf, count, offset);
   }
+  // Inode rlock released.
+  if (is_refill_verify_error(r)) {
+    // Retry once with the refreshed path.
+    if (!path_refreshed) {
+      path_refreshed = true;
+      goto retry_with_path_lock;
+    }
+    // Retry exhausted: trust the error. The anchored path really does not
+    // exist, or the object was replaced externally.
+    return (r == -E_REFILL_PATH_ENOENT) ? -ENOENT : -EIO;
+  }
+  if (r != -E_CONTINUE_READ) return r;
   return reader_->pread(buf, count, offset);
 }
 

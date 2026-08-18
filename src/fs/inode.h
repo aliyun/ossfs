@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -36,6 +37,7 @@
 #include "cache.h"
 #include "common/logger.h"
 #include "common/macros.h"
+#include "random_write_context.h"
 
 namespace OssFileSystem {
 
@@ -52,11 +54,9 @@ struct Attribute {
   uint64_t size;
   struct timespec mtime;
 
-  Attribute() : size(0) {
-    struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
-    mtime = now;
-  }
+  static blksize_t DEFAULT_BLKSIZE;
+
+  Attribute() : size(0), mtime{} {}
 
   Attribute(uint64_t file_size, struct timespec file_mtime)
       : size(file_size), mtime(file_mtime) {}
@@ -70,7 +70,18 @@ struct Attribute {
     return true;
   }
 
-  static mode_t get_mode(InodeType type) {
+  static mode_t get_file_type_bits(InodeType type) {
+    switch (type) {
+      case InodeType::kDir:
+        return S_IFDIR;
+      case InodeType::kSymlink:
+        return S_IFLNK;
+      default:
+        return S_IFREG;
+    }
+  }
+
+  static mode_t get_default_full_mode(InodeType type) {
     switch (type) {
       case InodeType::kDir:
         return S_IFDIR | DEFAULT_DIR_MODE;
@@ -79,6 +90,10 @@ struct Attribute {
       default:
         return S_IFREG | DEFAULT_FILE_MODE;
     }
+  }
+
+  static mode_t build_mode(InodeType type, mode_t perm) {
+    return get_file_type_bits(type) | perm;
   }
 
   static void set_default_gid_uid(gid_t gid, uid_t uid) {
@@ -97,16 +112,34 @@ struct Attribute {
   static mode_t DEFAULT_FILE_MODE;
 };
 
+// Posix extended attributes (mode/uid/gid/atime).
+struct PosixExtAttr {
+  mode_t mode = 0;
+  uid_t uid = 0;
+  gid_t gid = 0;
+  struct timespec atime = {};
+};
+
 struct Inode {
-  // Immutable, won't change since this Inode was created.
   const uint64_t nodeid;
   std::string name;
   struct Attribute attr;
-  // Immutable, won't change since this Inode was created.
   const InodeType type = InodeType::kFile;
+
   // Once is_stale is set to true, it won't be false again.
   // If an inode is stale, its parent-child relationship will be remained.
   std::atomic<bool> is_stale = ATOMIC_VAR_INIT(false);
+
+  // Renamed to ".fuse_hiddenXXX" by hide_inode; removed on last release.
+  bool is_hidden = false;
+
+  // pathlock == 0: no lock
+  // pathlock == PATHLOCK_WRITE(-1): held write lock
+  // pathlock > 0: held read lock
+  // pathlock < -1(PATHLOCK_WAIT_OFFSET + n): held read lock and some write op
+  // is waiting
+  // Placed here to fill the alignment hole before attr_time.
+  int pathlock = 0;  // access only in global map lock scope
 
   time_t attr_time = 0;
 
@@ -121,17 +154,13 @@ struct Inode {
   // decrement: return_inode_ref or modify it with global map lock held
   int ref_ctr = 0;
 
-  uint64_t parent_nodeid = 0;  // for reverse lookup, such as get_full_path
+  // For reverse lookup, such as get_full_path.
+  uint64_t parent_nodeid = 0;
   Inode *parent = nullptr;
 
-  std::shared_mutex inode_lock;  // lock everything above
+  std::shared_mutex inode_lock;
 
-  // pathlock == 0: no lock
-  // pathlock == PATHLOCK_WRITE(-1): held write lock
-  // pathlock > 0: held read lock
-  // pathlock < -1(PATHLOCK_WAIT_OFFSET + n): held read lock and some write op
-  // is waiting
-  int pathlock = 0;  // access only in global map lock scope
+  std::unique_ptr<PosixExtAttr> posix_ext;
 
   Inode(uint64_t file_ino, std::string_view file_name, uint64_t file_size,
         struct timespec file_mtime, InodeType type, uint64_t parent_id,
@@ -150,7 +179,6 @@ struct Inode {
     return attr_time > 0 && ::difftime(time(nullptr), attr_time) < timeout;
   }
 
-  // Protected by inodes_map_lck_.
   virtual bool can_be_invalidated() const;
 
   bool is_dir() const {
@@ -174,8 +202,46 @@ struct Inode {
     lookup_cnt -= n;
   }
 
-  void update_attr(uint64_t file_size, struct timespec file_mtime);
+  void update_attr(uint64_t file_size, struct timespec file_mtime,
+                   struct timespec file_atime = {});
   void fill_statbuf(struct stat *stbuf) const;
+
+  PosixExtAttr *ensure_posix_ext() {
+    if (!posix_ext) posix_ext = std::make_unique<PosixExtAttr>();
+    return posix_ext.get();
+  }
+
+  mode_t get_mode() const {
+    return posix_ext ? posix_ext->mode : Attribute::get_default_full_mode(type);
+  }
+  uid_t get_uid() const {
+    return posix_ext ? posix_ext->uid : Attribute::DEFAULT_UID;
+  }
+  gid_t get_gid() const {
+    return posix_ext ? posix_ext->gid : Attribute::DEFAULT_GID;
+  }
+  struct timespec get_atime() const {
+    return posix_ext ? posix_ext->atime : attr.mtime;
+  }
+  struct timespec get_mtime() const {
+    return attr.mtime;
+  }
+
+  void set_mode(mode_t mode) {
+    if (posix_ext) posix_ext->mode = mode;
+  }
+  void set_uid(uid_t uid) {
+    if (posix_ext) posix_ext->uid = uid;
+  }
+  void set_gid(gid_t gid) {
+    if (posix_ext) posix_ext->gid = gid;
+  }
+  void set_atime(struct timespec atime) {
+    if (posix_ext) posix_ext->atime = atime;
+  }
+  void set_mtime(struct timespec mtime) {
+    attr.mtime = mtime;
+  }
 
   static InodeType dirent_type_to_inode_type(unsigned char dtype);
   static InodeType mode_to_inode_type(mode_t mode);
@@ -186,9 +252,14 @@ struct FileInode final : public Inode {
   bool is_dirty = false;
   bool invalidate_data_cache = false;
 
-  // We only allow one dirty fh per inode, so we can read dirty data from it
-  // when enable_appendable_object is true.
-  OssFileHandle *dirty_fh = nullptr;
+  // Per-mode write runtime state sharing one slot (write mode is fixed per
+  // mount): dirty_fh (Streaming/Appendable), rw_ctx (Random, owning),
+  // hdfs_dirty_count (HDFS).
+  union {
+    OssFileHandle *dirty_fh = nullptr;
+    int64_t hdfs_dirty_count;
+    RandomWriteContext *rw_ctx;
+  };
 
   std::string etag;
 
@@ -201,6 +272,7 @@ struct FileInode final : public Inode {
               parent_node),
         is_dirty(is_dirty),
         invalidate_data_cache(false),
+        dirty_fh(nullptr),
         etag(etag) {}
 
   bool is_attr_valid(uint64_t timeout) const override {

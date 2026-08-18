@@ -20,7 +20,8 @@
 
 class Ossfs2MetricsTest : public Ossfs2TestSuite {
  protected:
-  void verify_basic_metrics(bool appendable = false) {
+  void verify_basic_metrics(bool appendable = false,
+                            bool random_write = false) {
     Metric::set_enabled_metrics("all");
     DEFER(Metric::set_enabled_metrics(""));
     // wait for metrics clear
@@ -29,7 +30,11 @@ class Ossfs2MetricsTest : public Ossfs2TestSuite {
     DEFER(fs_->forget(parent, 1));
 
     uint64_t nodeid = 0;
-    size_t file_size_MB = 10;
+    // Random-write mode keeps the file within one upload buffer so the initial
+    // flush stays on the flush_no_multipart (put_object) path, while spanning
+    // multiple chunks so a later partial overwrite leaves CLEAN chunks to
+    // refill.
+    size_t file_size_MB = random_write ? 4 : 10;
     size_t file_size = file_size_MB * 1024 * 1024;
     create_file_in_folder(parent, "test", file_size_MB, nodeid);
     DEFER(fs_->forget(nodeid, 1));
@@ -39,11 +44,15 @@ class Ossfs2MetricsTest : public Ossfs2TestSuite {
     std::string metrics_name =
         appendable ? "oss_append_object" : "oss_put_object";
     ASSERT_TRUE(metrics[metrics_name + "_latency"] > 0);
-    ASSERT_GE(metrics["oss_write_bytes"], file_size);
+    // Random-write flush uploads from the staging file (put_object(fd)), which
+    // reports oss_write_from_disk instead of oss_write.
+    std::string write_name = random_write ? "oss_write_from_disk" : "oss_write";
+    ASSERT_TRUE(metrics[write_name + "_latency"] > 0);
+    ASSERT_GE(metrics[write_name + "_bytes"], file_size);
 
     auto metrics_str = Metric::get_metrics_string(10);
     ASSERT_TRUE(metrics_str.find(metrics_name) != std::string::npos);
-    ASSERT_TRUE(metrics_str.find("oss_write") != std::string::npos);
+    ASSERT_TRUE(metrics_str.find(write_name) != std::string::npos);
 
     void *handle = nullptr;
     bool unused = false;
@@ -89,6 +98,32 @@ class Ossfs2MetricsTest : public Ossfs2TestSuite {
     metrics_str = Metric::get_metrics_string(10);
     ASSERT_TRUE(metrics_str.find("oss_get_object_range") != std::string::npos);
     ASSERT_TRUE(metrics_str.find("oss_read") != std::string::npos);
+
+    if (random_write) {
+      // Partially overwrite the first chunk, then flush. The untouched CLEAN
+      // chunks that still fall inside remote_size are refilled to the staging
+      // file via get_object_range(fd), reported as oss_read_to_disk.
+      void *rw_handle = nullptr;
+      bool rw_unused = false;
+      int rr = fs_->open(nodeid, O_RDWR, &rw_handle, &rw_unused);
+      ASSERT_EQ(rr, 0);
+      DEFER(fs_->release(nodeid, get_file_from_handle(rw_handle)));
+
+      const size_t patch_size = 4096;
+      auto patch = random_string(patch_size);
+      ssize_t w = write_to_file_handle(rw_handle, patch.c_str(), patch_size, 0);
+      ASSERT_EQ(w, static_cast<ssize_t>(patch_size));
+      rr = fsync_file_handle(rw_handle, /*datasync=*/true);
+      ASSERT_EQ(rr, 0);
+
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      metrics = Metric::get_metrics_map(10);
+      ASSERT_TRUE(metrics["oss_read_to_disk_latency"] > 0);
+      ASSERT_GT(metrics["oss_read_to_disk_bytes"], 0u);
+
+      metrics_str = Metric::get_metrics_string(10);
+      ASSERT_TRUE(metrics_str.find("oss_read_to_disk") != std::string::npos);
+    }
 
     // check empty metrics
     std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -179,6 +214,7 @@ class Ossfs2MetricsTest : public Ossfs2TestSuite {
 };
 
 TEST_F(Ossfs2MetricsTest, verify_basic_metrics) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -186,6 +222,7 @@ TEST_F(Ossfs2MetricsTest, verify_basic_metrics) {
 }
 
 TEST_F(Ossfs2MetricsTest, verify_basic_metrics_with_appendable_object) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
@@ -193,7 +230,17 @@ TEST_F(Ossfs2MetricsTest, verify_basic_metrics_with_appendable_object) {
   verify_basic_metrics(true);
 }
 
+TEST_F(Ossfs2MetricsTest, verify_basic_metrics_random_write) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;
+  init(opts);
+  verify_basic_metrics(/*appendable=*/false, /*random_write=*/true);
+}
+
 TEST_F(Ossfs2MetricsTest, verify_metrics_filter) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -201,6 +248,7 @@ TEST_F(Ossfs2MetricsTest, verify_metrics_filter) {
 }
 
 TEST_F(Ossfs2MetricsTest, verify_uds_server) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);

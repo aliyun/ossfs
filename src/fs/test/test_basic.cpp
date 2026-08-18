@@ -295,6 +295,7 @@ TEST_F(Ossfs2BasicTest, verify_init) {
   INIT_PHOTON();
 
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_init();
 }
@@ -302,11 +303,13 @@ TEST_F(Ossfs2BasicTest, verify_init) {
 TEST_F(Ossfs2BasicTest, verify_statfs) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_statfs();
 }
 
 TEST_F(Ossfs2BasicTest, verify_oss_prefix_types) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
@@ -314,9 +317,10 @@ TEST_F(Ossfs2BasicTest, verify_oss_prefix_types) {
 }
 
 TEST_F(Ossfs2BasicTest, verify_oss_retrying) {
+  SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
-  opts.prefetch_chunk_size = 0;
+  opts.prefetch_concurrency = 0;
   init(opts);
   verify_oss_retrying();
 }
@@ -326,6 +330,7 @@ TEST_F(Ossfs2BasicTest, verify_bind_ips) {
   auto ip = get_ip_by_interface("eth0");
   ASSERT_TRUE(!ip.empty());
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, -1, ip + ",ignored_ip");
 }
 
@@ -333,6 +338,7 @@ TEST_F(Ossfs2BasicTest, verify_bind_ips_negative) {
   INIT_PHOTON();
   OssFsOptions opts;
   // will fallback to default mode
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, -1, "invalid_ip");
 }
 

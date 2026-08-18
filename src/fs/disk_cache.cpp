@@ -16,8 +16,8 @@
 
 #include "disk_cache.h"
 
+#include <photon/thread/thread.h>
 #include <sys/xattr.h>
-#include <unistd.h>
 
 #include "common/fault_injector.h"
 #include "common/macros.h"
@@ -25,91 +25,122 @@
 #include "error_codes.h"
 #include "inode.h"
 
-#define DO_SYNC_BACKGROUND_DISKCACHE_REQUEST(__env, __func, ...)       \
-  ({                                                                   \
-    auto __exec = __env->get_executor();                               \
-    auto __r = __exec->perform([&]() { return __func(__VA_ARGS__); }); \
-    __r;                                                               \
+// psync: run the request inline on the caller vCPU. libaio: dispatch to the
+// executor pool where the libaio contexts live.
+#define DO_DISKCACHE_REQUEST(__store, __func, ...)             \
+  ({                                                           \
+    auto *__s = (__store);                                     \
+    auto __call = [&] { return __func(__VA_ARGS__); };         \
+    __s->dispatch_to_bg_vcpu()                                 \
+        ? __s->get_env()->get_executor_next()->perform(__call) \
+        : __call();                                            \
   })
 
 namespace OssFileSystem {
 
 class DiskCacheStore : public ICacheStore {
  public:
-  DiskCacheStore(DiskCache *cache) : cache_(cache) {}
+  DiskCacheStore(DiskCache *cache, std::string_view object_key)
+      : cache_(cache) {
+    serialize_writes_ = !cache_->dispatch_to_bg_vcpu_;
+  }
   ~DiskCacheStore();
 
-  int init(std::string_view key, std::string_view source_key);
+  int init(std::string_view object_key, std::string_view etag, size_t size);
 
   ssize_t pin(off_t offset, size_t count, void **buf) override {
     return -ENOTSUP;
   }
 
   void unpin(off_t offset) override {
-    std::abort();
+    RELEASE_ASSERT_WITH_MSG(false, "unpin is not supported for disk cache");
   }
 
   ssize_t pread(char *buf, off_t offset, size_t count) override;
   std::pair<off_t, size_t> query_refill_range(off_t offset,
                                               size_t count) override;
-  void drop() override;
+  void drop(std::string_view object_key, std::string_view etag,
+            size_t size) override;
 
   int acquire_write_buffer(RangeBuffer &range_buffer) override;
   void release_write_buffer(const RangeBuffer &range_buffer,
                             bool evict = false) override;
 
-  void set_actual_size(off_t size) {
-    local_store_->set_actual_size(size);
+ private:
+  BGVCpuDiskCacheEnv *get_env() const {
+    return cache_->env_;
   }
 
- private:
-  BGVCpuDiskCacheEnv *get_env() const;
+  bool dispatch_to_bg_vcpu() const {
+    return cache_->dispatch_to_bg_vcpu_;
+  }
+
+  int open_and_validate(std::string_view key, std::string_view source_key);
   int validate_source_key(std::string_view source_key) const;
+
   void release_store();
 
   DiskCache *cache_ = nullptr;
 
   photon::fs::ICacheStore *local_store_ = nullptr;
-  int raw_fd_ = -1;
-  bool psync_mode_ = false;
+  photon::rwlock store_lock_;
+
+  photon::mutex write_mutex_;
+  bool serialize_writes_ = false;
 };
 
-BGVCpuDiskCacheEnv *DiskCacheStore::get_env() const {
-  return cache_->env_;
+int DiskCacheStore::init(std::string_view object_key, std::string_view etag,
+                         size_t size) {
+  auto source_key = std::string(object_key) + "/" + std::string(etag);
+  auto cache_key = "/" + cityhash128_base64url(source_key);
+  // Split the first 3 characters to construct the prefix directory,
+  // to avoid flat directory structure.
+  cache_key.insert(4, "/");
+
+  FAULT_INJECTION(FI_DiskCache_Key_Collision, [&]() {
+    auto hash = std::hash<std::string_view>{}(source_key);
+    cache_key = "/" + std::to_string(hash % 5);
+  });
+
+  int ret = 0;
+  FAULT_INJECTION(FI_DiskCache_Init_Failure, [&]() { ret = -1; });
+  if (unlikely(ret != 0)) return ret;
+
+  // Maximum retry attempts when cache key collision is detected.
+  static constexpr int kMaxCollisionAttempts = 5;
+  for (int attempt = 0; attempt < kMaxCollisionAttempts; ++attempt) {
+    ret = open_and_validate(cache_key, source_key);
+    if (ret == -E_DISK_CACHE_COLLISION) {
+      // '+' will not appear in the cache key (base64url).
+      cache_key += "+";
+    } else {
+      break;
+    }
+  }
+  if (unlikely(ret != 0)) {
+    LOG_ERROR("Failed to init disk cache for `, key: `, ret: `", object_key,
+              cache_key, ret);
+  } else {
+    local_store_->set_actual_size(size);
+    LOG_DEBUG("Init disk cache for `, key: `", object_key, cache_key);
+  }
+  return ret;
 }
 
-int DiskCacheStore::init(std::string_view key, std::string_view source_key) {
-  int r = 0;
-  FAULT_INJECTION(FI_DiskCache_Init_Failure, [&]() { r = -1; });
-  if (r != 0) return r;
-
+int DiskCacheStore::open_and_validate(std::string_view key,
+                                      std::string_view source_key) {
   auto cache_pool = get_env()->get_disk_cache_pool();
-  local_store_ = DO_SYNC_BACKGROUND_DISKCACHE_REQUEST(
-      get_env(), cache_pool->open, key, O_CREAT | O_RDWR | O_CACHE_ONLY, 0644);
+  local_store_ = DO_DISKCACHE_REQUEST(this, cache_pool->open, key,
+                                      O_CREAT | O_RDWR | O_CACHE_ONLY, 0644);
   if (local_store_ == nullptr) {
     LOG_ERRNO_RETURN(0, -EIO, "Failed to open cache key: `", key);
-  }
-
-  // Check psync mode and open raw fd for direct read bypass.
-  psync_mode_ = (get_env()->io_engine_type_ == photon::fs::ioengine_psync);
-  if (psync_mode_) {
-    // TODO: get raw fd from cache store.
-    auto store_key = local_store_->get_store_key();
-    auto full_path = join_paths(get_env()->disk_cache_env->options.cache_dir,
-                                std::string(store_key));
-    raw_fd_ = ::open(full_path.c_str(), O_RDONLY);
-    if (raw_fd_ < 0) {
-      LOG_WARN("Failed to open raw fd for psync bypass: `, errno: `", full_path,
-               errno);
-    }
   }
 
   auto ret = validate_source_key(source_key);
   if (ret != 0) {
     release_store();
-    return ret;
   }
-  return 0;
+  return ret;
 }
 
 int DiskCacheStore::validate_source_key(std::string_view source_key) const {
@@ -153,60 +184,57 @@ DiskCacheStore::~DiskCacheStore() {
 }
 
 void DiskCacheStore::release_store() {
-  if (raw_fd_ >= 0) {
-    ::close(raw_fd_);
-    raw_fd_ = -1;
-  }
   if (local_store_ != nullptr) {
-    auto release_func = [this]() {
-      if (psync_mode_) {
-        // 0-byte read to trigger LRU touch on close in psync mode.
-        iovec touch_iov{nullptr, 0};
-        local_store_->do_preadv2(&touch_iov, 0, 0, RW_V2_CACHE_ONLY);
-      }
-      local_store_->release();
-      return 0;
-    };
-    DO_SYNC_BACKGROUND_DISKCACHE_REQUEST(get_env(), release_func);
+    DO_DISKCACHE_REQUEST(this, local_store_->release);
     local_store_ = nullptr;
   }
 }
 
 ssize_t DiskCacheStore::pread(char *buf, off_t offset, size_t count) {
-  iovec iov{buf, count};
-  if (psync_mode_ && raw_fd_ >= 0) {
-    auto range = query_refill_range(offset, count);
-    auto cache_hit = (range.second == 0);
-    if (cache_hit) {
-      ssize_t ret = ::preadv(raw_fd_, &iov, 1, offset);
-      if (likely(ret == (ssize_t)count)) {
-        return ret;
-      } else {
-        LOG_WARN("read cache file failed, offset `, count `, got `", offset,
-                 count, ret);
-        return -ENOENT;
-      }
-    }
-  }
+  photon::scoped_rwlock l(store_lock_, photon::RLOCK);
+  if (unlikely(local_store_ == nullptr)) return -ENOENT;
 
-  auto ret = DO_SYNC_BACKGROUND_DISKCACHE_REQUEST(
-      get_env(), local_store_->try_preadv2, &iov, 1, offset, RW_V2_CACHE_ONLY);
+  iovec iov{buf, count};
+  auto ret = DO_DISKCACHE_REQUEST(this, local_store_->try_preadv2, &iov, 1,
+                                  offset, RW_V2_CACHE_ONLY);
   return ret.refill_size == 0 ? ret.size : -ENOENT;
 }
 
 std::pair<off_t, size_t> DiskCacheStore::query_refill_range(off_t offset,
                                                             size_t count) {
-  return DO_SYNC_BACKGROUND_DISKCACHE_REQUEST(
-      get_env(), local_store_->queryRefillRange, offset, count);
+  photon::scoped_rwlock l(store_lock_, photon::RLOCK);
+  if (unlikely(local_store_ == nullptr)) return {offset, count};
+
+  return DO_DISKCACHE_REQUEST(this, local_store_->queryRefillRange, offset,
+                              count);
 }
 
-void DiskCacheStore::drop() {
-  auto cache_pool = get_env()->get_disk_cache_pool();
-  DO_SYNC_BACKGROUND_DISKCACHE_REQUEST(get_env(), cache_pool->evict,
-                                       local_store_->get_store_key());
+void DiskCacheStore::drop(std::string_view object_key, std::string_view etag,
+                          size_t size) {
+  photon::scoped_rwlock l(store_lock_, photon::WLOCK);
+  if (likely(local_store_ != nullptr)) {
+    auto cache_pool = get_env()->get_disk_cache_pool();
+    DO_DISKCACHE_REQUEST(this, cache_pool->evict,
+                         local_store_->get_store_key());
+    release_store();
+  }
+
+  auto ret = init(object_key, etag, size);
+  if (unlikely(ret != 0)) {
+    LOG_ERROR("Failed to reopen disk cache for `, ret `", object_key, ret);
+    return;
+  }
+  LOG_DEBUG("Reopen disk cache for `", object_key);
 }
 
 int DiskCacheStore::acquire_write_buffer(RangeBuffer &range_buffer) {
+  {
+    photon::scoped_rwlock l(store_lock_, photon::RLOCK);
+    if (unlikely(local_store_ == nullptr)) {
+      return -ENOSPC;
+    }
+    range_buffer.token = local_store_->get_store_key();
+  }
   auto pool = cache_->memory_pool_;
   auto block_size = cache_->block_size();
   auto block_num = (range_buffer.count + block_size - 1) / block_size;
@@ -240,9 +268,20 @@ void DiskCacheStore::release_write_buffer(const RangeBuffer &range_buffer,
 
   if (evict) return;
 
-  auto ret = DO_SYNC_BACKGROUND_DISKCACHE_REQUEST(
-      get_env(), local_store_->do_pwritev2, buffer.iovec(), buffer.iovcnt(),
-      range_buffer.offset, 0);
+  if (serialize_writes_) write_mutex_.lock();
+  DEFER(if (serialize_writes_) write_mutex_.unlock());
+
+  photon::scoped_rwlock l(store_lock_, photon::RLOCK);
+  if (unlikely(local_store_ == nullptr) ||
+      range_buffer.token != local_store_->get_store_key()) {
+    LOG_DEBUG("Skip stale disk cache write, offset: `, count: `",
+              range_buffer.offset, range_buffer.count);
+    return;
+  }
+
+  auto ret =
+      DO_DISKCACHE_REQUEST(this, local_store_->do_pwritev2, buffer.iovec(),
+                           buffer.iovcnt(), range_buffer.offset, 0);
   if (ret != static_cast<ssize_t>(buffer.sum())) {
     LOG_WARN("Failed to write buffer, offset: `, count: `, ret: `, errno: `",
              range_buffer.offset, range_buffer.count, ret, errno);
@@ -256,43 +295,18 @@ DiskCache::~DiskCache() {
 }
 
 CacheHandle *DiskCache::get(std::string_view name, std::string_view etag,
-                            off_t actual_size) {
-  auto source_key = std::string(name) + "/" + etag;
-  auto cache_key = "/" + cityhash128_base64url(source_key);
-  // Split the first 3 characters to construct the prefix directory,
-  // to avoid flat directory structure.
-  cache_key.insert(4, "/");
-
-  FAULT_INJECTION(FI_DiskCache_Key_Collision, [&]() {
-    auto hash = std::hash<std::string>{}(source_key);
-    cache_key = "/" + std::to_string(hash % 5);
-  });
-
+                            size_t size) {
   std::lock_guard<std::mutex> l(mtx_);
   if (cache_store_ == nullptr) {
-    cache_store_ = new DiskCacheStore(this);
-    int ret = 0;
-    // Maximum retry attempts when cache key collision is detected.
-    static constexpr int kMaxCollisionAttempts = 5;
-    for (int attempt = 0; attempt < kMaxCollisionAttempts; ++attempt) {
-      ret = cache_store_->init(cache_key, source_key);
-      if (ret == -E_DISK_CACHE_COLLISION) {
-        // '+' will not appear in the cache key (base64url).
-        cache_key += "+";
-      } else {
-        break;
-      }
-    }
+    cache_store_ = new DiskCacheStore(this, name);
+    auto ret = cache_store_->init(name, etag, size);
 
     if (unlikely(ret != 0)) {
-      LOG_ERROR("Failed to init disk cache for `, key: `, ret: `", name,
-                cache_key, ret);
+      LOG_ERROR("Failed to init disk cache for `, ret: `", name, ret);
       delete cache_store_;
       cache_store_ = nullptr;
       return nullptr;
     }
-    cache_store_->set_actual_size(actual_size);
-    LOG_DEBUG("Init disk cache for `, key: `", name, cache_key);
   }
   ++ref_cnt_;
   return new CacheHandle(cache_store_, &range_lock_);

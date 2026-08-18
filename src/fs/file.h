@@ -61,11 +61,18 @@ class OssFileHandle : public IFileHandleFuseLL {
   ssize_t pwrite(const void *buf, size_t count, off_t offset) override;
   ssize_t write_buf(struct fuse_bufvec *bufv, off_t offset) override;
 
-  FileInode *get_inode() {
+  int ftruncate(off_t length) override {
+    return -ENOTSUP;
+  }
+  int fallocate(off_t offset, off_t length) override {
+    return -ENOTSUP;
+  }
+
+  void *get_inode() override {
     return inode_;
   }
 
-  std::string_view get_path() {
+  std::string get_path() {
     return reader_->get_path();
   }
 
@@ -74,8 +81,8 @@ class OssFileHandle : public IFileHandleFuseLL {
   }
 
   // The following functions need inode's rlock.
-  ssize_t pread_from_upload_buffer(void *buf, size_t count, off_t offset) {
-    return writer_ ? writer_->pread_from_upload_buffer(buf, count, offset) : 0;
+  ssize_t pread_from_local(void *buf, size_t count, off_t offset) {
+    return writer_ ? writer_->pread_from_local(buf, count, offset) : 0;
   }
   size_t calc_remote_size() {
     return writer_ ? writer_->calc_remote_size() : inode_->attr.size;

@@ -16,7 +16,7 @@
 
 #include "test_suite.h"
 
-class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
+class Ossfs2StagedInodeCacheTest : public OssOnlyTestSuite {
  protected:
   void verify_lru() {
     int r = 0;
@@ -212,19 +212,22 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
 
       int rr = fs_->creat(parent, "local_file", CREATE_BASE_FLAGS, 0777, 0, 0,
                           0, &file_nodeid, &st, &handle);
-      ASSERT_EQ(rr, 0);
+      EXPECT_EQ(rr, 0);
+      if (rr != 0) return;
 
       rr = fs_->release(file_nodeid, get_file_from_handle(handle));
-      ASSERT_EQ(rr, 0);
+      EXPECT_EQ(rr, 0);
+      if (rr != 0) return;
 
       rr = fs_->lookup(parent, "local_file", &file_nodeid, &st);
-      ASSERT_EQ(rr, 0);
+      EXPECT_EQ(rr, 0);
+      if (rr != 0) return;
 
       fs_->forget(file_nodeid, 2);
-      ASSERT_EQ(fs_->staged_inodes_cache_->size(), size_t(1));
+      EXPECT_EQ(fs_->staged_inodes_cache_->size(), size_t(1));
       rr = delete_file(join_paths(parent_path, "local_file"),
                        FLAGS_oss_bucket_prefix);
-      ASSERT_EQ(rr, 0);
+      EXPECT_EQ(rr, 0);
     });
 
     int r = fs_->lookup(parent, "local_file", &nodeid, &st);
@@ -286,17 +289,20 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
           FaultInjectionId::FI_Readdir_Delay_After_Construct_Inodes);
       struct fuse_file_info fi;
       int r = fs_->opendir(parent, &fi);
-      ASSERT_EQ(r, 0);
+      EXPECT_EQ(r, 0);
+      if (r != 0) {
+        g_fault_injector->clear_injection(
+            FaultInjectionId::FI_Readdir_Delay_After_Construct_Inodes);
+        return;
+      }
       void *dirp = reinterpret_cast<void *>(fi.fh);
+      DEFER(fs_->releasedir(parent, dirp));
 
       std::vector<TestInode> childs;
       r = fs_->readdir(parent, 0, dirp, filler, &childs, nullptr, true,
                        nullptr);
-      ASSERT_SIZE_EQ(childs.size(), file_num + 2);
-      ASSERT_EQ(r, 0);
-
-      r = fs_->releasedir(parent, dirp);
-      ASSERT_EQ(r, 0);
+      EXPECT_EQ(childs.size(), static_cast<size_t>(file_num + 2));
+      EXPECT_EQ(r, 0);
 
       g_fault_injector->clear_injection(
           FaultInjectionId::FI_Readdir_Delay_After_Construct_Inodes);
@@ -490,6 +496,7 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
       // Hit staged cache, and then sleep.
       r1 = fs_->lookup(parent, "testfile", &nodeid2, &st);
     });
+    DEFER(if (th.joinable()) th.join());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     // During lock-free period, upload a new file with a different size but the
@@ -504,7 +511,9 @@ class Ossfs2StagedInodeCacheTest : public Ossfs2TestSuite {
     r = fs_->release(nodeid1, get_file_from_handle(handle));
     ASSERT_EQ(r, 0);
 
-    th.join();
+    // Wait for thread to finish BEFORE assertions.
+    if (th.joinable()) th.join();
+
     ASSERT_EQ(r1, 0);
     ASSERT_EQ(nodeid2, nodeid1);
     ASSERT_NE(nodeid2, nodeid);
@@ -613,6 +622,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_lru) {
   OssFsOptions opts;
   opts.max_inode_cache_count = 7;
   opts.inode_cache_eviction_interval_ms = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lru();
 }
@@ -627,6 +637,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_lru_forget_with_parent) {
   OssFsOptions opts;
   opts.max_inode_cache_count = 6;
   opts.inode_cache_eviction_interval_ms = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lru_forget_with_parent(2);
 }
@@ -641,6 +652,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_lru_with_evict_forget_with_parent) {
   OssFsOptions opts;
   opts.max_inode_cache_count = 3;
   opts.inode_cache_eviction_interval_ms = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lru_forget_with_parent(4);
 }
@@ -655,6 +667,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_forget_stale_inode_lru) {
   OssFsOptions opts;
   opts.max_inode_cache_count = 3;
   opts.inode_cache_eviction_interval_ms = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_forget_stale_inode_lru();
 }
@@ -670,6 +683,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_lru_cache_removed_in_lookup) {
   opts.max_inode_cache_count = 10;
   opts.attr_timeout = 60;
   opts.inode_cache_eviction_interval_ms = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_lru_cache_removed_in_lookup();
 }
@@ -684,6 +698,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_lru_readdir_while_forget) {
   OssFsOptions opts;
   opts.max_inode_cache_count = 5;
   opts.inode_cache_eviction_interval_ms = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_while_forget(opts.max_inode_cache_count - 2);
 }
@@ -698,6 +713,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_lru_with_evict_readdir_while_forget) {
   OssFsOptions opts;
   opts.max_inode_cache_count = 5;
   opts.inode_cache_eviction_interval_ms = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_while_forget(opts.max_inode_cache_count);
 }
@@ -705,6 +721,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_lru_with_evict_readdir_while_forget) {
 TEST_F(Ossfs2StagedInodeCacheTest, verify_readdir_while_forget) {
   INIT_PHOTON();
   OssFsOptions opts;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_while_forget(3);
 }
@@ -713,6 +730,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_readdir_type_changed) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.max_inode_cache_count = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_readdir_type_changed();
 }
@@ -721,6 +739,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_staged_cache_lookup_update) {
   INIT_PHOTON();
   OssFsOptions opts;
   opts.max_inode_cache_count = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_staged_cache_lookup_update();
 }
@@ -730,6 +749,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_stagedcache_expiry) {
   OssFsOptions opts;
   opts.attr_timeout = 1;
   opts.max_inode_cache_count = 10;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_stagedcache_expiry();
 }
@@ -743,6 +763,7 @@ TEST_F(Ossfs2StagedInodeCacheTest, verify_staged_cache_memory) {
   OssFsOptions opts;
   opts.max_inode_cache_count = 10000;
   opts.inode_cache_eviction_interval_ms = 30000;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts, get_random_max_keys());
   verify_staged_cache_memory();
 }
