@@ -30,6 +30,10 @@ std::string OssFs::process_uds_request(std::string_view action,
     return Metric::get_metrics_string(std::atoll(param.data()));
   } else if (action == "set-metrics") {
     return Metric::set_enabled_metrics(param);
+  } else if (action == "warmup") {
+    return warmup(param);
+  } else if (action == "dump-status") {
+    return dump_status();
   }
 
   std::string output = "Not supported for action \"" + std::string(action) +
@@ -75,6 +79,15 @@ void OssFs::start_uds_server(std::promise<bool> &uds_server_running) {
   uds_server_running.set_value(true);
 
   while (!is_stopping_) photon::thread_usleep(100 * 1000);
+}
+
+std::string OssFs::warmup(std::string_view warm_path) {
+  return async_task_manager_->add_task(
+      std::make_shared<WarmupTask>(warm_path, this));
+}
+
+std::string OssFs::dump_status() {
+  return async_task_manager_->dump_task_status();
 }
 
 }  // namespace OssFileSystem

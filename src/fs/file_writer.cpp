@@ -29,6 +29,7 @@
 #include "common/crc64_combine.h"
 #include "common/fuse.h"
 #include "common/fuse_buf_utils.h"
+#include "common/iov_utils.h"
 #include "error_codes.h"
 #include "file.h"
 #include "fs.h"
@@ -158,7 +159,8 @@ class OssWriter : public IWriter {
   }
 
   virtual void mark_dirty();
-  virtual void mark_clean();
+  virtual void mark_clean(bool data_lost = false);
+  void drop_post_write_caches(bool data_lost, std::string_view path);
 
   OssFs *fs_ = nullptr;
   FileInode *inode_ = nullptr;
@@ -196,8 +198,8 @@ class OssSeqWriter : public OssWriter {
   inline int check_writing_permission();
   inline int check_and_update_write_offset(off_t &offset);
 
-  inline char *get_buffer();
-  inline void free_buffer(char *ptr);
+  inline void get_buffer();
+  inline void free_buffer(std::vector<iovec> &buf);
   inline void clear_current_buffer();
   inline bool verify_crc64();
 
@@ -228,7 +230,7 @@ class OssSeqWriter : public OssWriter {
   // open, truncate, write, close.
   off_t write_off_ = -1;
 
-  char *buffer_ = nullptr;
+  std::vector<iovec> buffer_;
   size_t buffer_size_ = 0;
   // Current buffer index, used for calculating write offset or upload part
   // number.
@@ -266,7 +268,7 @@ class OssStreamingWriter : public OssSeqWriter {
 
   struct MultipartContext {
     OssStreamingWriter *writer = nullptr;
-    char *buf = nullptr;
+    std::vector<iovec> buf;
     size_t part_number = 0;
   };
 
@@ -330,9 +332,14 @@ class OssRandomWriter : public OssWriter {
   int truncate(uint64_t new_size) override;
 
  private:
+  CacheKey cache_key() {
+    return {inode_->rw_ctx->upload_path, inode_->etag, inode_->attr.mtime,
+            inode_->attr.size};
+  }
+
   int create_staging(RandomWriteContext &ctx);
   void mark_dirty() override;
-  void mark_clean() override;
+  void mark_clean(bool data_lost = false) override;
   int fetch_chunks(const std::vector<uint64_t> &cids);
 
   // ── disk space protection ──
@@ -381,18 +388,12 @@ void OssWriter::mark_dirty() {
   }
 }
 
-void OssWriter::mark_clean() {
+void OssWriter::mark_clean(bool data_lost) {
   if (get_is_dirty()) {
     LOG_INFO("file: `, nodeid: `, size: ` is marked to clean", upload_path_,
              inode_->nodeid, inode_->attr.size);
 
-    // Always reset flag after release().
-    inode_->invalidate_data_cache = true;
-
-    // After every write op, FUSE kernel will invalidate attr cache(see details
-    // in fuse_perfrom_write), so we only need to reset attr_time and delay
-    // updating until next getattr().
-    inode_->attr_time = 0;
+    drop_post_write_caches(data_lost, upload_path_);
 
     is_dirty_ = false;
     inode_->is_dirty = false;
@@ -403,9 +404,25 @@ void OssWriter::mark_clean() {
   }
 }
 
+// Invalidate the page cache when data was lost or no trustworthy etag
+// exists, and drop stale pre-write content from the shared read cache.
+void OssWriter::drop_post_write_caches(bool data_lost, std::string_view path) {
+  if (data_lost || inode_->etag.empty()) inode_->invalidate_data_cache = true;
+
+  if (inode_->cache) {
+    inode_->cache->drop(
+        CacheKey{path, inode_->etag, inode_->attr.mtime, inode_->attr.size});
+  }
+
+  // After every write op, FUSE kernel will invalidate attr cache(see details
+  // in fuse_perfrom_write), so we only need to reset attr_time and delay
+  // updating mtime until next getattr().
+  inode_->attr_time = 0;
+}
+
 OssSeqWriter::~OssSeqWriter() {
   waiting_upload_tasks();
-  RELEASE_ASSERT(buffer_ == nullptr);
+  RELEASE_ASSERT(buffer_.empty());
 }
 
 int OssSeqWriter::flush() {
@@ -415,7 +432,7 @@ int OssSeqWriter::flush() {
     LOG_ERROR("Failed to fdatasync file: `, nodeid: `, r: `", upload_path_,
               inode_->nodeid, r);
   }
-  mark_clean();
+  mark_clean(/*data_lost=*/r < 0);
   return r;
 }
 
@@ -475,7 +492,7 @@ int OssSeqWriter::open() {
 
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
-    inode_->etag.clear();
+    // The etag stays valid until flush lands the deferred truncate.
     inode_->update_attr(0, now);
   }
   return 0;
@@ -539,34 +556,38 @@ ssize_t OssSeqWriter::pwrite(size_t count, off_t offset, const void *buf,
 
   size_t written = 0;
   while (written < count) {
-    if (buffer_ == nullptr) {
-      buffer_ = get_buffer();
+    if (buffer_.empty()) {
+      get_buffer();
     }
 
     size_t write_size =
         std::min(count - written, upload_buffer_size - buffer_off);
+    auto view = build_iov_view(buffer_, buffer_off, write_size);
 
     if (buf) {
-      memcpy(buffer_ + buffer_off, (char *)buf + written, write_size);
+      memcpy_to_iov(view.data(), iovcnt(view), (char *)buf + written,
+                    write_size);
       r = write_size;
     } else {
       DECLARE_METRIC_LATENCY(fuse_bufv_copy, Metric::kInternalMetrics);
-      r = fuse_bufvec_to_buf_copy(buffer_ + buffer_off, bufv, write_size);
+      r = fuse_bufvec_to_iov_copy(view.data(), iovcnt(view), bufv, write_size);
     }
 
     if (r < 0) break;
 
     if (verify_crc64()) {
-      expected_crc64_ = crc64ecma(buffer_ + buffer_off, r, expected_crc64_);
+      expected_crc64_ = crc64ecma_iov(view, r, expected_crc64_);
     }
 
     FAULT_INJECTION(FI_Modify_Write_Buffer, [&]() {
       size_t index = get_fault_injection_buffer_index();
+      auto fi_view = build_iov_view(buffer_, index, 1);
+      char *p = static_cast<char *>(fi_view.front().iov_base);
       char old = '\0';
       do {
-        old = buffer_[index];
-        buffer_[index] = (buffer_[index] + 1) % 256;
-      } while (buffer_[index] == old);
+        old = *p;
+        *p = (*p + 1) % 256;
+      } while (*p == old);
     });
 
     buffer_off += r;
@@ -599,10 +620,7 @@ ssize_t OssSeqWriter::pwrite(size_t count, off_t offset, const void *buf,
     inode_->invalidate_data_cache = true;
     immutable_ = true;
 
-    if (buffer_ != nullptr) {
-      free_buffer(buffer_);
-      buffer_ = nullptr;
-    }
+    free_buffer(buffer_);
 
     return r;
   } else {
@@ -647,21 +665,41 @@ cleanup:
   return r;
 }
 
-char *OssSeqWriter::get_buffer() {
+void OssSeqWriter::get_buffer() {
   // TODO: use dynamic buffer size to support large file
   //       more intelligently.
-  return fs_->upload_buffers_->allocate(1).front();
+  RELEASE_ASSERT(buffer_.empty());
+  RELEASE_ASSERT(fs_->data_buffers_ != nullptr);
+  const size_t block_size = fs_->data_buffers_->block_size();
+  const uint64_t buffer_bytes = fs_->options_.upload_buffer_size;
+  const size_t block_count = (buffer_bytes + block_size - 1) / block_size;
+
+  auto blocks = fs_->data_buffers_->allocate_write(block_count);
+  RELEASE_ASSERT(blocks.size() == block_count);
+
+  buffer_.reserve(block_count);
+  uint64_t remain = buffer_bytes;
+  for (char *block : blocks) {
+    size_t seg_len = std::min(remain, static_cast<uint64_t>(block_size));
+    buffer_.push_back({block, seg_len});
+    remain -= seg_len;
+  }
 }
 
-void OssSeqWriter::free_buffer(char *ptr) {
-  std::vector<char *> ptr_vec{ptr};
-  fs_->upload_buffers_->deallocate(ptr_vec);
+void OssSeqWriter::free_buffer(std::vector<iovec> &buf) {
+  if (buf.empty()) return;
+  std::vector<char *> blocks;
+  blocks.reserve(buf.size());
+  for (const auto &seg : buf) {
+    blocks.push_back(static_cast<char *>(seg.iov_base));
+  }
+  fs_->data_buffers_->deallocate_write(blocks);
+  buf.clear();
 }
 
 void OssSeqWriter::clear_current_buffer() {
-  if (buffer_) {
+  if (!buffer_.empty()) {
     free_buffer(buffer_);
-    buffer_ = nullptr;
     buffer_size_ = 0;
   }
 }
@@ -742,8 +780,7 @@ int OssStreamingWriter::schedule_multipart_upload(size_t part_number) {
   auto ctx = new MultipartContext;
   ctx->writer = this;
   ctx->part_number = part_number;
-  ctx->buf = buffer_;
-  buffer_ = nullptr;
+  ctx->buf.swap(buffer_);
 
   auto th = photon::thread_create(do_multipart_upload, ctx);
   photon::thread_migrate(th,
@@ -757,11 +794,8 @@ void *OssStreamingWriter::do_multipart_upload(void *args) {
   thread_local auto obj_store =
       ctx->writer->fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store();
 
-  iovec iov;
-  iov.iov_base = ctx->buf;
-  iov.iov_len = ctx->writer->fs_->options_.upload_buffer_size;
-  int r = obj_store->upload_part(ctx->writer->upload_context_, &iov, 1,
-                                 ctx->part_number);
+  int r = obj_store->upload_part(ctx->writer->upload_context_, ctx->buf.data(),
+                                 iovcnt(ctx->buf), ctx->part_number);
   if (r < 0) {
     LOG_ERROR("Failed to upload file: `, part: ` r: `",
               ctx->writer->inode_->nodeid, ctx->part_number, r);
@@ -784,12 +818,15 @@ int OssStreamingWriter::do_complete_multipart() {
     return -EIO;
   }
 
+  std::string new_etag;
   int r = PERFORM_BACKGROUND_OBJ_REQUEST(
       fs_, complete_multipart_upload, upload_context_,
-      verify_crc64() ? &expected_crc64_ : nullptr);
+      verify_crc64() ? &expected_crc64_ : nullptr, &new_etag);
   if (r < 0) {
     LOG_ERROR("Failed to complete multipart file: `, r: `", inode_->nodeid, r);
     immutable_ = true;
+  } else if (!new_etag.empty()) {
+    inode_->etag = new_etag;
   }
 
   upload_context_ = nullptr;
@@ -814,8 +851,10 @@ void OssStreamingWriter::do_abort_multipart() {
 
 int OssStreamingWriter::do_upload_empty() {
   iovec iov{nullptr, 0};
-  ssize_t r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, put_object, upload_path_,
-                                             &iov, 1, &expected_crc64_);
+  std::string new_etag;
+  ssize_t r =
+      PERFORM_BACKGROUND_OBJ_REQUEST(fs_, put_object, upload_path_, &iov, 1,
+                                     &expected_crc64_, 0755, &new_etag);
   if (r < 0) {
     LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
               inode_->nodeid, r);
@@ -823,6 +862,9 @@ int OssStreamingWriter::do_upload_empty() {
     return r;
   }
 
+  if (!new_etag.empty()) {
+    inode_->etag = new_etag;
+  }
   return 0;
 }
 
@@ -845,7 +887,6 @@ int OssStreamingWriter::merge_remote_data_of_normal_object() {
 
       auto ctx = new MultipartContext;
       ctx->writer = this;
-      ctx->buf = nullptr;
       ctx->part_number = ++buffer_index_;
 
       auto th = photon::thread_create(do_multipart_copy, ctx);
@@ -856,16 +897,15 @@ int OssStreamingWriter::merge_remote_data_of_normal_object() {
 
   // Download the remained data to the buffer.
   size_t remain_size = inode_->attr.size % part_size;
-  RELEASE_ASSERT(buffer_ == nullptr && buffer_size_ == 0);
+  RELEASE_ASSERT(buffer_.empty() && buffer_size_ == 0);
 
-  buffer_ = get_buffer();
+  get_buffer();
 
-  iovec iov{buffer_, remain_size};
-  IOVector bufv(&iov, 1);
+  auto view = build_iov_view(buffer_, 0, remain_size);
 
   off_t offset = copy_num_parts * part_size;
   int r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, get_object_range, upload_path_,
-                                         bufv.iovec(), bufv.iovcnt(), offset);
+                                         view.data(), iovcnt(view), offset);
   FAULT_INJECTION(FI_Download_Failed_During_Merge_Remote_Data,
                   [&]() { r = -EIO; });
 
@@ -875,7 +915,6 @@ int OssStreamingWriter::merge_remote_data_of_normal_object() {
         upload_path_, inode_->nodeid, offset, remain_size, r);
     immutable_ = true;
     free_buffer(buffer_);
-    buffer_ = nullptr;
   } else {
     buffer_size_ = remain_size;
   }
@@ -907,23 +946,28 @@ void *OssStreamingWriter::do_multipart_copy(void *args) {
 }
 
 int OssStreamingWriter::do_upload_buffer() {
-  iovec iov{buffer_, buffer_size_};
+  auto view = build_iov_view(buffer_, 0, buffer_size_);
   ssize_t r = 0;
   uint64_t *expected_crc64 = verify_crc64() ? &expected_crc64_ : nullptr;
 
   if (upload_context_ != nullptr) {
-    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, upload_part, upload_context_, &iov,
-                                       1, ++buffer_index_);
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, upload_part, upload_context_,
+                                       view.data(), iovcnt(view),
+                                       ++buffer_index_);
     if (r < 0) {
       LOG_ERROR("Failed to upload file: `, nodeid: `, part: ` r: `",
                 upload_path_, inode_->nodeid, buffer_index_, r);
     }
   } else {
-    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, put_object, upload_path_, &iov, 1,
-                                       expected_crc64);
+    std::string new_etag;
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, put_object, upload_path_,
+                                       view.data(), iovcnt(view),
+                                       expected_crc64, 0755, &new_etag);
     if (r < 0) {
       LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
                 inode_->nodeid, r);
+    } else if (!new_etag.empty()) {
+      inode_->etag = new_etag;
     }
   }
 
@@ -937,6 +981,10 @@ int OssStreamingWriter::do_upload_buffer() {
 
 int OssStreamingWriter::on_first_write(off_t &offset, size_t &count) {
   if (write_off_ != 0) {
+    // The remote data may have already been merged by an earlier write on this
+    // still clean handle. Skip if already merged.
+    if (upload_context_ != nullptr || !buffer_.empty()) return 0;
+
     int r = prepare_merge_remote_data(offset);
     if (r < 0) return r;
 
@@ -977,7 +1025,7 @@ void OssStreamingWriter::on_upload_fail_cleanup() {
 int OssStreamingWriter::do_upload_last_part() {
   int r = 0;
 
-  if (buffer_ != nullptr) {
+  if (!buffer_.empty()) {
     r = do_upload_buffer();
     clear_current_buffer();
     if (r < 0) {
@@ -1002,13 +1050,14 @@ int OssStreamingWriter::do_merge_remote_data() {
 int OssAppendableWriter::do_upload_buffer() {
   off_t off =
       valid_buffer_offset + buffer_index_ * fs_->options_.upload_buffer_size;
-  char *buf = buffer_ + valid_buffer_offset;
   size_t upload_size = buffer_size_ - valid_buffer_offset;
-  iovec iov{buf, upload_size};
+  auto view = build_iov_view(buffer_, valid_buffer_offset, upload_size);
 
   uint64_t *expected_crc64 = verify_crc64() ? &expected_crc64_ : nullptr;
+  std::string new_etag;
   ssize_t r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, append_object, upload_path_,
-                                             &iov, 1, off, expected_crc64);
+                                             view.data(), iovcnt(view), off,
+                                             expected_crc64, &new_etag);
   if (r < 0) {
     LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
               inode_->nodeid, r);
@@ -1016,13 +1065,18 @@ int OssAppendableWriter::do_upload_buffer() {
     return r;
   }
 
+  if (!new_etag.empty()) {
+    inode_->etag = new_etag;
+  }
   return 0;
 }
 
 int OssAppendableWriter::do_upload_empty() {
   iovec iov{nullptr, 0};
-  ssize_t r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, append_object, upload_path_,
-                                             &iov, 1, 0, &expected_crc64_);
+  std::string new_etag;
+  ssize_t r =
+      PERFORM_BACKGROUND_OBJ_REQUEST(fs_, append_object, upload_path_, &iov, 1,
+                                     0, &expected_crc64_, &new_etag);
   if (r < 0) {
     LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
               inode_->nodeid, r);
@@ -1030,6 +1084,9 @@ int OssAppendableWriter::do_upload_empty() {
     return r;
   }
 
+  if (!new_etag.empty()) {
+    inode_->etag = new_etag;
+  }
   return 0;
 }
 
@@ -1091,11 +1148,10 @@ int OssAppendableWriter::do_merge_remote_data() {
 int OssAppendableWriter::do_upload_last_part() {
   int r = 0;
 
-  if (buffer_ != nullptr) {
+  if (!buffer_.empty()) {
     r = do_upload_buffer();
 
     free_buffer(buffer_);
-    buffer_ = nullptr;
     if (r < 0) {
       return r;
     }
@@ -1121,7 +1177,7 @@ ssize_t OssAppendableWriter::pread_from_local(void *buf, size_t count,
     return 0;
   }
 
-  RELEASE_ASSERT(buffer_ != nullptr);
+  RELEASE_ASSERT(!buffer_.empty());
 
   size_t buffer_index = offset / fs_->options_.upload_buffer_size;
   RELEASE_ASSERT(buffer_index == buffer_index_);
@@ -1130,24 +1186,27 @@ ssize_t OssAppendableWriter::pread_from_local(void *buf, size_t count,
   RELEASE_ASSERT(buffer_offset >= valid_buffer_offset);
 
   count = std::min(count, buffer_size_ - (size_t)buffer_offset);
-  memcpy(static_cast<char *>(buf), buffer_ + buffer_offset, count);
+  auto view = build_iov_view(buffer_, buffer_offset, count);
+  memcpy_from_iov(static_cast<char *>(buf), view.data(), iovcnt(view), count);
   return count;
 }
 
 int OssAppendableWriter::do_append_upload(size_t part_number) {
   off_t off = valid_buffer_offset +
               (part_number - 1) * fs_->options_.upload_buffer_size;
-  char *buf = buffer_ + valid_buffer_offset;
   size_t upload_size = buffer_size_ - valid_buffer_offset;
+  auto view = build_iov_view(buffer_, valid_buffer_offset, upload_size);
   valid_buffer_offset = 0;
 
-  iovec iov{buf, upload_size};
+  std::string new_etag;
   int r = PERFORM_BACKGROUND_OBJ_REQUEST(
-      fs_, append_object, upload_path_, &iov, 1, off,
-      verify_crc64() ? &expected_crc64_ : nullptr);
+      fs_, append_object, upload_path_, view.data(), iovcnt(view), off,
+      verify_crc64() ? &expected_crc64_ : nullptr, &new_etag);
   if (r < 0) {
     LOG_ERROR("Failed to do append upload file: `, nodeid: `, r: `",
               upload_path_, inode_->nodeid, r);
+  } else if (!new_etag.empty()) {
+    inode_->etag = new_etag;
   }
 
   return r;
@@ -1181,8 +1240,8 @@ int OssAppendableWriter::switch_object_type_normal_to_appendable() {
   const size_t part_size = fs_->options_.upload_buffer_size;
   size_t copy_num_parts = inode_->attr.size / part_size;
 
-  RELEASE_ASSERT(buffer_ == nullptr && buffer_size_ == 0);
-  buffer_ = get_buffer();
+  RELEASE_ASSERT(buffer_.empty() && buffer_size_ == 0);
+  get_buffer();
 
   auto background_env =
       fs_->bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next();
@@ -1222,16 +1281,17 @@ int OssAppendableWriter::switch_object_type_normal_to_appendable() {
     buffer_size_ = inode_->attr.size % part_size;
     if (buffer_size_ > 0) copy_num_parts++;
 
+    // The last append's etag reflects the whole object.
+    std::string new_etag;
     for (size_t i = 0; i < copy_num_parts; i++) {
       size_t copy_size = (buffer_size_ > 0 && i == copy_num_parts - 1)
                              ? buffer_size_
                              : part_size;
 
-      iovec iov{buffer_, copy_size};
-      IOVector bufv(&iov, 1);
+      auto view = build_iov_view(buffer_, 0, copy_size);
 
-      ssize_t ret = obj_store->get_object_range(tmp_file_path, bufv.iovec(),
-                                                bufv.iovcnt(), i * part_size);
+      ssize_t ret = obj_store->get_object_range(tmp_file_path, view.data(),
+                                                iovcnt(view), i * part_size);
       if (ret < 0) {
         // clang-format off
         LOG_ERROR(
@@ -1243,12 +1303,12 @@ int OssAppendableWriter::switch_object_type_normal_to_appendable() {
 
       uint64_t *crc64_ptr = nullptr;
       if (verify_crc64()) {
-        expected_crc64_ = crc64ecma(buffer_, copy_size, expected_crc64_);
+        expected_crc64_ = crc64ecma_iov(view, copy_size, expected_crc64_);
         crc64_ptr = &expected_crc64_;
       }
 
-      ret = obj_store->append_object(upload_path_, &iov, 1, i * part_size,
-                                     crc64_ptr);
+      ret = obj_store->append_object(upload_path_, view.data(), iovcnt(view),
+                                     i * part_size, crc64_ptr, &new_etag);
       if (ret < 0) {
         LOG_ERROR("Failed to append upload file: `, nodeid: `, r: `",
                   upload_path_, inode_->nodeid, ret);
@@ -1267,12 +1327,14 @@ int OssAppendableWriter::switch_object_type_normal_to_appendable() {
 
     valid_buffer_offset = buffer_size_;
     buffer_index_ = inode_->attr.size / part_size;
+    if (!new_etag.empty()) {
+      inode_->etag = new_etag;
+    }
     return 0;
   });
 
   if (r < 0) {
     free_buffer(buffer_);
-    buffer_ = nullptr;
     buffer_size_ = 0;
   }
 
@@ -1316,7 +1378,6 @@ int OssRandomWriter::open() {
   inode_->rw_ctx->ref_count++;
   if (open_flags_ & O_TRUNC) {
     inode_->rw_ctx->remote_size = 0;
-    inode_->etag.clear();
     inode_->attr.size = 0;
     mark_dirty();
   } else if (open_flags_ & O_CREAT) {
@@ -1486,6 +1547,7 @@ int OssRandomWriter::flush() {
   if (r < 0) {
     LOG_ERROR("flush failed: `, nodeid `, size `", r, inode_->nodeid,
               file_size);
+    // Data stays in staging for retry; close() invalidates if it is lost.
     return r;
   }
 
@@ -1520,37 +1582,18 @@ void OssRandomWriter::mark_dirty() {
   if (inode_->is_dirty) return;
   inode_->is_dirty = true;
   fs_->add_dirty_nodeid(inode_->nodeid);
-  // Drop the prefetched cache at the clean->dirty transition so blocks from
-  // the previous clean state can never be served while the file is dirty.
-  if (inode_->cache) {
-    auto *handle = inode_->cache->get(inode_->rw_ctx->upload_path, inode_->etag,
-                                      inode_->attr.size);
-    if (handle) {
-      LOG_INFO("file: `, nodeid: ` marked dirty, drop prefetched cache",
-               inode_->rw_ctx->upload_path, inode_->nodeid);
-      handle->drop(inode_->rw_ctx->upload_path, inode_->etag,
-                   inode_->attr.size);
-      inode_->cache->release(handle, 0);
-    }
+  // Drop prefetched clean-state blocks; they must not be served while dirty.
+  if (inode_->cache && inode_->cache->drop(cache_key())) {
+    LOG_INFO("file: `, nodeid: ` marked dirty, drop prefetched cache",
+             inode_->rw_ctx->upload_path, inode_->nodeid);
   }
 }
 
-void OssRandomWriter::mark_clean() {
+void OssRandomWriter::mark_clean(bool data_lost) {
   if (!inode_->is_dirty) return;
   inode_->is_dirty = false;
-  inode_->invalidate_data_cache = true;
-  inode_->attr_time = 0;
+  drop_post_write_caches(data_lost, inode_->rw_ctx->upload_path);
   fs_->erase_dirty_nodeid(inode_->nodeid);
-  // Drop cache after flush so subsequent reads fetch the new OSS version.
-  if (inode_->cache) {
-    auto *handle = inode_->cache->get(inode_->rw_ctx->upload_path, inode_->etag,
-                                      inode_->attr.size);
-    if (handle) {
-      handle->drop(inode_->rw_ctx->upload_path, inode_->etag,
-                   inode_->attr.size);
-      inode_->cache->release(handle, 0);
-    }
-  }
   LOG_INFO("file: `, nodeid: `, size: ` is marked to clean (random)",
            inode_->rw_ctx->upload_path, inode_->nodeid, inode_->attr.size);
 }
@@ -1625,7 +1668,7 @@ void OssRandomWriter::close() {
                 inode_->nodeid);
       inode_->attr.size = inode_->rw_ctx->remote_size;
       inode_->rw_ctx->chunks.clear();
-      mark_clean();
+      mark_clean(/*data_lost=*/true);
     }
     delete inode_->rw_ctx;
     inode_->rw_ctx = nullptr;
@@ -1665,7 +1708,7 @@ int OssRandomWriter::truncate(uint64_t new_size) {
 
   struct timespec now;
   clock_gettime(CLOCK_REALTIME, &now);
-  inode_->etag.clear();
+  // The etag stays valid until flush lands the deferred truncate.
   inode_->update_attr(new_size, now);
 
   mark_dirty();

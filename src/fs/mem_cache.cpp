@@ -589,9 +589,14 @@ void BlockCacheStore::update_retention_range(BlockCacheHandle *h, off_t offset,
   }
 }
 
-void BlockCacheStore::increment_generation() {
+void BlockCacheStore::drop(const CacheKey &key, bool force) {
   SCOPED_LOCK(meta_store_->lock_);
+  // Same identity keeps the blocks; force skips this shortcut.
+  if (!force && !key.etag.empty() && key.etag == current_etag_) {
+    return;
+  }
   meta_store_->generation_++;
+  current_etag_.assign(key.etag);
 }
 
 std::pair<off_t, size_t> BlockCacheStore::query_refill_range(off_t offset,
@@ -648,14 +653,22 @@ BlockCache::~BlockCache() {
   RELEASE_ASSERT(cache_store_ == nullptr);
 }
 
-CacheHandle *BlockCache::get(std::string_view /* name */,
-                             std::string_view /* etag */, size_t /* size */) {
+CacheHandle *BlockCache::get(const CacheKey &key) {
   std::lock_guard<std::mutex> l(mtx_);
   if (cache_store_ == nullptr) {
-    cache_store_ = new BlockCacheStore(block_pool_->block_size());
+    // The identity is initialized once at creation; later maintained by
+    // drop().
+    cache_store_ = new BlockCacheStore(block_pool_->block_size(), key);
   }
   ++ref_cnt_;
   return new BlockCacheHandle(cache_store_, &range_lock_);
+}
+
+bool BlockCache::drop(const CacheKey &key) {
+  std::lock_guard<std::mutex> l(mtx_);
+  if (cache_store_ == nullptr) return false;
+  cache_store_->drop(key);
+  return true;
 }
 
 size_t BlockCache::try_expand_blocks(uint64_t count, uint64_t max_capacity,

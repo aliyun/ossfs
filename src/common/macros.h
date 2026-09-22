@@ -60,6 +60,11 @@ constexpr const char *__basename(const char *path) {
 
 #define OSSFS_EVENT_ENGINE photon::INIT_EVENT_EPOLL | photon::INIT_EVENT_SELECT
 
+#define EXECUTOR_QUEUE_OPTION \
+  { 16, 1024 }
+#define LIBAIO_PHOTON_OPTION \
+  { 128 }
+
 #define INIT_PHOTON()                                     \
   photon::block_all_signal();                             \
   photon::init(OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE); \

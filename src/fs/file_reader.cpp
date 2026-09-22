@@ -163,26 +163,21 @@ off_t OssCachedReader::get_remote_size() {
   return remote_size_;
 }
 
-void OssCachedReader::set_remote_size(off_t size) {
-  SCOPED_LOCK(attr_lock_);
-  remote_size_ = size;
-}
-
-bool OssCachedReader::refresh_attr_if_needed_and_invoke(
-    std::function<void()> &&callback) {
+bool OssCachedReader::refresh_attr_if_needed_and_drop_cache(off_t clean_size) {
   SCOPED_LOCK(attr_lock_);
 
-  // The goal is to support readers seeing appended data after the attr cache
-  // expires. If a relevant change is detected, caller must invalidate any
-  // cached data associated with this file handle within the callback.
-  if (unlikely(inode_->attr.size != static_cast<uint64_t>(remote_size_) ||
+  if (clean_size == -1) clean_size = inode_->attr.size;
+
+  // The appendable clean boundary advances in lockstep with the ETag, so a
+  // size advance implies a moved identity.
+  if (unlikely(clean_size != remote_size_ ||
                inode_->attr.mtime.tv_sec != mtime_.tv_sec ||
                inode_->attr.mtime.tv_nsec != mtime_.tv_nsec ||
                inode_->etag != etag_)) {
-    remote_size_ = inode_->attr.size;
+    remote_size_ = clean_size;
     mtime_ = inode_->attr.mtime;
     etag_ = inode_->etag;
-    callback();
+    drop_cache();
     return true;
   }
   return false;
@@ -252,7 +247,7 @@ ssize_t OssAppendableCachedReader::pread_rlocked(void *buf, size_t count,
     auto r = read_from_appendable_dirty_inode(buf, count, offset);
     if (r != -E_NO_DIRTY_DATA) return r;
   } else {
-    set_remote_size(inode_->attr.size);
+    refresh_attr_if_needed_and_drop_cache();
   }
   return -E_CONTINUE_READ;
 }
@@ -284,11 +279,6 @@ ssize_t OssCachedReader::pread(void *buf, size_t count, off_t offset) {
         offset, get_prefetch_buffer_size(prefetch_window_size_));
   }
   return ret;
-}
-
-bool OssCachedReader::refresh_attr_if_needed_and_drop_cache() {
-  return refresh_attr_if_needed_and_invoke(
-      [&]() { cache_handle_->drop(path_, etag_, remote_size_); });
 }
 
 ssize_t OssCachedReader::pin_rlocked(off_t offset, size_t count, void **buf) {
@@ -442,8 +432,8 @@ void OssCachedReader::set_path(std::string_view new_path) {
   SCOPED_LOCK(attr_lock_);
   if (path_ == new_path) return;
   path_.assign(new_path.data(), new_path.size());
-  // Re-key cache: rename changes object_key.
-  cache_handle_->drop(new_path, etag_, remote_size_);
+  // Rename never changes the data; keep the blocks when the etag is unchanged.
+  drop_cache(false);
 }
 
 ssize_t OssCachedReader::do_verified_refill_get(IObjStore *obj_store,
@@ -536,7 +526,7 @@ void OssCachedReader::try_expand_prefetch_window(off_t remain_prefetch_size) {
 
   const size_t block_size = cache_->block_size();
 
-  auto pool_usage = fs_->download_buffers_->get_usage_ratio();
+  auto pool_usage = fs_->data_buffers_->read_usage_ratio();
   auto configured_max_window =
       std::min(fs_->max_prefetch_window_size_per_handle_,
                static_cast<size_t>(remain_prefetch_size));
@@ -678,7 +668,7 @@ ssize_t serve_appendable_dirty_read(
 }  // namespace
 
 void OssAppendableCachedReader::note_clean_size(off_t size) {
-  set_remote_size(size);
+  refresh_attr_if_needed_and_drop_cache(size);
 }
 
 ssize_t OssAppendableCachedReader::read_clean_range(void *buf, size_t count,
@@ -772,9 +762,10 @@ std::unique_ptr<IReader> create_oss_reader(OssFs *fs, std::string_view path,
   if (cache_enabled) {
     auto cache = inode->cache;
     if (cache == nullptr) {
-      cache = std::make_shared<BlockCache>(fs->get_download_buffers());
+      cache = std::make_shared<BlockCache>(fs->get_data_buffers());
     }
-    auto cache_handle = cache->get(path, inode->etag, inode->attr.size);
+    CacheKey key{path, inode->etag, inode->attr.mtime, inode->attr.size};
+    auto cache_handle = cache->get(key);
     if (cache_handle) {
       switch (fs->write_mode()) {
         case WriteMode::Random:

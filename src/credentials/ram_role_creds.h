@@ -30,10 +30,13 @@ class RamRoleCredentialsProvider : public CredentialsProvider {
  public:
   using RamCredMap = CredentialsParser::Result;
 
-  RamRoleCredentialsProvider(std::string_view ram_role);
+  RamRoleCredentialsProvider(std::string_view ram_role,
+                             bool backoff_enabled = false);
 
  private:
   int get_credentials(ObjCredentials &creds, time_t &expiration) override;
+
+  int get_ecs_meta(std::string_view url, std::string &resp);
 
   std::string url_;
 

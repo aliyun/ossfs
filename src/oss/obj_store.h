@@ -40,6 +40,13 @@ static constexpr std::string_view kOssObjectTypeSymlink = "Symlink";
 
 using ObjCredentials = photon::objstore_from_photon::CredentialParameters;
 using ObjHeaderMeta = photon::objstore_from_photon::ObjectHeaderMeta;
+using ObjIPVersion = photon::objstore_from_photon::IPVersion;
+
+// One home for the --enable_ipv6 mapping, so the mount path and the test
+// harness cannot drift apart.
+inline ObjIPVersion ip_version_for(bool enable_ipv6) {
+  return enable_ipv6 ? ObjIPVersion::kBoth : ObjIPVersion::kIPv4Only;
+}
 
 // JindoSDK option keys.
 constexpr const char kHdfsSdkOptEndpoint[] = "fs.oss.endpoint";
@@ -49,6 +56,7 @@ constexpr const char kHdfsSdkOptRandomWriteSyncInterval[] =
     "fs.oss.randomwrite.sync.interval.millisecond";
 constexpr const char kHdfsSdkOptLoggerAppender[] = "logger.appender";
 constexpr const char kHdfsSdkOptLoggerDir[] = "logger.dir";
+constexpr const char kHdfsSdkOptUserAgentModule[] = "fs.oss.user.agent.module";
 
 struct ObjDirent {
   ObjDirent(std::string_view name, uint64_t size, struct timespec mtime,
@@ -202,6 +210,11 @@ struct ObjStoreOptions : public photon::objstore_from_photon::ClientOptions {
   virtual ~ObjStoreOptions() = default;
 };
 
+struct CredsMeta {
+  time_t expiration = 0;
+  uint64_t generation = 0;
+};
+
 class IObjStore {
  public:
   enum class StorageBackend {
@@ -214,7 +227,10 @@ class IObjStore {
   // Get storage backend type
   virtual StorageBackend get_backend_type() const = 0;
 
-  virtual void set_credentials(ObjCredentials &&creds) = 0;
+  virtual void set_credentials(ObjCredentials &&creds,
+                               const CredsMeta &meta) = 0;
+
+  virtual void set_creds_refresh_handler(std::function<int(uint64_t)>) {}
 
   virtual const ObjStoreOptions &get_options() const = 0;
 
@@ -233,7 +249,8 @@ class IObjStore {
 
   virtual ssize_t put_object(std::string_view path, const struct iovec *iov,
                              int iovcnt, uint64_t *expected_crc64 = nullptr,
-                             mode_t mode = 0755) = 0;
+                             mode_t mode = 0755,
+                             std::string *etag = nullptr) = 0;
 
   virtual ssize_t put_object_from_fd(std::string_view path, int fd,
                                      off_t offset, size_t count,
@@ -285,7 +302,8 @@ class IObjStore {
 
   virtual ssize_t append_object(std::string_view path, const struct iovec *iov,
                                 int iovcnt, off_t position,
-                                uint64_t *expected_crc64 = nullptr) = 0;
+                                uint64_t *expected_crc64 = nullptr,
+                                std::string *etag = nullptr) = 0;
 
   virtual int init_multipart_upload(std::string_view path, void **context) = 0;
 

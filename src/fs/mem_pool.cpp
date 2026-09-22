@@ -59,12 +59,8 @@ std::vector<char *> FixedBlockMemoryPool::allocate(size_t count) {
   return try_allocate(count, true);
 }
 
-std::vector<char *> FixedBlockMemoryPool::try_allocate(size_t count,
-                                                       bool ignore_limit) {
-  const size_t limit =
-      ignore_limit ? std::numeric_limits<size_t>::max() : pool_capacity_;
-  SCOPED_LOCK(lock_);
-
+std::vector<char *> FixedBlockMemoryPool::take_blocks_locked(size_t count,
+                                                             size_t limit) {
   std::vector<char *> addresses;
   addresses.reserve(count);
   for (size_t i = 0; i < count; ++i) {
@@ -80,29 +76,44 @@ std::vector<char *> FixedBlockMemoryPool::try_allocate(size_t count,
   return addresses;
 }
 
+size_t FixedBlockMemoryPool::return_blocks_locked(
+    const std::vector<char *> &addresses) {
+  size_t free_cnt = 0;
+  for (char *addr : addresses) {
+    if (cached_block_list_.size() >= max_cached_blocks_) break;
+    cached_block_list_.push_back(addr);
+    free_cnt++;
+
+    if (ENABLE_TESTS()) {
+      memset(addr, 0, block_size_);
+    }
+  }
+  used_ -= addresses.size();
+  return free_cnt;
+}
+
+void FixedBlockMemoryPool::free_excess(const std::vector<char *> &addresses,
+                                       size_t free_cnt) {
+  for (size_t i = free_cnt; i < addresses.size(); ++i) {
+    free(addresses[i]);
+  }
+}
+
+std::vector<char *> FixedBlockMemoryPool::try_allocate(size_t count,
+                                                       bool ignore_limit) {
+  const size_t limit =
+      ignore_limit ? std::numeric_limits<size_t>::max() : pool_capacity_;
+  SCOPED_LOCK(lock_);
+  return take_blocks_locked(count, limit);
+}
+
 void FixedBlockMemoryPool::deallocate(const std::vector<char *> &addresses) {
   size_t free_cnt = 0;
   {
     SCOPED_LOCK(lock_);
-    for (char *addr : addresses) {
-      if (cached_block_list_.size() < max_cached_blocks_) {
-        cached_block_list_.push_back(addr);
-        free_cnt++;
-
-        if (ENABLE_TESTS()) {
-          memset(addr, 0, block_size_);
-        }
-      } else {
-        break;
-      }
-    }
-    used_ -= addresses.size();
+    free_cnt = return_blocks_locked(addresses);
   }
-  if (free_cnt < addresses.size()) {
-    for (size_t i = free_cnt; i < addresses.size(); ++i) {
-      free(addresses[i]);
-    }
-  }
+  free_excess(addresses, free_cnt);
 }
 
 size_t FixedBlockMemoryPool::used_blocks() {

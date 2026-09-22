@@ -16,9 +16,46 @@
 
 #include "common/fault_injector.h"
 #include "fs/test/test_suite.h"
+#include "oss/oss_hdfs_store.h"
+
+namespace {
+constexpr const char kNonRootLoginUser[] = "gtest_user_5000";
+}  // namespace
 
 class Ossfs2HdfsMknodTest : public OssHdfsTestSuite {
  protected:
+  void TearDown() override {
+    // In OSS mode SetUp() is skipped before g_fault_injector is created.
+    if (g_fault_injector) {
+      g_fault_injector->clear_injection(FI_Hdfs_LoginUser_Override);
+      g_fault_injector->clear_injection(FI_Hdfs_UserGroup_Mapping);
+    }
+    g_test_hdfs_login_user.clear();
+    g_test_user_mapping = {};
+    OssHdfsTestSuite::TearDown();
+  }
+
+  // Simulate a non-root mount: JindoSDK connects as kNonRootLoginUser, so
+  // newly created files are owned by that user unless set_owner is issued.
+  void connect_as_non_root_user() {
+    g_test_hdfs_login_user = kNonRootLoginUser;
+
+    auto &m = g_test_user_mapping;
+    m.uid_to_name[5000] = kNonRootLoginUser;
+    m.name_to_uid[kNonRootLoginUser] = 5000;
+    m.gid_to_name[5000] = "gtest_group_5000";
+    m.name_to_gid["gtest_group_5000"] = 5000;
+    m.uid_to_name[0] = "root";
+    m.name_to_uid["root"] = 0;
+    m.gid_to_name[0] = "root";
+    m.name_to_gid["root"] = 0;
+
+    g_fault_injector->set_injection(FI_Hdfs_UserGroup_Mapping,
+                                    FaultInjection());
+    g_fault_injector->set_injection(FI_Hdfs_LoginUser_Override,
+                                    FaultInjection());
+  }
+
   // mknod S_IFREG: create a regular file.
   void verify_mknod_regular_file() {
     uint64_t parent = get_test_dir_parent();
@@ -204,6 +241,27 @@ class Ossfs2HdfsMknodTest : public OssHdfsTestSuite {
     ASSERT_EQ(st2.st_gid, (gid_t)1000);
   }
 
+  // With the option enabled, set_owner must be issued even when uid/gid are
+  // 0. Connected as a non-root user, a file created for root would otherwise
+  // be owned by the connecting user.
+  void verify_set_owner_on_create_non_root() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    struct stat st;
+    uint64_t nodeid = 0;
+    int r = fs_->mknod(parent, "root_owner_nonroot", S_IFREG | 0644, 0, 0,
+                       &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    struct stat st2;
+    r = fs_->getattr(nodeid, &st2);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(st2.st_uid, (uid_t)0);
+    ASSERT_EQ(st2.st_gid, (gid_t)0);
+  }
+
   // lookup/stat backend failure via FI.
   void verify_lookup_call_failed() {
     uint64_t parent = get_test_dir_parent();
@@ -353,6 +411,16 @@ TEST_F(Ossfs2HdfsMknodTest, verify_set_owner_on_mkdir) {
   opts.hdfs_set_owner_on_create = true;
   init(opts);
   verify_set_owner_on_mkdir();
+}
+
+TEST_F(Ossfs2HdfsMknodTest, verify_set_owner_on_create_non_root) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.hdfs_set_owner_on_create = true;
+  opts.attr_timeout = 0;
+  connect_as_non_root_user();
+  init(opts);
+  verify_set_owner_on_create_non_root();
 }
 
 TEST_F(Ossfs2HdfsMknodTest, verify_lookup_call_failed) {

@@ -31,10 +31,17 @@ bool Inode::can_be_invalidated() const {
 
 void Inode::update_attr(uint64_t file_size, struct timespec file_mtime,
                         struct timespec file_atime) {
-  if (is_dir()) return;
+  // Dir size is never updated: fill_statbuf always reports a fixed size for
+  // dirs.
+  if (!is_dir()) {
+    attr.size = file_size;
+  }
 
-  attr.size = file_size;
-  attr.mtime = file_mtime;
+  // A zero mtime means the backend did not provide one (e.g. OSS dir stats
+  // are list-based probes without mtimes), so keep the local value.
+  if (file_mtime.tv_sec != 0) {
+    attr.mtime = file_mtime;
+  }
   if (file_atime.tv_sec != 0) {
     set_atime(file_atime);
   }
@@ -86,16 +93,22 @@ std::string Inode::inode_type_to_string(InodeType type) {
   }
 }
 
-void FileInode::invalidate_data_cache_if_needed(const struct stat *stbuf,
-                                                std::string_view remote_etag) {
+void FileInode::refresh_etag(const struct stat *stbuf,
+                             std::string_view remote_etag) {
   if (is_data_changed(stbuf, remote_etag)) {
     invalidate_data_cache = true;
   }
+  etag.assign(remote_etag.data(), remote_etag.size());
 }
 
 bool FileInode::is_data_changed(const struct stat *stbuf,
                                 std::string_view remote_etag) const {
-  return etag != remote_etag || uint64_t(stbuf->st_size) != attr.size ||
+  if (!etag.empty() && !remote_etag.empty()) {
+    return etag != remote_etag || uint64_t(stbuf->st_size) != attr.size;
+  }
+
+  // No etag available (HDFS, or never fetched): fall back to size + mtime.
+  return uint64_t(stbuf->st_size) != attr.size ||
          stbuf->st_mtim.tv_nsec != attr.mtime.tv_nsec ||
          stbuf->st_mtim.tv_sec != attr.mtime.tv_sec;
 }

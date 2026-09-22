@@ -30,8 +30,6 @@
 
 // Reserved uid/gid for unresolved names (nobody user).
 // Used by backend when username/groupname resolution fails.
-// Also used by FUSE adapter to replace backend reserved values with req.
-// context.
 constexpr uid_t kReservedUnresolvedUid = 99;
 constexpr gid_t kReservedUnresolvedGid = 99;
 
@@ -58,6 +56,12 @@ std::string uid_to_username(uid_t uid);
 // Resolve gid to groupname string. Returns empty string on failure.
 // Uses FI_Hdfs_UserGroup_Mapping for test mocking when enabled.
 std::string gid_to_groupname(gid_t gid);
+
+// Replace reserved unresolved uid/gid with the requesting user's ids.
+// Must be applied both when replying to the kernel and before any local
+// permission check, so that both see the same owner.
+void resolve_unresolved_uid_gid(struct stat *stbuf, uid_t req_uid,
+                                gid_t req_gid);
 
 // HDFS permission check. Uses OR check for loose pre-checking.
 // Supplementary group membership is checked via getgrgid_r + gr_mem.

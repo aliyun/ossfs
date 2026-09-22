@@ -129,17 +129,16 @@ class OssCachedReader : public OssReader,
  protected:
   ssize_t do_pread(void *buf, size_t count, off_t offset, size_t refill_unit);
 
-  void set_remote_size(off_t size);
+  // Sync anchored attrs from the inode and drop cache on change. Must be
+  // called under the inode rlock. `clean_size` defaults to attr.size;
+  // appendable dirty reads pass the uploaded (clean) boundary instead.
+  bool refresh_attr_if_needed_and_drop_cache(off_t clean_size = -1);
 
-  // Sync anchored attrs from the inode and drop cache on change.
-  // Must be called under the inode rlock.
-  bool refresh_attr_if_needed_and_drop_cache();
-
-  photon::spinlock attr_lock_;
+  photon::mutex attr_lock_;
   // remote_size is a cached copy of the inode file size, stored per file
   // handle. It is primarily used in prefetching and caching code paths to avoid
   // repeatedly acquiring the inode lock. The following value is only updated
-  // during refresh_attr_if_needed_and_invoke.
+  // during refresh_attr_if_needed_and_drop_cache.
   off_t remote_size_ = 0;
   timespec mtime_ = {0, 0};
   std::string etag_;
@@ -147,7 +146,15 @@ class OssCachedReader : public OssReader,
  private:
   off_t get_remote_size();
 
-  bool refresh_attr_if_needed_and_invoke(std::function<void()> &&callback);
+  // Caller must hold attr_lock_.
+  void drop_cache(bool force = true) {
+    cache_handle_->drop(cache_key(), force);
+  }
+
+  // Caller must hold attr_lock_.
+  CacheKey cache_key() {
+    return {path_, etag_, mtime_, static_cast<size_t>(remote_size_)};
+  }
 
   RangeLock *range_lock() {
     return cache_handle_->get_range_lock();

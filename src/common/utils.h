@@ -27,7 +27,7 @@
 std::string join_paths(const std::string &first, const std::string &second);
 std::string remove_prepend_backslash(const std::string &path);
 std::string add_backslash(const std::string &path);
-int daemonize(int foreground, int pipefd, void (*log_exit_error)(char));
+int daemonize(int foreground, int pipefd[2], void (*log_exit_error)(char));
 
 // Check if child is a subdirectory of parent.
 // The inputs should be normalized paths.

@@ -26,14 +26,57 @@ class BlockCacheTest : public ::testing::Test {
   bool share_cache_store(CacheHandle *h1, CacheHandle *h2) {
     return h1->cache_store == h2->cache_store;
   }
+
+  BlockCacheStore *store_of(CacheHandle *h) {
+    return static_cast<BlockCacheStore *>(h->cache_store);
+  }
+
+  uint64_t generation_of(CacheHandle *h) {
+    return store_of(h)->meta_store_->generation_;
+  }
+
+  std::string etag_of(CacheHandle *h) {
+    return store_of(h)->current_etag_;
+  }
 };
+
+TEST_F(BlockCacheTest, verify_get_initializes_identity_only_once) {
+  auto pool = std::make_shared<FixedBlockMemoryPool>(kBlockSize, 50, 5, 0);
+  BlockCache manager(pool);
+
+  // The first get() creates the store and initializes its identity.
+  auto h1 = manager.get(CacheKey{"obj", "etagA"});
+  ASSERT_TRUE(h1);
+  ASSERT_EQ(etag_of(h1), "etagA");
+  uint64_t gen = generation_of(h1);
+
+  // A later get() carrying a different etag must not relabel the existing
+  // store: the identity stays "etagA" and nothing is invalidated.
+  auto h2 = manager.get(CacheKey{"obj", "etagB"});
+  ASSERT_TRUE(h2);
+  ASSERT_TRUE(share_cache_store(h1, h2));
+  ASSERT_EQ(etag_of(h1), "etagA");
+  ASSERT_EQ(generation_of(h1), gen);
+
+  // Identity is subsequently maintained by drop(): same etag is a no-op...
+  store_of(h1)->drop({"obj", "etagA"}, /*force=*/false);
+  ASSERT_EQ(generation_of(h1), gen);
+
+  // ...while a different etag bumps the generation and re-states it.
+  store_of(h1)->drop({"obj", "etagB"}, kBlockSize);
+  ASSERT_EQ(generation_of(h1), gen + 1);
+  ASSERT_EQ(etag_of(h1), "etagB");
+
+  manager.release(h2, 0);
+  manager.release(h1, 0);
+}
 
 TEST_F(BlockCacheTest, verify_multiple_expansions) {
   auto pool = std::make_shared<FixedBlockMemoryPool>(kBlockSize, 50, 5, 0);
   BlockCache manager(pool);
 
   // Get a reference to initialize the cache
-  auto h1 = manager.get();
+  auto h1 = manager.get(CacheKey{});
   ASSERT_TRUE(h1);
 
   uint64_t max_capacity = 20;
@@ -64,7 +107,7 @@ TEST_F(BlockCacheTest, verify_multiple_expansions) {
 
   // Test count > max_capacity scenario
   BlockCache manager2(pool);
-  auto h2 = manager2.get();
+  auto h2 = manager2.get(CacheKey{});
   ASSERT_TRUE(h2);
 
   // Request more blocks than max capacity allows
@@ -76,7 +119,7 @@ TEST_F(BlockCacheTest, verify_multiple_expansions) {
 
   // Test with zero capacity
   BlockCache manager3(pool);
-  auto h3 = manager3.get();
+  auto h3 = manager3.get(CacheKey{});
   ASSERT_TRUE(h3);
 
   size_t expanded6 = manager3.try_expand_blocks(5, 0);  // Max capacity 0
@@ -87,7 +130,7 @@ TEST_F(BlockCacheTest, verify_multiple_expansions) {
 
   // Test with very small capacity
   BlockCache manager4(pool);
-  auto h4 = manager4.get();
+  auto h4 = manager4.get(CacheKey{});
   ASSERT_TRUE(h4);
 
   size_t expanded7 = manager4.try_expand_blocks(1, 1);  // Max capacity 1
@@ -105,11 +148,11 @@ TEST_F(BlockCacheTest, verify_ref_counting_with_reuse) {
   ASSERT_EQ(manager.capacity(), 0ULL);
 
   // Get first reference
-  auto h1 = manager.get();
+  auto h1 = manager.get(CacheKey{});
   ASSERT_TRUE(h1);
 
   // Get second reference
-  auto h2 = manager.get();
+  auto h2 = manager.get(CacheKey{});
   ASSERT_TRUE(h2);
 
   // Both should point to the same cache instance
@@ -125,7 +168,7 @@ TEST_F(BlockCacheTest, verify_ref_counting_with_reuse) {
   ASSERT_EQ(manager.capacity(), 1ULL);  // 1 block remains in cache
 
   // Get another reference - should still work since there's still one reference
-  auto h3 = manager.get();
+  auto h3 = manager.get(CacheKey{});
   ASSERT_TRUE(h3);
   ASSERT_TRUE(share_cache_store(h1, h3));
 
@@ -145,7 +188,7 @@ TEST_F(BlockCacheTest, verify_ref_counting_with_reuse) {
   ASSERT_EQ(manager.capacity(), 0ULL);
 
   // Get a fresh reference after everything is released
-  auto h4 = manager.get();
+  auto h4 = manager.get(CacheKey{});
   ASSERT_TRUE(h4);
 
   // Expand again to make sure manager works after full cleanup
@@ -177,7 +220,7 @@ TEST_F(BlockCacheTest, verify_concurrent_allocation_deallocation) {
           // Each thread will perform multiple allocation/deallocation cycles
           for (uint64_t iter = 0; iter < iterations; ++iter) {
             // Get cache reference
-            auto h = manager.get();
+            auto h = manager.get(CacheKey{});
             ASSERT_TRUE(h);
 
             // Random number of blocks to allocate (between 1 and
@@ -196,7 +239,7 @@ TEST_F(BlockCacheTest, verify_concurrent_allocation_deallocation) {
 
             // Get another reference occasionally to test reference counting
             if (iter % 10 == 0) {
-              auto h2 = manager.get();
+              auto h2 = manager.get(CacheKey{});
               ASSERT_TRUE(h2);
               // Should point to same cache instance
               ASSERT_TRUE(share_cache_store(h, h2));
@@ -217,7 +260,7 @@ TEST_F(BlockCacheTest, verify_concurrent_allocation_deallocation) {
 
   // After all threads finish, the manager should be in a valid state
   // Verify that we can still get a reference and use the manager
-  auto final_h = manager.get();
+  auto final_h = manager.get(CacheKey{});
   ASSERT_TRUE(final_h);
 
   // Perform one final allocation to verify the manager is still functional

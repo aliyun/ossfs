@@ -14,12 +14,8 @@
  * limitations under the License.
  */
 
-#include "common/ssl_probe.h"
 #include "test_suite.h"
 #include "test_util.h"
-
-DEFINE_string(config_file, "/etc/ossfs2-gtest.conf",
-              "default config file path");
 
 class Ossfs2BasicTest : public Ossfs2TestSuite {
  protected:
@@ -289,6 +285,67 @@ class Ossfs2BasicTest : public Ossfs2TestSuite {
                 2ULL * 32 * 8 * 1024 * 1024);
     }
   }
+
+  // OSS dirs inferred from common prefixes have no backend mtime
+  // (oss_stat_dir provides none), so a backend attr refresh must keep the
+  // local mtime instead of corrupting it.
+  void verify_oss_virtual_dir_mtime_preserved_on_refresh() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    // Build a marker-less virtual dir by uploading a child object directly.
+    std::string local_file = join_paths(test_path_, "local_file");
+    create_random_file(local_file, 3);
+    auto parent_path = nodeid_to_path(parent);
+    int r = upload_file(local_file, join_paths(parent_path, "virtual_dir/f"),
+                        FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
+
+    uint64_t dir_id = 0;
+    struct stat st;
+    r = fs_->lookup(parent, "virtual_dir", &dir_id, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_id, 1));
+    time_t mtime_before = st.st_mtim.tv_sec;
+    ASSERT_GT(mtime_before, 0);
+
+    // Expire the creation-time attrs to force a backend refresh.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_EQ(fs_->getattr(dir_id, &st), 0);
+    ASSERT_EQ(st.st_mtim.tv_sec, mtime_before)
+        << "OSS dir mtime must not be overwritten by the backend refresh";
+  }
+
+  // stat does not know whether a path is a file or a dir in OSS, so it
+  // tries a file HEAD first and falls back to a list-based dir probe, which
+  // provides no mtime. So even for marker dirs, a backend refresh must keep
+  // the local mtime, no matter what happens to the marker object.
+  void verify_oss_marker_dir_mtime_preserved_on_refresh() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t dir_id = 0;
+    struct stat st;
+    int r = fs_->mkdir(parent, "marker_dir", 0755, 0, 0, 0, &dir_id, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_id, 1));
+    time_t mtime_created = st.st_mtim.tv_sec;
+
+    // Another client rewrites the marker object; the dir mtime must be
+    // unaffected since the backend provides no dir mtime.
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::string local_file = join_paths(test_path_, "marker_rewrite");
+    create_zero_file(local_file, 1);
+    auto parent_path = nodeid_to_path(parent);
+    ASSERT_EQ(upload_file(local_file, join_paths(parent_path, "marker_dir/"),
+                          FLAGS_oss_bucket_prefix),
+              0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_EQ(fs_->getattr(dir_id, &st), 0);
+    ASSERT_EQ(st.st_mtim.tv_sec, mtime_created)
+        << "OSS dir mtime must not be overwritten by the backend refresh";
+  }
 };
 
 TEST_F(Ossfs2BasicTest, verify_init) {
@@ -347,36 +404,20 @@ TEST_F(Ossfs2BasicTest, verify_init_prefetch_options) {
   verify_init_prefetch_options();
 }
 
-int main(int argc, char **arg) {
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = SIG_IGN;
-  sa.sa_flags = SA_SIGINFO;
+TEST_F(Ossfs2BasicTest, verify_oss_virtual_dir_mtime_preserved_on_refresh) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  init(opts);
+  verify_oss_virtual_dir_mtime_preserved_on_refresh();
+}
 
-  if (sigaction(SIGPIPE, &sa, NULL) == -1) {
-    perror("sigaction");
-    exit(EXIT_FAILURE);
-  }
-
-  if (!SSLProbe::setup_ssl_env()) {
-    LOG_WARN("Failed to get SSL certificate file");
-  }
-
-  ::testing::InitGoogleTest(&argc, arg);
-  gflags::ParseCommandLineFlags(&argc, &arg, true);
-
-  std::string config_file = FLAGS_config_file;
-  gflags::SetCommandLineOption("flagfile", config_file.c_str());
-
-  std::atomic<bool> stopped = {false};
-  std::thread signal_handler_thread([&stopped]() {
-    while (!stopped) {
-      sleep(1);
-    }
-  });
-
-  int r = RUN_ALL_TESTS();
-  stopped = true;
-  signal_handler_thread.join();
-  return r;
+TEST_F(Ossfs2BasicTest, verify_oss_marker_dir_mtime_preserved_on_refresh) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  init(opts);
+  verify_oss_marker_dir_mtime_preserved_on_refresh();
 }

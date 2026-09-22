@@ -16,34 +16,45 @@
 
 #include "disk_cache_env.h"
 
+#include <sys/file.h>
+
 #include <cstring>
+
+#include "common/utils.h"
 
 namespace OssFileSystem {
 
-static constexpr size_t kAlignment = 4096;
-
 int DiskCacheEnv::init() {
+  static constexpr size_t kAlignment = 4096;
   io_alloc = new AlignedAlloc(kAlignment);
   std::error_code ec;
-  const auto &dir = options.cache_dir;
-  // Create_directories returns false (not an error) if the dir exists.
-  std::filesystem::create_directories(dir, ec);
+  // cache-data/ holds the cached data; the lock file sits at the root.
+  data_dir = join_paths(options.cache_dir, kDiskCacheDataSubDir);
+  // Create_directories creates parents recursively and returns false (not an
+  // error) if the dir exists.
+  std::filesystem::create_directories(data_dir, ec);
   if (ec) {
-    LOG_ERROR("Failed to create cache dir `, error `", dir, ec.message());
+    LOG_ERROR("Failed to create cache data dir `, error `", data_dir,
+              ec.message());
+    return -1;
+  }
+
+  if (acquire_dir_exclusive_lock(options.cache_dir) != 0) {
     return -1;
   }
 
   auto local_fs =
-      photon::fs::new_localfs_adaptor(dir.c_str(), options.io_engine_type);
+      photon::fs::new_localfs_adaptor(data_dir.c_str(), options.io_engine_type);
   if (local_fs == nullptr) {
-    LOG_ERRNO_RETURN(0, -1, "Failed to new localfs adaptor for dir `", dir);
+    LOG_ERRNO_RETURN(0, -1, "Failed to new localfs adaptor for dir `",
+                     data_dir);
   }
   local_xattr_fs = dynamic_cast<photon::fs::IFileSystemXAttr *>(local_fs);
   RELEASE_ASSERT(local_xattr_fs != nullptr);
   if (!probe_xattr_support(local_fs, local_xattr_fs)) {
     delete local_xattr_fs;
     local_xattr_fs = nullptr;
-    LOG_ERRNO_RETURN(0, -1, "Failed to probe xattr support, dir `", dir);
+    LOG_ERRNO_RETURN(0, -1, "Failed to probe xattr support, dir `", data_dir);
   }
 
   local_fs = photon::fs::new_aligned_fs_adaptor(local_fs, kAlignment, true,
@@ -55,7 +66,8 @@ int DiskCacheEnv::init() {
   if (cache_fs == nullptr) {
     delete local_fs;
     local_xattr_fs = nullptr;
-    LOG_ERRNO_RETURN(0, -1, "Failed to new full file cached fs, dir `", dir);
+    LOG_ERRNO_RETURN(0, -1, "Failed to new full file cached fs, dir `",
+                     data_dir);
   }
   return 0;
 }
@@ -64,37 +76,80 @@ DiskCacheEnv::~DiskCacheEnv() {
   // Cache fs destructor: cache_fs → aligned_fs → local_fs(local_xattr_fs).
   delete cache_fs;
   delete io_alloc;
+  // Closing the fd releases the flock.
+  if (dir_lock_fd >= 0) {
+    ::close(dir_lock_fd);
+    dir_lock_fd = -1;
+  }
+}
+
+int DiskCacheEnv::acquire_dir_exclusive_lock(const std::string &dir) {
+  // The lock file sits at the cache dir root, outside cache-data, so the
+  // caching mechanism never cleans it up.
+  static constexpr const char *kDiskCacheLockFileName = ".ossfs2.lock";
+  const std::string lock_path = join_paths(dir, kDiskCacheLockFileName);
+  dir_lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+  if (dir_lock_fd < 0) {
+    if (errno == EACCES) {
+      LOG_ERRNO_RETURN(
+          0, -1,
+          "Failed to open disk cache lock file `, no write permission on "
+          "cache dir `",
+          lock_path, dir);
+    }
+    LOG_ERRNO_RETURN(0, -1, "Failed to open disk cache lock file `", lock_path);
+  }
+  if (::flock(dir_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+    // Best effort: read the holder pid recorded in the lock file. The kernel
+    // releases flock automatically when the holder exits (even abnormally),
+    // so the pid here is diagnostics only, never used for staleness checks.
+    int err = errno;
+    char buf[32] = {0};
+    ::pread(dir_lock_fd, buf, sizeof(buf) - 1, 0);
+    errno = err;
+    // clang-format off
+    LOG_ERRNO_RETURN(
+        0, -1,
+        "Failed to acquire exclusive lock on `, holder pid `, another instance may be using the same disk cache dir",
+        dir, trim_string_view(std::string_view(buf)));
+    // clang-format on
+  }
+  // Record our pid for diagnostics.
+  char pid_buf[32];
+  int len = snprintf(pid_buf, sizeof(pid_buf), "%d\n", getpid());
+  ::ftruncate(dir_lock_fd, 0);
+  if (::pwrite(dir_lock_fd, pid_buf, len, 0) != len) {
+    LOG_WARN("Failed to write pid into disk cache lock file");
+  }
+  LOG_DEBUG("Acquired exclusive lock on `", lock_path);
+  return 0;
 }
 
 bool DiskCacheEnv::probe_xattr_support(photon::fs::IFileSystem *fs,
                                        photon::fs::IFileSystemXAttr *xattr_fs) {
-  static constexpr const char *kProbeFile = "/tmp/.ossfs2_xattr_probe";
+  static constexpr const char *kProbeFile = "/.ossfs2_xattr_probe";
   static constexpr const char *kProbeXattrKey = "trusted.ossfs2.xattr_probe";
   static constexpr const char *kProbeXattrValue = "test/123_456";
 
   // Check if the probe file already exists before creating it.
-  std::string full_path = options.cache_dir + kProbeFile;
+  std::string full_path = data_dir + kProbeFile;
   bool file_existed = (::access(full_path.c_str(), F_OK) == 0);
-  int ret = fs->mkdir("/tmp", 0755);
-  if (ret != 0 && errno != EEXIST) {
-    LOG_ERRNO_RETURN(0, false, "Failed to mkdir `/tmp", options.cache_dir);
-  }
 
   auto file = fs->open(kProbeFile, O_CREAT | O_RDWR, 0644);
   if (file == nullptr) {
     LOG_ERRNO_RETURN(0, false, "Failed to create xattr probe file ` under `",
-                     kProbeFile, options.cache_dir);
+                     kProbeFile, data_dir);
   }
   // The file will be closed implicitly via `delete file`.
   delete file;
   // Only remove the probe file if it was newly created by us.
   DEFER(if (!file_existed) fs->unlink(kProbeFile));
 
-  ret = xattr_fs->setxattr(kProbeFile, kProbeXattrKey, kProbeXattrValue,
-                           strlen(kProbeXattrValue), 0);
+  int ret = xattr_fs->setxattr(kProbeFile, kProbeXattrKey, kProbeXattrValue,
+                               strlen(kProbeXattrValue), 0);
   if (ret != 0) {
     LOG_ERRNO_RETURN(0, false, "Failed to setxattr for ` under `", kProbeFile,
-                     options.cache_dir);
+                     data_dir);
   }
   return true;
 }

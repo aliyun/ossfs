@@ -789,7 +789,8 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
         ASSERT_TRUE(fs_->global_inodes_map_.find(nodeid) !=
                     fs_->global_inodes_map_.end());
         inode = static_cast<FileInode *>(fs_->global_inodes_map_[nodeid]);
-        ASSERT_EQ(inode->etag, "");
+        // create_and_flush may have landed the empty object and backfilled
+        // its etag already.
       }
 
       if (i == 0) {
@@ -808,9 +809,12 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
         }
       }
 
-      ASSERT_EQ(inode->etag, "");
+      // Release lands the data on the cloud and backfills the new etag.
+      std::string etag_before_release = inode->etag;
       r = fs_->release(nodeid, get_file_from_handle(handle));
       ASSERT_EQ(r, 0);
+      ASSERT_FALSE(inode->etag.empty());
+      ASSERT_NE(inode->etag, etag_before_release);
 
       // etag should be refresh
       r = fs_->getattr(nodeid, &st);
@@ -896,6 +900,231 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
       ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
       ASSERT_NE(old_etag, inode->etag);
       ASSERT_TRUE(inode->invalidate_data_cache);
+    }
+  }
+
+  // Etag + size decide when both sides carry an etag; otherwise fall back
+  // to size + mtime.
+  void verify_is_data_changed() {
+    struct timespec mtime {
+      100, 200
+    };
+    FileInode inode(2, "f", 1024, mtime, InodeType::kFile, false, 1, nullptr,
+                    "\"etag-a\"");
+
+    struct stat stbuf = {};
+    stbuf.st_size = 1024;
+    stbuf.st_mtim.tv_sec = 100;
+    stbuf.st_mtim.tv_nsec = 200;
+
+    // Both etags present: etag + size decide, mtime drift is ignored.
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    stbuf.st_mtim.tv_sec = 999;
+    stbuf.st_mtim.tv_nsec = 1;
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, "\"etag-a\""))
+        << "mtime drift must not invalidate when etags match";
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-b\""));
+    stbuf.st_size = 2048;
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    stbuf.st_size = 1024;
+    stbuf.st_mtim.tv_sec = 100;
+    stbuf.st_mtim.tv_nsec = 200;
+
+    // Local etag cleared (HDFS, failed or deferred upload): size + mtime.
+    inode.etag.clear();
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    stbuf.st_mtim.tv_nsec = 201;
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    stbuf.st_mtim.tv_nsec = 200;
+    stbuf.st_size = 512;
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    stbuf.st_size = 1024;
+
+    // Remote without etag (HDFS backend) falls back the same way.
+    inode.etag = "\"etag-a\"";
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, ""));
+    stbuf.st_mtim.tv_sec = 101;
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, ""));
+  }
+
+  // A flushed write backfills the etag so a reopen keeps the page cache;
+  // an external overwrite or truncate(0) still invalidates it on reopen.
+  void verify_page_cache_retention_after_write() {
+    auto add_dquo = [](const std::string &s) { return "\"" + s + "\""; };
+
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    auto parent_path = nodeid_to_path(parent);
+    bool appendable_mode =
+        fs_->write_mode() == OssFileSystem::WriteMode::Appendable;
+    struct stat st;
+
+    // 1. Flush backfills the etag (put_object and multipart paths), and the
+    //    following reopen must keep the page cache.
+    for (int i = 0; i < 2; i++) {
+      uint64_t nodeid = 0;
+      void *handle = nullptr;
+      std::string filename = "pc_retain_" + std::to_string(i);
+      int r = create_and_flush(parent, filename.c_str(), CREATE_BASE_FLAGS,
+                               0777, 0, 0, 0, &nodeid, &st, &handle);
+      ASSERT_EQ(r, 0);
+      DEFER(fs_->forget(nodeid, 1));
+
+      std::string data = random_string(11);
+      if (i == 1) {
+        data = random_string(2 * 1024 * 1024);  // > 1 MiB upload buffer
+      }
+      ssize_t w = write_to_file_handle(handle, data.c_str(), data.size(), 0);
+      ASSERT_EQ(w, static_cast<ssize_t>(data.size()));
+
+      r = fs_->release(nodeid, get_file_from_handle(handle));
+      ASSERT_EQ(r, 0);
+
+      FileInode *inode = nullptr;
+      {
+        std::lock_guard<std::mutex> l(fs_->inodes_map_lck_);
+        ASSERT_TRUE(fs_->global_inodes_map_.find(nodeid) !=
+                    fs_->global_inodes_map_.end());
+        inode = static_cast<FileInode *>(fs_->global_inodes_map_[nodeid]);
+        ASSERT_FALSE(inode->etag.empty())
+            << "flush must backfill the etag of the landed object";
+        ASSERT_FALSE(inode->invalidate_data_cache)
+            << "backfilled etag must keep the page cache on mark_clean";
+      }
+
+      auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
+      if (!appendable_mode) {
+        ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
+      } else if (inode->etag != add_dquo(meta["Etag"])) {
+        // AppendObject's response etag may differ from HeadObject's; retention
+        // then degrades to per-open invalidation, not a correctness issue.
+        LOG_WARN("appendable etag mismatch, response: `, head: `", inode->etag,
+                 meta["Etag"]);
+        continue;
+      }
+
+      void *rhandle = nullptr;
+      bool keep_cache = false;
+      r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_cache);
+      ASSERT_EQ(r, 0);
+      EXPECT_TRUE(keep_cache) << "reopen after write must keep page cache";
+      r = fs_->release(nodeid, get_file_from_handle(rhandle));
+      ASSERT_EQ(r, 0);
+    }
+
+    // 2. External overwrite: reopen must drop the cache and serve new data.
+    {
+      uint64_t nodeid = 0;
+      void *handle = nullptr;
+      std::string filename = "pc_retain_external";
+      int r = create_and_flush(parent, filename.c_str(), CREATE_BASE_FLAGS,
+                               0777, 0, 0, 0, &nodeid, &st, &handle);
+      ASSERT_EQ(r, 0);
+      DEFER(fs_->forget(nodeid, 1));
+
+      std::string data = random_string(4096);
+      ssize_t w = write_to_file_handle(handle, data.c_str(), data.size(), 0);
+      ASSERT_EQ(w, static_cast<ssize_t>(data.size()));
+      r = fs_->release(nodeid, get_file_from_handle(handle));
+      ASSERT_EQ(r, 0);
+
+      FileInode *inode = nullptr;
+      {
+        std::lock_guard<std::mutex> l(fs_->inodes_map_lck_);
+        inode = static_cast<FileInode *>(fs_->global_inodes_map_[nodeid]);
+      }
+      std::string old_etag = inode->etag;
+      ASSERT_FALSE(old_etag.empty());
+
+      std::string local_file = join_paths(test_path_, "pc_external_src");
+      create_random_file(local_file, 3);
+      r = upload_file(local_file, join_paths(parent_path, filename),
+                      FLAGS_oss_bucket_prefix);
+      ASSERT_EQ(r, 0);
+
+      void *rhandle = nullptr;
+      bool keep_cache = true;
+      r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_cache);
+      ASSERT_EQ(r, 0);
+      EXPECT_FALSE(keep_cache)
+          << "external overwrite must invalidate the page cache";
+
+      auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
+      ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
+      ASSERT_NE(inode->etag, old_etag);
+
+      size_t new_size = std::stoull(meta["Content-Length"]);
+      std::string got(new_size, '\0');
+      ssize_t n = read_from_handle(rhandle, got.data(), new_size, 0);
+      ASSERT_EQ(n, static_cast<ssize_t>(new_size));
+      std::ifstream rf(local_file);
+      std::string want(new_size, '\0');
+      rf.read(want.data(), new_size);
+      ASSERT_EQ(got, want) << "reopen must serve the new remote content";
+
+      r = fs_->release(nodeid, get_file_from_handle(rhandle));
+      ASSERT_EQ(r, 0);
+
+      // Etag synced with the remote, the next reopen is retained again.
+      rhandle = nullptr;
+      keep_cache = false;
+      r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_cache);
+      ASSERT_EQ(r, 0);
+      EXPECT_TRUE(keep_cache);
+      r = fs_->release(nodeid, get_file_from_handle(rhandle));
+      ASSERT_EQ(r, 0);
+    }
+
+    // 3. truncate(0) backfills the empty-object etag; the first reopen drops
+    //    the stale cache, the next one keeps it.
+    {
+      uint64_t nodeid = 0;
+      void *handle = nullptr;
+      std::string filename = "pc_retain_trunc";
+      int r = create_and_flush(parent, filename.c_str(), CREATE_BASE_FLAGS,
+                               0777, 0, 0, 0, &nodeid, &st, &handle);
+      ASSERT_EQ(r, 0);
+      DEFER(fs_->forget(nodeid, 1));
+
+      std::string data = random_string(4096);
+      ssize_t w = write_to_file_handle(handle, data.c_str(), data.size(), 0);
+      ASSERT_EQ(w, static_cast<ssize_t>(data.size()));
+      r = fs_->release(nodeid, get_file_from_handle(handle));
+      ASSERT_EQ(r, 0);
+
+      FileInode *inode = nullptr;
+      {
+        std::lock_guard<std::mutex> l(fs_->inodes_map_lck_);
+        inode = static_cast<FileInode *>(fs_->global_inodes_map_[nodeid]);
+      }
+
+      r = fs_->getattr(nodeid, &st);
+      ASSERT_EQ(r, 0);
+      st.st_size = 0;
+      r = fs_->setattr(nodeid, &st, FUSE_SET_ATTR_SIZE);
+      ASSERT_EQ(r, 0);
+
+      auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
+      ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]))
+          << "truncate(0) must backfill the empty object etag";
+      ASSERT_TRUE(inode->invalidate_data_cache);
+
+      void *rhandle = nullptr;
+      bool keep_cache = true;
+      r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_cache);
+      ASSERT_EQ(r, 0);
+      EXPECT_FALSE(keep_cache) << "first reopen after truncate must drop";
+      r = fs_->release(nodeid, get_file_from_handle(rhandle));
+      ASSERT_EQ(r, 0);
+
+      rhandle = nullptr;
+      keep_cache = false;
+      r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_cache);
+      ASSERT_EQ(r, 0);
+      EXPECT_TRUE(keep_cache)
+          << "etag of the empty object must retain the cache afterwards";
+      r = fs_->release(nodeid, get_file_from_handle(rhandle));
+      ASSERT_EQ(r, 0);
     }
   }
 
@@ -1641,6 +1870,31 @@ TEST_F(Ossfs2InodeTest, verify_etag) {
   opts.attr_timeout = 3;
   init(opts);
   verify_etag();
+}
+
+TEST_F(Ossfs2InodeTest, verify_is_data_changed) {
+  verify_is_data_changed();
+}
+
+TEST_F(Ossfs2InodeTest, verify_page_cache_retention_after_write) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.close_to_open = true;
+  opts.upload_buffer_size = 1048576;
+  init(opts);
+  verify_page_cache_retention_after_write();
+}
+
+TEST_F(Ossfs2InodeTest, verify_page_cache_retention_after_write_appendable) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.close_to_open = true;
+  opts.enable_appendable_object = true;
+  opts.upload_buffer_size = 1048576;
+  init(opts);
+  verify_page_cache_retention_after_write();
 }
 
 TEST_F(Ossfs2InodeTest, verify_remote_inode_type_change) {

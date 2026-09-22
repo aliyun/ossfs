@@ -1499,37 +1499,9 @@ class Ossfs2HdfsReadWriteTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
   }
 
-  // Stale inode close: unlink while open, then close with FI close fail.
-  // When inode is stale, close error should be ignored (ret = 0).
-  void verify_close_stale_inode_ignores_error() {
-    uint64_t parent = get_test_dir_parent();
-    DEFER(fs_->forget(parent, 1));
-    uint64_t nodeid = 0;
-    void *handle = nullptr;
-    create_fi_test_file(parent, "stale_close", nodeid, handle);
-    DEFER(fs_->forget(nodeid, 1));
-
-    auto file = get_file_from_handle(handle);
-    const char *data = "stale_test";
-    ssize_t w = file->pwrite(data, strlen(data), 0);
-    ASSERT_EQ(w, (ssize_t)strlen(data));
-
-    // Unlink the file to mark inode as stale.
-    int r = fs_->unlink(parent, "stale_close");
-    ASSERT_EQ(r, 0);
-
-    // Inject close failure. Since inode is stale, error should be ignored.
-    g_fault_injector->set_injection(FI_HdfsClose_WriterFail,
-                                    FaultInjection(/*run_count=*/1));
-    DEFER(g_fault_injector->clear_injection(FI_HdfsClose_WriterFail));
-
-    // Release should succeed because stale inode ignores close error.
-    r = fs_->release(nodeid, file);
-    ASSERT_EQ(r, 0);
-  }
-
-  // Stale inode fdatasync: unlink while open, then fsync should skip flush.
-  void verify_fdatasync_stale_inode_skips_flush() {
+  // Hidden inode fdatasync: unlink while open hides the file; fsync flushes
+  // normally and returns 0, and the hidden object is deleted on release.
+  void verify_fdatasync_hidden_inode_succeeds() {
     uint64_t parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
     uint64_t nodeid = 0;
@@ -1542,16 +1514,19 @@ class Ossfs2HdfsReadWriteTest : public OssHdfsTestSuite {
     ssize_t w = file->pwrite(data, strlen(data), 0);
     ASSERT_EQ(w, (ssize_t)strlen(data));
 
-    // Unlink to mark inode as stale.
+    // Unlink while open: the file is hidden, not deleted.
     int r = fs_->unlink(parent, "stale_fsync");
     ASSERT_EQ(r, 0);
+    auto *inode = static_cast<FileInode *>(file->get_inode());
+    ASSERT_TRUE(inode->is_hidden);
 
-    // fsync on stale inode should skip flush and return 0.
+    // fsync on the hidden file flushes and succeeds.
     r = fs_->fsync(nodeid, handle, false);
     ASSERT_EQ(r, 0);
 
     r = fs_->release(nodeid, file);
     ASSERT_EQ(r, 0);
+    ASSERT_TRUE(inode->is_stale);
   }
 
   // Idle writer close failure: open O_WRONLY without writing, close should
@@ -1835,18 +1810,11 @@ TEST_F(Ossfs2HdfsReadWriteTest, verify_pwrite_seek_fail) {
   verify_pwrite_seek_fail();
 }
 
-TEST_F(Ossfs2HdfsReadWriteTest, verify_close_stale_inode_ignores_error) {
+TEST_F(Ossfs2HdfsReadWriteTest, verify_fdatasync_hidden_inode_succeeds) {
   INIT_PHOTON();
   OssFsOptions opts;
   init(opts);
-  verify_close_stale_inode_ignores_error();
-}
-
-TEST_F(Ossfs2HdfsReadWriteTest, verify_fdatasync_stale_inode_skips_flush) {
-  INIT_PHOTON();
-  OssFsOptions opts;
-  init(opts);
-  verify_fdatasync_stale_inode_skips_flush();
+  verify_fdatasync_hidden_inode_succeeds();
 }
 
 TEST_F(Ossfs2HdfsReadWriteTest, verify_close_idle_writer_fail) {

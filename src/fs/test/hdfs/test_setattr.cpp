@@ -14,9 +14,18 @@
  * limitations under the License.
  */
 
+#include <thread>
+
 #include "common/fault_injector.h"
 #include "fs/test/test_suite.h"
 #include "oss/oss_hdfs_store.h"
+
+namespace {
+// Login user absent from both the FI mapping table and the local NSS, so the
+// backend cannot map the owner/group of new files and returns the reserved
+// unresolved uid/gid.
+constexpr const char kUnresolvableOwner[] = "gtest_unresolvable_owner";
+}  // namespace
 
 class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
  protected:
@@ -45,11 +54,25 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
   }
 
   void TearDown() override {
-    if (g_fault_injector)
+    if (g_fault_injector) {
       g_fault_injector->clear_injection(FI_Hdfs_UserGroup_Mapping);
+      g_fault_injector->clear_injection(FI_Hdfs_LoginUser_Override);
+    }
+    g_test_hdfs_login_user.clear();
     g_test_user_mapping = {};
     OssHdfsTestSuite::TearDown();
   }
+
+  // Connect as a user that cannot be resolved locally, so every file the
+  // backend reports carries the reserved unresolved uid/gid. Deliberately not
+  // added to g_test_user_mapping, which would resolve it.
+  void connect_as_unresolvable_owner() {
+    g_test_hdfs_login_user = kUnresolvableOwner;
+    if (g_fault_injector)
+      g_fault_injector->set_injection(FI_Hdfs_LoginUser_Override,
+                                      FaultInjection());
+  }
+
   // Helper to create a file and return nodeid + handle.
   void create_test_file(uint64_t parent, const char *name, uint64_t &nodeid,
                         void *&handle) {
@@ -252,6 +275,180 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
 
     r = fs_->release(nodeid, file);
     ASSERT_EQ(r, 0);
+  }
+
+  // chmod on an open dirty file must not shrink the locally cached size:
+  // setattr's backend refresh must not roll back the deferred size.
+  void verify_setattr_mode_on_dirty_file_keeps_size() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "dirty_chmod", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto *file = get_file_from_handle(handle);
+    const size_t buf_size = 8192;
+    char buf[buf_size];
+    memset(buf, 'D', buf_size);
+    ssize_t w = file->pwrite(buf, buf_size, 0);
+    ASSERT_EQ(w, (ssize_t)buf_size);
+
+    struct stat st_before;
+    ASSERT_EQ(fs_->getattr(nodeid, &st_before), 0);
+    ASSERT_EQ(st_before.st_size, (off_t)0);
+
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    st.st_mode = 0600;
+    int r = fs_->setattr(nodeid, &st, FUSE_SET_ATTR_MODE);
+    ASSERT_EQ(r, 0);
+
+    struct stat st_mid;
+    ASSERT_EQ(fs_->getattr(nodeid, &st_mid), 0);
+    EXPECT_EQ(st_mid.st_mode & 07777, (mode_t)0600);
+    EXPECT_EQ(st_mid.st_size, (off_t)0);
+
+    ASSERT_EQ(file->fdatasync(), 0);
+    struct stat st_after;
+    ASSERT_EQ(fs_->getattr(nodeid, &st_after), 0);
+    ASSERT_EQ(st_after.st_size, (off_t)buf_size);
+
+    st.st_mode = 0640;
+    r = fs_->setattr(nodeid, &st, FUSE_SET_ATTR_MODE);
+    ASSERT_EQ(r, 0);
+
+    struct stat st_final;
+    ASSERT_EQ(fs_->getattr(nodeid, &st_final), 0);
+    EXPECT_EQ(st_final.st_mode & 07777, (mode_t)0640);
+    EXPECT_EQ(st_final.st_size, (off_t)buf_size)
+        << "setattr refresh shrank committed size of a dirty open file";
+
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+  }
+
+  // After fdatasync (stream flush), the uncommitted write must become
+  // visible to backend readers and to backend stat.
+  void verify_fsync_makes_write_visible() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "fsync_visible", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto *file = get_file_from_handle(handle);
+    const size_t buf_size = 8192;
+    char buf[buf_size];
+    memset(buf, 'V', buf_size);
+    ASSERT_EQ(file->pwrite(buf, buf_size, 0), (ssize_t)buf_size);
+
+    ASSERT_EQ(file->fdatasync(), 0);
+
+    int64_t backend_size = -1;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(
+                  hdfs_helper_->full_uri(nodeid_to_path(nodeid)), backend_size),
+              0);
+    EXPECT_EQ(backend_size, (int64_t)buf_size)
+        << "backend size not visible after fdatasync";
+
+    void *read_handle = nullptr;
+    bool keep_cache = false;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &read_handle, &keep_cache), 0);
+    auto *reader = get_file_from_handle(read_handle);
+
+    char rbuf[buf_size];
+    ssize_t rd = reader->pread(rbuf, buf_size, 0);
+    EXPECT_EQ(rd, (ssize_t)buf_size)
+        << "flushed data not visible to backend reader before close";
+    if (rd == (ssize_t)buf_size) {
+      EXPECT_EQ(memcmp(rbuf, buf, buf_size), 0);
+    }
+
+    ASSERT_EQ(fs_->release(nodeid, reader), 0);
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+  }
+
+  // Before flush/close, an uncommitted write must be invisible: backend
+  // stat reports the old size, local getattr matches it, and a second
+  // read-only handle reads no data. fdatasync makes size and data visible.
+  void verify_size_deferred_until_flush() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "deferred_size", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto *file = get_file_from_handle(handle);
+    const size_t buf_size = 8192;
+    char buf[buf_size];
+    memset(buf, 'Z', buf_size);
+    ASSERT_EQ(file->pwrite(buf, buf_size, 0), (ssize_t)buf_size);
+
+    int64_t backend_size = -1;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(
+                  hdfs_helper_->full_uri(nodeid_to_path(nodeid)), backend_size),
+              0);
+    EXPECT_EQ(backend_size, (int64_t)0)
+        << "uncommitted write visible in backend stat";
+
+    struct stat st;
+    ASSERT_EQ(fs_->getattr(nodeid, &st), 0);
+    EXPECT_EQ(st.st_size, (off_t)0);
+
+    void *read_handle = nullptr;
+    bool keep_cache = false;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &read_handle, &keep_cache), 0);
+    auto *reader = get_file_from_handle(read_handle);
+    char rbuf[buf_size];
+    EXPECT_EQ(reader->pread(rbuf, buf_size, 0), (ssize_t)0)
+        << "uncommitted write visible to a new reader";
+    ASSERT_EQ(fs_->release(nodeid, reader), 0);
+
+    ASSERT_EQ(file->fdatasync(), 0);
+    ASSERT_EQ(fs_->getattr(nodeid, &st), 0);
+    EXPECT_EQ(st.st_size, (off_t)buf_size);
+    ASSERT_EQ(hdfs_helper_->stat_file_size(
+                  hdfs_helper_->full_uri(nodeid_to_path(nodeid)), backend_size),
+              0);
+    EXPECT_EQ(backend_size, (int64_t)buf_size);
+
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+  }
+
+  // Closing a dirty file without fsync flushes the writer and commits the
+  // written size.
+  void verify_size_committed_on_close() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "close_commit", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto *file = get_file_from_handle(handle);
+    const size_t buf_size = 8192;
+    char buf[buf_size];
+    memset(buf, 'C', buf_size);
+    ASSERT_EQ(file->pwrite(buf, buf_size, 0), (ssize_t)buf_size);
+
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+
+    struct stat st;
+    ASSERT_EQ(fs_->getattr(nodeid, &st), 0);
+    EXPECT_EQ(st.st_size, (off_t)buf_size);
+
+    int64_t backend_size = -1;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(
+                  hdfs_helper_->full_uri(nodeid_to_path(nodeid)), backend_size),
+              0);
+    EXPECT_EQ(backend_size, (int64_t)buf_size);
   }
 
   // setattr: combined mode + uid + gid.
@@ -643,6 +840,105 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
   }
 
+  // access() checks against the attr reported by the backend, which still
+  // holds the reserved unresolved uid/gid. It must resolve them to the caller
+  // before checking, otherwise the caller is treated as a stranger and group
+  // bits are dropped.
+  void verify_access_unresolved_uid_gid() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "access_unresolved", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+    ASSERT_EQ(fs_->release(nodeid, get_file_from_handle(handle)), 0);
+
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    ASSERT_EQ(fs_->getattr(nodeid, &st), 0);
+    ASSERT_EQ(st.st_uid, kReservedUnresolvedUid);
+    ASSERT_EQ(st.st_gid, kReservedUnresolvedGid);
+
+    // Group-only mode: the reserved gid resolves to the caller's gid, so the
+    // caller counts as a group member and R_OK passes while W_OK still fails.
+    memset(&st, 0, sizeof(st));
+    st.st_mode = 0040;
+    ASSERT_EQ(fs_->setattr(nodeid, &st, FUSE_SET_ATTR_MODE), 0);
+    ASSERT_EQ(fs_->access(nodeid, R_OK, 1000, 2000), 0);
+    ASSERT_EQ(fs_->access(nodeid, W_OK, 1000, 2000), -EACCES);
+  }
+
+  // Sweeps every front-end path that resolves the reserved uid/gid before a
+  // local permission check: access(), the check_permission() branches reached
+  // by chmod / ftruncate / truncate / unlink, and the utimensat owner gate.
+  // Without the resolve the caller is a stranger to its own file: chmod and
+  // utimensat return -EPERM, truncate and ftruncate -EACCES, and access and
+  // unlink lose the group bits.
+  void verify_check_permission_unresolved_uid_gid() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "perm_unresolved", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+    auto file = get_file_from_handle(handle);
+
+    // creat() seeds the inode with the caller's ids; refresh from the backend
+    // so it carries the reserved ones, as lookup()/readdir() would.
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    ASSERT_EQ(fs_->getattr(nodeid, &st), 0);
+    ASSERT_EQ(st.st_uid, kReservedUnresolvedUid);
+    ASSERT_EQ(st.st_gid, kReservedUnresolvedGid);
+
+    // chmod: PermOp::Chmod. Group-writable, so the access() and unlink() checks
+    // below have group bits to grant.
+    memset(&st, 0, sizeof(st));
+    st.st_mode = 0660;
+    ASSERT_EQ(
+        fs_->setattr(nodeid, &st, FUSE_SET_ATTR_MODE, nullptr, 1000, 1000), 0);
+    // The resolve is caller-local: the reply and the inode keep the reserved
+    // ids reported by the backend.
+    ASSERT_EQ(st.st_uid, kReservedUnresolvedUid);
+    ASSERT_EQ(st.st_gid, kReservedUnresolvedGid);
+
+    // access(): the reserved gid resolves to the caller's, so the caller counts
+    // as a group member instead of falling back to the empty other bits.
+    ASSERT_EQ(fs_->access(nodeid, R_OK, 1000, 1000), 0);
+    ASSERT_EQ(fs_->access(nodeid, W_OK, 1000, 1000), 0);
+
+    // utimensat with explicit times: the owner gate in do_hdfs_setattr_times().
+    memset(&st, 0, sizeof(st));
+    st.st_atim.tv_sec = 1577836800;
+    st.st_mtim.tv_sec = 1577836800;
+    ASSERT_EQ(
+        fs_->setattr(nodeid, &st, FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME,
+                     nullptr, 1000, 1000),
+        0);
+
+    // ftruncate: PermOp::Ftruncate, the setattr(SIZE) branch with a handle.
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(handle);
+    memset(&st, 0, sizeof(st));
+    st.st_size = 0;
+    ASSERT_EQ(fs_->setattr(nodeid, &st, FUSE_SET_ATTR_SIZE, &fi, 1000, 1000),
+              0);
+
+    // truncate: PermOp::Truncate, the setattr(SIZE) branch without a handle.
+    memset(&st, 0, sizeof(st));
+    st.st_size = 0;
+    ASSERT_EQ(
+        fs_->setattr(nodeid, &st, FUSE_SET_ATTR_SIZE, nullptr, 1000, 1000), 0);
+
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+
+    // unlink: PermOp::Unlink, which delegates to check_hdfs_access(W_OK).
+    ASSERT_EQ(fs_->unlink(parent, "perm_unresolved", 1000, 1000), 0);
+  }
+
   // set_permission backend failure via FI.
   void verify_set_permission_fail() {
     uint64_t parent = get_test_dir_parent();
@@ -754,8 +1050,6 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
   }
 
-  // check_access: aligned with jindo-fuse which only checks group+other bits
-  // (owner bits are skipped due to unreliable uid mapping).
   void verify_access_owner_branch() {
     uint64_t parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
@@ -767,8 +1061,6 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
 
     struct stat st;
     memset(&st, 0, sizeof(st));
-    // Use mode with other-read bit so check_hdfs_access can verify via
-    // the other branch (owner bits are not checked, per jindo-fuse design).
     st.st_uid = 1000;
     st.st_mode = 0704;
     int r = fs_->setattr(nodeid, &st, FUSE_SET_ATTR_UID | FUSE_SET_ATTR_MODE);
@@ -783,99 +1075,6 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
     // Non-owner, non-group also gets R_OK via other bit.
     r = fs_->access(nodeid, R_OK, 2000, 2000);
     ASSERT_EQ(r, 0);
-  }
-
-  // check_permission(Unlink): owner with W_OK should succeed.
-  void verify_unlink_permission_owner() {
-    uint64_t parent = get_test_dir_parent();
-    DEFER(fs_->forget(parent, 1));
-
-    uint64_t nodeid = 0;
-    void *handle = nullptr;
-    create_test_file(parent, "unlink_perm_owner", nodeid, handle);
-    DEFER(fs_->forget(nodeid, 1));
-    if (handle) fs_->release(nodeid, get_file_from_handle(handle));
-
-    // Set file owner to uid=1000, mode=0700 (owner rwx).
-    struct stat st;
-    memset(&st, 0, sizeof(st));
-    st.st_uid = 1000;
-    st.st_mode = 0700;
-    fs_->setattr(nodeid, &st, FUSE_SET_ATTR_UID | FUSE_SET_ATTR_MODE);
-
-    // Unlink as owner (uid=1000) with W_OK → should succeed.
-    int r = fs_->unlink(parent, "unlink_perm_owner");
-    // Note: unlink is called on parent dir entry, not file.
-    // The check_permission(Unlink) is called with the file's stat.
-    // Here we just verify the unlink call itself works.
-    ASSERT_EQ(r, 0);
-  }
-
-  // check_permission(Utimensat): non-root, non-owner, group match → W_OK check.
-  void verify_utimensat_group_branch() {
-    uint64_t parent = get_test_dir_parent();
-    DEFER(fs_->forget(parent, 1));
-
-    uint64_t nodeid = 0;
-    void *handle = nullptr;
-    create_test_file(parent, "utimensat_grp", nodeid, handle);
-    DEFER(fs_->forget(nodeid, 1));
-    if (handle) fs_->release(nodeid, get_file_from_handle(handle));
-
-    // Set file uid=500, gid=1000, mode=0070 (group rwx).
-    struct stat st;
-    memset(&st, 0, sizeof(st));
-    st.st_uid = 500;
-    st.st_gid = 1000;
-    st.st_mode = 0070;
-    fs_->setattr(nodeid, &st,
-                 FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_MODE);
-
-    // Caller: uid=2000, gid=1000.
-    // uid!=0, uid!=file_uid(500) → enter permission check.
-    // atime_now && mtime_now → check_permission(Utimensat)
-    // → check_posix_access(W_OK, uid=2000, gid=1000)
-    // → gid==file_gid(1000) → check W_OK against S_IWGRP (0070 has S_IWGRP) →
-    // OK.
-    memset(&st, 0, sizeof(st));
-    int r = fs_->setattr(nodeid, &st,
-                         FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_ATIME_NOW |
-                             FUSE_SET_ATTR_MTIME | FUSE_SET_ATTR_MTIME_NOW,
-                         nullptr, 2000, 1000);
-    ASSERT_EQ(r, 0);  // group has W_OK → allowed
-  }
-
-  // check_permission(Utimensat): non-root, non-owner, no group match, no W_OK.
-  void verify_utimensat_other_denied() {
-    uint64_t parent = get_test_dir_parent();
-    DEFER(fs_->forget(parent, 1));
-
-    uint64_t nodeid = 0;
-    void *handle = nullptr;
-    create_test_file(parent, "utimensat_deny", nodeid, handle);
-    DEFER(fs_->forget(nodeid, 1));
-    if (handle) fs_->release(nodeid, get_file_from_handle(handle));
-
-    // Set file uid=500, gid=500, mode=0070 (group rwx, other no perm).
-    struct stat st;
-    memset(&st, 0, sizeof(st));
-    st.st_uid = 500;
-    st.st_gid = 500;
-    st.st_mode = 0070;
-    fs_->setattr(nodeid, &st,
-                 FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_MODE);
-
-    // Caller: uid=2000, gid=2000.
-    // uid!=0, uid!=file_uid(500), gid!=file_gid(500) → other branch.
-    // atime_now && mtime_now → check_permission(Utimensat)
-    // → check_posix_access(W_OK, uid=2000, gid=2000)
-    // → other has no W_OK (mode 0070) → denied.
-    memset(&st, 0, sizeof(st));
-    int r = fs_->setattr(nodeid, &st,
-                         FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_ATIME_NOW |
-                             FUSE_SET_ATTR_MTIME | FUSE_SET_ATTR_MTIME_NOW,
-                         nullptr, 2000, 2000);
-    ASSERT_EQ(r, -EACCES);  // other has no W_OK → denied
   }
 
   // === Backend persistence verification ===
@@ -1088,6 +1287,62 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
     r = fs_->release(nodeid, get_file_from_handle(handle));
     ASSERT_EQ(r, 0);
   }
+
+  // After a backend refresh of a dir's attrs, getattr within attr_timeout
+  // must be served from the local cache without touching the backend.
+  void verify_dir_attr_cached_within_timeout() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t dir_id = 0;
+    struct stat st;
+    int r = fs_->mkdir(parent, "attr_cache_dir", 0755, 0, 0, 0, &dir_id, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_id, 1));
+
+    // Expire the creation-time attrs, then refresh from the backend.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_EQ(fs_->getattr(dir_id, &st), 0);
+
+    // Backend stat now fails: getattr within attr_timeout must hit the
+    // refreshed local cache instead of the backend.
+    ASSERT_NE(g_fault_injector, nullptr);
+    g_fault_injector->set_injection(FI_OssError_Failed_Without_Call);
+    DEFER(g_fault_injector->clear_injection(FI_OssError_Failed_Without_Call));
+
+    struct stat st2;
+    ASSERT_EQ(fs_->getattr(dir_id, &st2), 0);
+    // Cached attrs must be returned unchanged.
+    ASSERT_EQ(st2.st_mtim.tv_sec, st.st_mtim.tv_sec);
+    ASSERT_EQ(st2.st_mtim.tv_nsec, st.st_mtim.tv_nsec);
+  }
+
+  // HDFS dirs are real objects: their mtime must follow backend changes
+  // made by other clients.
+  void verify_dir_mtime_follows_backend() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t dir_id = 0;
+    struct stat st;
+    int r = fs_->mkdir(parent, "mtime_dir", 0755, 0, 0, 0, &dir_id, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_id, 1));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_EQ(fs_->getattr(dir_id, &st), 0);
+    time_t mtime_before = st.st_mtim.tv_sec;
+
+    // Another client creates a subdir, bumping the dir mtime on the
+    // NameNode.
+    std::string dir_uri = hdfs_helper_->full_uri(nodeid_to_path(dir_id));
+    ASSERT_EQ(hdfs_helper_->create_dir(join_paths(dir_uri, "child_dir")), 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_EQ(fs_->getattr(dir_id, &st), 0);
+    ASSERT_GT(st.st_mtim.tv_sec, mtime_before)
+        << "dir mtime was not refreshed from the backend";
+  }
 };
 
 TEST_F(Ossfs2HdfsSetattrTest, verify_setattr_mode) {
@@ -1123,6 +1378,34 @@ TEST_F(Ossfs2HdfsSetattrTest, verify_setattr_size_nonzero) {
   OssFsOptions opts;
   init(opts);
   verify_setattr_size_nonzero();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_setattr_mode_on_dirty_file_keeps_size) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_setattr_mode_on_dirty_file_keeps_size();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_fsync_makes_write_visible) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_fsync_makes_write_visible();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_size_deferred_until_flush) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_size_deferred_until_flush();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_size_committed_on_close) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_size_committed_on_close();
 }
 
 TEST_F(Ossfs2HdfsSetattrTest, verify_setattr_combined) {
@@ -1331,4 +1614,38 @@ TEST_F(Ossfs2HdfsSetattrTest, verify_chown_unresolvable_uid_gid) {
   OssFsOptions opts;
   init(opts);
   verify_chown_unresolvable_uid_gid();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_access_unresolved_uid_gid) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 0;
+  connect_as_unresolvable_owner();
+  init(opts);
+  verify_access_unresolved_uid_gid();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_check_permission_unresolved_uid_gid) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 0;
+  connect_as_unresolvable_owner();
+  init(opts);
+  verify_check_permission_unresolved_uid_gid();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_dir_attr_cached_within_timeout) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  init(opts);
+  verify_dir_attr_cached_within_timeout();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_dir_mtime_follows_backend) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.attr_timeout = 1;
+  init(opts);
+  verify_dir_mtime_follows_backend();
 }

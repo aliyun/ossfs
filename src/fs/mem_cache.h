@@ -29,6 +29,7 @@
 #include "mem_pool.h"
 
 class BlockCacheStoreTest;
+class BlockCacheTest;
 
 namespace OssFileSystem {
 
@@ -91,7 +92,10 @@ struct BlockCacheHandle;
 
 class BlockCacheStore : public ICacheStore {
  public:
-  BlockCacheStore(uint64_t block_size = 1048576) : block_size_(block_size) {
+  // The identity is copied from the etag component of key; the block cache
+  // only tracks the etag.
+  BlockCacheStore(uint64_t block_size, const CacheKey &key)
+      : block_size_(block_size), current_etag_(key.etag) {
     meta_store_ = std::make_unique<MetaStore>(this);
   }
 
@@ -147,13 +151,7 @@ class BlockCacheStore : public ICacheStore {
     retention_manager_.remove_range(h);
   }
 
-  // Drop all existing cache blocks by incrementing the generation number,
-  // Blocks are not keyed by object key/etag, so parameters are unused;
-  // drop just bumps the generation to invalidate cached block refs.
-  void drop(std::string_view /* object_key */, std::string_view /* etag */,
-            size_t /* size */) override {
-    increment_generation();
-  }
+  void drop(const CacheKey &key, bool force = true) override;
 
  private:
   struct RetentionManager {
@@ -193,6 +191,7 @@ class BlockCacheStore : public ICacheStore {
     uint64_t generation_ = 1;
 
     friend class BlockCacheStore;
+    friend class ::BlockCacheTest;
   };
 
   class BlockPool {
@@ -220,8 +219,6 @@ class BlockCacheStore : public ICacheStore {
   int alloc_block(BlockInfo **info);
   void rollback_locked_block_range(uint64_t start_block_id, int count);
 
-  void increment_generation();
-
   // Try to allocate blocks for range [offset, offset + count) and
   // lock it if successful.
   int try_lock_blocks(uint64_t offset, uint64_t count, IOVector &blocks);
@@ -237,8 +234,13 @@ class BlockCacheStore : public ICacheStore {
 
   const uint64_t block_size_ = 0;
 
+  // Etag of the source whose data is currently cached. Guarded by
+  // meta_store_->lock_ (the same lock protecting generation_).
+  std::string current_etag_;
+
   friend class BlockCacheHandle;
   friend class ::BlockCacheStoreTest;
+  friend class ::BlockCacheTest;
 };
 
 struct BlockCacheHandle : public CacheHandle {
@@ -277,8 +279,10 @@ class BlockCache : public ICache {
   }
 
   // Get the cache instance and increase the reference count.
-  CacheHandle *get(std::string_view name = "", std::string_view etag = "",
-                   size_t size = 0) override;
+  CacheHandle *get(const CacheKey &key) override;
+
+  // Blocks are not keyed by identity; unconditionally drop all cached blocks.
+  bool drop(const CacheKey &key) override;
 
   // Try to expand cache blocks by allocating 'count' blocks in buffer_pool_,
   // and the total number of blocks should not exceed 'max_capacity'

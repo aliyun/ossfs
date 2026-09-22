@@ -104,16 +104,12 @@ struct BGVCpuObjStoreEnv : public VCpuObjStoreEnv {
     return vcpu_list[next_id];
   }
 
-  std::vector<IObjStore *> get_all_obj_stores() {
-    return obj_stores;
-  }
-
-  std::vector<EnvContext> get_all_env_cxts() {
-    std::vector<EnvContext> ctxs;
+  template <class F>
+  void for_each_obj_store(F &&fn) {
     for (int i = 0; i < vcpu_num; i++) {
-      ctxs.emplace_back(get_obj_store_env(i));
+      auto ctx = get_obj_store_env(i);
+      ctx.executor->perform([&]() { fn(ctx.obj_store); });
     }
-    return ctxs;
   }
 };
 

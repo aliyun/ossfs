@@ -15,7 +15,11 @@
  */
 
 #include <atomic>
+#include <cstring>
+#include <random>
+#include <vector>
 
+#include "common/fault_injector.h"
 #include "test_suite.h"
 
 class Ossfs2RenameTest : public Ossfs2TestSuite {
@@ -315,7 +319,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
 
     ASSERT_EQ(std::to_string(crc64), meta["X-Oss-Hash-Crc64ecma"]);
 
-    fs_->update_creds({"1", "2", "3"});
+    fs_->update_creds({"1", "2", "3"}, CredsMeta{});
 
     int r = fs_->rename(parent, "test_file", parent, "test_file2", 0);
     ASSERT_NE(r, 0);
@@ -367,10 +371,11 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
         srand(time(nullptr));
         photon::thread_usleep(rand() % 1000 *
                               1000);  // random sleep for [0, 1000] ms
-        fs_->update_creds({"1", "2", "3"});
+        fs_->update_creds({"1", "2", "3"}, CredsMeta{});
         photon::thread_usleep(500000);
         fs_->update_creds(
-            {FLAGS_oss_access_key_id, FLAGS_oss_access_key_secret});
+            {FLAGS_oss_access_key_id, FLAGS_oss_access_key_secret},
+            CredsMeta{});
       });
       DEFER(set_invalid_cred_future.wait());
 
@@ -1167,50 +1172,61 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     // Wait for background prefetch to populate cache with 0xAA data
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-    // Rename /b over /a (overwrite): /a now has content 0xBB (E_B)
+    // Rename /b over /a: random-write mode hides the opened dst, so the
+    // anchored handle keeps serving the original object.
     r = fs_->rename(parent, "file_b", parent, "file_a", 0);
     ASSERT_EQ(r, 0);
 
-    // Read from offset 1MB onward (region that prefetch should have cached).
-    // After rename overwrite, possible outcomes:
-    // - Returns cached old data 0xAA (cache hit, attr not yet refreshed) —
-    // acceptable
-    // - Returns -EIO (ETag verification on cache-miss refill detected mismatch)
-    // — acceptable
-    // - Returns new data 0xBB (path refresh succeeded) — acceptable
-    // The key invariant: no crash, no garbage (random bytes). Data must be
-    // entirely 0xAA or entirely 0xBB, not a mix.
+    // The hidden handle must keep reading the old 0xAA data (the prefetched
+    // region); EIO or new data would be a hide-semantics regression.
     size_t remaining = file_size - verify_offset;
     std::vector<char> read_buf(remaining, 0);
     size_t offset = 0;
-    bool read_error = false;
     while (offset < remaining) {
       n = file_read->pread(read_buf.data() + offset, remaining - offset,
                            verify_offset + offset);
-      if (n <= 0) {
-        // Error return is acceptable (ETag mismatch detected on refill)
-        read_error = true;
-        break;
-      }
+      ASSERT_GT(n, 0) << "pread on the hidden (renamed-over) handle failed";
       offset += n;
     }
+    for (size_t i = 0; i < remaining; i++) {
+      ASSERT_EQ(read_buf[i], (char)0xAA)
+          << "old handle must keep serving the old content after hide, "
+          << "mismatch at offset " << i;
+    }
 
-    if (!read_error && offset > 0) {
-      // Verify data coherence: must be all-0xAA or all-0xBB, no mix.
-      bool all_aa = true, all_bb = true;
-      for (size_t i = 0; i < offset; i++) {
-        if (read_buf[i] != (char)0xAA) all_aa = false;
-        if (read_buf[i] != (char)0xBB) all_bb = false;
-      }
-      ASSERT_TRUE(all_aa || all_bb)
-          << "Data corruption: read mixed content after rename overwrite";
+    // A fresh open of the dst name must serve the new content 0xBB.
+    uint64_t nodeid_new = 0;
+    struct stat st_new;
+    r = fs_->lookup(parent, "file_a", &nodeid_new, &st_new);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid_new, 1));
+    ASSERT_NE(nodeid_new, nodeid_a)
+        << "dst name must be served by the renamed-in inode";
+
+    void *handle_new = nullptr;
+    r = fs_->open(nodeid_new, O_RDONLY, &handle_new, &unused);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->release(nodeid_new, get_file_from_handle(handle_new)));
+
+    auto file_new = get_file_from_handle(handle_new);
+    std::vector<char> new_buf(file_size, 0);
+    size_t new_off = 0;
+    while (new_off < file_size) {
+      n = file_new->pread(new_buf.data() + new_off, file_size - new_off,
+                          new_off);
+      ASSERT_GT(n, 0) << "pread on the new dst name failed";
+      new_off += n;
+    }
+    for (size_t i = 0; i < file_size; i++) {
+      ASSERT_EQ(new_buf[i], (char)0xBB)
+          << "dst name must serve the new content after rename overwrite, "
+          << "mismatch at offset " << i;
     }
   }
 
   // Stress-test concurrent rename + pread on the same file (random-write
-  // mode). Verifies that concurrent path mutations never cause crashes or
-  // silent data corruption; pread may return correct data or -EIO (path
-  // refresh detected external replacement) but never garbage.
+  // mode). Moving an opened file never invalidates its inode, so pread on
+  // the anchored handle must keep returning correct data, never an error.
   void verify_concurrent_rename_read_stress() {
     auto parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
@@ -1244,7 +1260,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     std::atomic<bool> stop{false};
     std::atomic<int> rename_done{0};
     std::atomic<int> read_ok{0};
-    std::atomic<int> read_eio{0};
+    std::atomic<int> read_err{0};
     std::atomic<bool> corruption_detected{false};
 
     // Rename thread: toggle between "stress_src" and "stress_dst"
@@ -1287,27 +1303,24 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
               return;
             }
             read_ok.fetch_add(1);
-          } else if (n == -EIO || n == -ENOENT) {
-            // Acceptable: path stale after rename, ETag mismatch
-            read_eio.fetch_add(1);
-          } else if (n < 0) {
-            // Other errors are acceptable during path refresh
-            read_eio.fetch_add(1);
-          } else if (n > 0 && n < (ssize_t)kBufSize) {
-            // Partial read at EOF boundary is OK, verify what we got
+          } else if (n > 0) {
+            // Partial read at EOF boundary: verify what we got.
             if (memcmp(buf.data(), expected.data(), n) != 0) {
               corruption_detected = true;
               stop.store(true);
               return;
             }
             read_ok.fetch_add(1);
+          } else {
+            // The inode stays alive across renames; errors are regressions.
+            read_err.fetch_add(1);
           }
           photon::thread_usleep(1000);  // 1ms between reads
         }
       }));
     }
 
-    // Wait for rename thread to finish, then signal readers to stop
+    // Wait for rename thread to finish, then signal readers to stop.
     rename_future.wait();
     stop.store(true);
 
@@ -1316,17 +1329,19 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     }
 
     LOG_INFO(
-        "Stress test done: renames=`, reads_ok=`, reads_eio=`, "
+        "Stress test done: renames=`, reads_ok=`, reads_err=`, "
         "corruption=`",
-        rename_done.load(), read_ok.load(), read_eio.load(),
+        rename_done.load(), read_ok.load(), read_err.load(),
         corruption_detected.load());
 
     ASSERT_FALSE(corruption_detected.load())
         << "Data corruption detected during concurrent rename+read";
     ASSERT_GT(rename_done.load(), 0)
         << "At least one rename should have succeeded";
-    ASSERT_GT(read_ok.load() + read_eio.load(), 0)
+    ASSERT_GT(read_ok.load(), 0)
         << "At least one read should have been attempted";
+    ASSERT_EQ(read_err.load(), 0)
+        << "pread on the anchored handle must survive renames without errors";
   }
 
   void verify_multi_file_cross_rename_no_corruption() {
@@ -1361,7 +1376,8 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
       ASSERT_EQ(r, 0);
     }
 
-    // Open each file for reading.
+    // Open each file for reading; the handles are released explicitly
+    // before the final checks below.
     for (auto &f : files) {
       bool unused = false;
       int r = fs_->open(f.nodeid, O_RDONLY, &f.read_handle, &unused);
@@ -1369,7 +1385,10 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     }
     DEFER({
       for (auto &f : files) {
-        fs_->release(f.nodeid, get_file_from_handle(f.read_handle));
+        if (f.read_handle) {
+          fs_->release(f.nodeid, get_file_from_handle(f.read_handle));
+          f.read_handle = nullptr;
+        }
         fs_->forget(f.nodeid, 1);
       }
     });
@@ -1436,11 +1455,8 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
               }
             }
             read_ok_total.fetch_add(1);
-          } else if (n == 0 || n == -EIO || n == -ENOENT) {
-            // Acceptable: file moved, path stale, ETag mismatch.
-            read_err_total.fetch_add(1);
           } else {
-            // Other negative errors also acceptable during rename storm.
+            // The inode stays alive across renames; errors are regressions.
             read_err_total.fetch_add(1);
           }
           photon::thread_usleep(1000);  // 1ms between reads
@@ -1472,8 +1488,282 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
         << " but got 0x" << (int)corruption_got.load();
     ASSERT_GT(rename_done.load(), 0)
         << "At least one cross-rename round should have succeeded";
-    ASSERT_GT(read_ok_total.load() + read_err_total.load(), 0)
+    ASSERT_GT(read_ok_total.load(), 0)
         << "At least one read should have been attempted";
+    ASSERT_EQ(read_err_total.load(), 0)
+        << "pread on the anchored handles must survive the rename rotation "
+        << "without errors";
+
+    // Release the handles first: a rename that landed on one of these opened
+    // inodes (hide path) deletes its hidden object on this last release.
+    for (auto &f : files) {
+      int rr = fs_->release(f.nodeid, get_file_from_handle(f.read_handle));
+      ASSERT_EQ(rr, 0) << "release failed for " << f.name;
+      f.read_handle = nullptr;
+    }
+
+    // No ".fuse_hidden*" object may survive on OSS.
+    auto parent_path = nodeid_to_path(parent);
+    std::vector<std::string> list_results;
+    int lr = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, list_dir_descendants,
+                                            parent_path, list_results);
+    ASSERT_EQ(lr, 0);
+    for (const auto &key : list_results) {
+      ASSERT_TRUE(key.find(".fuse_hidden") == std::string::npos)
+          << "hidden object leaked on OSS: " << key;
+    }
+
+    // Final layout: x/y/z must exist, and every present file must hold
+    // exactly one full pattern (mixing means corruption).
+    const char *final_names[] = {"cross_file_x", "cross_file_y", "cross_file_z",
+                                 "cross_file_tmp"};
+    int present = 0;
+    for (const char *name : final_names) {
+      uint64_t nid = 0;
+      struct stat st_f;
+      int flr = fs_->lookup(parent, name, &nid, &st_f);
+      if (flr == -ENOENT) continue;
+      ASSERT_EQ(flr, 0) << "final lookup failed for " << name;
+      DEFER(fs_->forget(nid, 1));
+      present++;
+
+      void *h = nullptr;
+      bool unused_f = false;
+      flr = fs_->open(nid, O_RDONLY, &h, &unused_f);
+      ASSERT_EQ(flr, 0) << "final open failed for " << name;
+      DEFER(fs_->release(nid, get_file_from_handle(h)));
+
+      auto file_f = get_file_from_handle(h);
+      std::vector<char> fbuf(kFileSize, 0);
+      size_t off_f = 0;
+      while (off_f < kFileSize) {
+        ssize_t rn =
+            file_f->pread(fbuf.data() + off_f, kFileSize - off_f, off_f);
+        ASSERT_GT(rn, 0) << "final verification pread failed for " << name;
+        off_f += rn;
+      }
+      char p0 = fbuf[0];
+      bool single_pattern = true;
+      for (size_t i = 1; i < kFileSize; i++) {
+        if (fbuf[i] != p0) single_pattern = false;
+      }
+      ASSERT_TRUE(single_pattern)
+          << "final content of " << name << " mixes patterns (corruption)";
+      ASSERT_TRUE(p0 == (char)0x11 || p0 == (char)0x22 || p0 == (char)0x33)
+          << "final content of " << name << " holds an unknown pattern";
+    }
+    ASSERT_GE(present, 3) << "x/y/z must all survive the rotation";
+  }
+
+  // Renames of an OPEN file that keep returning to used names:
+  // cross-directory ping-pong while writing, then a->b->c->a cycles with a
+  // full re-read at every name; the final content must match after release
+  // + fresh open.
+  void verify_rename_roundtrip_while_writing() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t dir_a = 0, dir_b = 0;
+    struct stat st;
+    int r = fs_->mkdir(parent, "rt_A", 0777, 0, 0, 0, &dir_a, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_a, 1));
+    r = fs_->mkdir(parent, "rt_B", 0777, 0, 0, 0, &dir_b, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_b, 1));
+
+    const size_t kSize = 4 * 1024 * 1024;
+    const size_t kMaxPatch = 256 * 1024;
+    std::mt19937 rng(12345);
+
+    auto patch = [&](void *handle, std::vector<char> &model, size_t size) {
+      size_t n = 4096 + rng() % (kMaxPatch - 4096);
+      size_t off = rng() % (size - n);
+      std::string blob = random_string(n);
+      auto w = get_file_from_handle(handle)->pwrite(blob.data(), n, off);
+      ASSERT_EQ(w, (ssize_t)n);
+      memcpy(model.data() + off, blob.data(), n);
+    };
+
+    // Part 1: cross-directory ping-pong while writing (20 moves).
+    std::vector<char> model(kSize);
+    {
+      std::string initial = random_string(kSize);
+      memcpy(model.data(), initial.data(), kSize);
+    }
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    r = create_and_flush(dir_a, "pp.dat", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                         &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    auto w0 = get_file_from_handle(handle)->pwrite(model.data(), kSize, 0);
+    ASSERT_EQ(w0, (ssize_t)kSize);
+
+    bool in_b = false;
+    for (int i = 0; i < 20; i++) {
+      patch(handle, model, kSize);
+      patch(handle, model, kSize);
+      uint64_t from = in_b ? dir_b : dir_a;
+      uint64_t to = in_b ? dir_a : dir_b;
+      r = fs_->rename(from, "pp.dat", to, "pp.dat", 0);
+      ASSERT_EQ(r, 0);
+      in_b = !in_b;
+    }
+    patch(handle, model, kSize);
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+
+    // Fresh open of the final name (back in rt_A) must match the model.
+    uint64_t final_nodeid = 0;
+    r = fs_->lookup(dir_a, "pp.dat", &final_nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(final_nodeid, 1));
+    ASSERT_EQ(st.st_size, (off_t)kSize);
+    {
+      void *h = nullptr;
+      bool unused = false;
+      r = fs_->open(final_nodeid, O_RDONLY, &h, &unused);
+      ASSERT_EQ(r, 0);
+      std::vector<char> buf(kSize);
+      size_t off = 0;
+      while (off < kSize) {
+        auto n =
+            get_file_from_handle(h)->pread(buf.data() + off, kSize - off, off);
+        ASSERT_GT(n, 0);
+        off += n;
+      }
+      fs_->release(final_nodeid, get_file_from_handle(h));
+      ASSERT_EQ(0, memcmp(buf.data(), model.data(), kSize))
+          << "ping-pong final content mismatch";
+    }
+
+    // Part 2: a->b->c->a cycles (3 rounds, 9 renames) of an open file, with
+    // a full re-read at every name — names cycle back onto used entries.
+    const size_t kSize2 = 1 * 1024 * 1024;
+    std::vector<char> model2(kSize2);
+    {
+      std::string initial = random_string(kSize2);
+      memcpy(model2.data(), initial.data(), kSize2);
+    }
+    const char *names[3] = {"rt_a.dat", "rt_b.dat", "rt_c.dat"};
+    uint64_t nodeid2 = 0;
+    void *handle2 = nullptr;
+    r = create_and_flush(parent, names[0], CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                         &nodeid2, &st, &handle2);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid2, 1));
+    auto w2 = get_file_from_handle(handle2)->pwrite(model2.data(), kSize2, 0);
+    ASSERT_EQ(w2, (ssize_t)kSize2);
+
+    int cur = 0;
+    for (int step = 0; step < 9; step++) {
+      patch(handle2, model2, kSize2);
+      int nxt = (cur + 1) % 3;
+      r = fs_->rename(parent, names[cur], parent, names[nxt], 0);
+      ASSERT_EQ(r, 0);
+      cur = nxt;
+
+      // Re-read the whole file through a FRESH handle at the new name.
+      uint64_t nid = 0;
+      r = fs_->lookup(parent, names[cur], &nid, &st);
+      ASSERT_EQ(r, 0);
+      DEFER(fs_->forget(nid, 1));
+      void *h = nullptr;
+      bool unused = false;
+      r = fs_->open(nid, O_RDONLY, &h, &unused);
+      ASSERT_EQ(r, 0);
+      std::vector<char> buf(kSize2);
+      size_t roff = 0;
+      while (roff < kSize2) {
+        auto n = get_file_from_handle(h)->pread(buf.data() + roff,
+                                                kSize2 - roff, roff);
+        ASSERT_GT(n, 0);
+        roff += n;
+      }
+      fs_->release(nid, get_file_from_handle(h));
+      ASSERT_EQ(0, memcmp(buf.data(), model2.data(), kSize2))
+          << "content mismatch after rename to " << names[cur];
+    }
+    r = fs_->release(nodeid2, get_file_from_handle(handle2));
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(cur, 0) << "9 renames must bring the file back to " << names[0];
+  }
+
+  // Directory rename migrating multiple dirty random-write files whose
+  // handles stay open across the move: every file must flush to the new path
+  // and verify byte-for-byte on a fresh open.
+  void verify_rename_dir_with_dirty_files() {
+    auto parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t dir_old = 0;
+    struct stat st;
+    int r = fs_->mkdir(parent, "dr_old", 0777, 0, 0, 0, &dir_old, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_old, 1));
+
+    const int kFiles = 5;
+    std::vector<uint64_t> nodeids(kFiles, 0);
+    std::vector<void *> handles(kFiles, nullptr);
+    std::vector<std::string> models(kFiles);
+    for (int i = 0; i < kFiles; i++) {
+      size_t size = (i + 1) * 256 * 1024;
+      std::string name = "dr_f" + std::to_string(i) + ".dat";
+      r = create_and_flush(dir_old, name.c_str(), CREATE_BASE_FLAGS, 0777, 0, 0,
+                           0, &nodeids[i], &st, &handles[i]);
+      ASSERT_EQ(r, 0);
+      models[i] = random_string(size);
+      auto w =
+          get_file_from_handle(handles[i])->pwrite(models[i].data(), size, 0);
+      ASSERT_EQ(w, (ssize_t)size);
+      // Deliberately no fsync: every file stays dirty across the dir rename.
+    }
+
+    // Move the whole directory while all handles are open and dirty.
+    r = fs_->rename(parent, "dr_old", parent, "dr_new", 0);
+    ASSERT_EQ(r, 0);
+
+    for (int i = 0; i < kFiles; i++) {
+      r = fs_->release(nodeids[i], get_file_from_handle(handles[i]));
+      ASSERT_EQ(r, 0);
+      fs_->forget(nodeids[i], 1);
+    }
+
+    // Fresh lookup + full read of every file under the new dir.
+    uint64_t dir_new = 0;
+    r = fs_->lookup(parent, "dr_new", &dir_new, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_new, 1));
+
+    for (int i = 0; i < kFiles; i++) {
+      std::string name = "dr_f" + std::to_string(i) + ".dat";
+      uint64_t nid = 0;
+      r = fs_->lookup(dir_new, name.c_str(), &nid, &st);
+      ASSERT_EQ(r, 0) << "missing " << name << " after dir rename";
+      DEFER(fs_->forget(nid, 1));
+      ASSERT_EQ(st.st_size, (off_t)models[i].size());
+
+      void *h = nullptr;
+      bool unused = false;
+      r = fs_->open(nid, O_RDONLY, &h, &unused);
+      ASSERT_EQ(r, 0);
+      std::vector<char> buf(models[i].size());
+      size_t off = 0;
+      while (off < buf.size()) {
+        auto n = get_file_from_handle(h)->pread(buf.data() + off,
+                                                buf.size() - off, off);
+        ASSERT_GT(n, 0);
+        off += n;
+      }
+      fs_->release(nid, get_file_from_handle(h));
+      ASSERT_EQ(0, memcmp(buf.data(), models[i].data(), buf.size()))
+          << name << " corrupted after dir rename";
+    }
+
+    uint64_t old_nid = 0;
+    r = fs_->lookup(parent, "dr_old", &old_nid, &st);
+    ASSERT_EQ(r, -ENOENT) << "old dir name must be gone";
   }
 
   void verify_rename_dir_oss_err_dir_obj() {
@@ -1556,6 +1846,54 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     for (auto &future : futures) {
       future.wait();
     }
+  }
+
+  // Rename re-keys the object but keeps the etag. In random write mode the
+  // read path refreshes attrs on the mtime change and drops by identity;
+  // the same-etag drop is a no-op, so the memory cache must survive.
+ protected:
+  void verify_rename_read_hits_cache_when_etag_unchanged() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    const std::string old_name = "cache_keep_src";
+    const std::string new_name = "cache_keep_dst";
+    const uint64_t kFileSizeMB = 4;
+    const size_t data_size = kFileSizeMB * 1024 * 1024;
+
+    uint64_t nodeid = 0;
+    uint64_t crc = create_file_in_folder(parent, old_name, kFileSizeMB, nodeid);
+    ASSERT_GT(crc, 0ULL);
+    DEFER(fs_->forget(nodeid, 1));
+
+    void *handle = nullptr;
+    bool unused = false;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &handle, &unused), 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(handle)));
+
+    // First read fills the memory cache.
+    std::vector<char> buf(data_size);
+    ASSERT_EQ(read_from_handle(handle, buf.data(), data_size, 0),
+              static_cast<ssize_t>(data_size));
+    ASSERT_EQ(cal_crc64(0, buf.data(), data_size), crc);
+
+    ASSERT_EQ(
+        fs_->rename(parent, old_name.c_str(), parent, new_name.c_str(), 0), 0);
+
+    // Make every OSS request fail: only a cache hit can satisfy the next
+    // read. A regression that evicts the memory cache on rename would
+    // surface as a refill failure here.
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Call_Failed,
+                                    FaultInjection(1000, 0));
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_OssError_Call_Failed));
+
+    std::vector<char> buf2(data_size);
+    // With every OSS request failing, only a cache hit can satisfy this
+    // read; a regression that evicts the cache on rename fails here.
+    ASSERT_EQ(read_from_handle(handle, buf2.data(), data_size, 0),
+              static_cast<ssize_t>(data_size));
+    ASSERT_EQ(cal_crc64(0, buf2.data(), data_size), crc);
   }
 };
 
@@ -1748,6 +2086,33 @@ TEST_F(Ossfs2RenameTest, verify_multi_file_cross_rename_no_corruption) {
   verify_multi_file_cross_rename_no_corruption();
 }
 
+TEST_F(Ossfs2RenameTest, verify_rename_roundtrip_while_writing) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // random write mode
+  init(opts);
+  verify_rename_roundtrip_while_writing();
+}
+
+TEST_F(Ossfs2RenameTest, verify_rename_dir_with_dirty_files) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // random write mode
+  init(opts);
+  verify_rename_dir_with_dirty_files();
+}
+
 // TODO: Add streaming/appendable rename+read tests after extending ETag
 // verification to all write modes (requires writer flush etag sync for
 // streaming put_object and appendable append_object).
+
+TEST_F(Ossfs2RenameTest, verify_rename_read_hits_cache_when_etag_unchanged) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;  // random write mode so flush syncs the etag
+  init(opts);
+  verify_rename_read_hits_cache_when_etag_unchanged();
+}

@@ -213,7 +213,12 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
 
     r = fs_->getattr(nodeid, &st);
     ASSERT_EQ(r, 0);
-    ASSERT_EQ(st.st_size, 11 * 1048576 + 4096);
+    if (is_hdfs_test_mode()) {
+      // HDFS defers the size to flush/close: the dirty write is invisible.
+      ASSERT_EQ(st.st_size, 11 * 1048576);
+    } else {
+      ASSERT_EQ(st.st_size, 11 * 1048576 + 4096);
+    }
 
     fs_->release(nodeid, get_file_from_handle(new_handle));
   }
@@ -304,7 +309,8 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
         ASSERT_EQ(r, 0);
       }
 
-      ASSERT_EQ(fs_->download_buffers_->used_blocks(),
+      wait_write_blocks_released();
+      ASSERT_EQ(fs_->data_buffers_->used_blocks(),
                 fs_->options_.max_total_reserved_buffer_count);
 
       for (int i = 0; i < total_file_count; i++) {
@@ -313,7 +319,8 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
       }
     }
 
-    ASSERT_EQ(fs_->download_buffers_->used_blocks(), 0ULL);
+    wait_write_blocks_released();
+    ASSERT_EQ(fs_->data_buffers_->used_blocks(), 0ULL);
 
     // open parallel
     {
@@ -341,7 +348,8 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
         task.wait();
       }
 
-      ASSERT_EQ(fs_->download_buffers_->used_blocks(),
+      wait_write_blocks_released();
+      ASSERT_EQ(fs_->data_buffers_->used_blocks(),
                 fs_->options_.max_total_reserved_buffer_count);
 
       for (int i = 0; i < total_file_count; i++) {
@@ -439,6 +447,82 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
       ASSERT_EQ(meta["Content-Length"], "0");
     }
   }
+
+  // open() derives keep_page_cache from the etag: a matching etag keeps the
+  // cache, a remote overwrite drops it until the new etag is adopted.
+  void verify_open_keep_cache_with_etag() {
+    auto add_dquo = [](const std::string &s) { return "\"" + s + "\""; };
+
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    auto parent_path = nodeid_to_path(parent);
+
+    // 1. Write and flush: etag backfilled, open keeps the page cache.
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    struct stat st;
+    std::string filename = "open_keep_cache";
+    int r = fs_->creat(parent, filename.c_str(), CREATE_BASE_FLAGS, 0644, 0, 0,
+                       0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    std::string data = random_string(4096);
+    auto write_size =
+        write_to_file_handle(handle, data.c_str(), data.size(), 0);
+    ASSERT_EQ(write_size, static_cast<ssize_t>(data.size()));
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+
+    FileInode *inode = nullptr;
+    {
+      std::lock_guard<std::mutex> l(fs_->inodes_map_lck_);
+      auto iter = fs_->global_inodes_map_.find(nodeid);
+      ASSERT_TRUE(iter != fs_->global_inodes_map_.end());
+      inode = static_cast<FileInode *>(iter->second);
+      ASSERT_FALSE(inode->etag.empty())
+          << "flush must backfill the etag of the landed object";
+      ASSERT_FALSE(inode->invalidate_data_cache);
+    }
+
+    void *rhandle = nullptr;
+    bool keep_page_cache = false;
+    r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_page_cache);
+    ASSERT_EQ(r, 0);
+    EXPECT_TRUE(keep_page_cache)
+        << "open with a valid backfilled etag must keep the page cache";
+    r = fs_->release(nodeid, get_file_from_handle(rhandle));
+    ASSERT_EQ(r, 0);
+
+    // 2. Remote overwrite: open must drop the page cache and adopt the new
+    //    etag.
+    std::string local_file = join_paths(test_path_, "open_keep_cache_src");
+    create_random_file(local_file, 3);
+    r = upload_file(local_file, join_paths(parent_path, filename),
+                    FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(r, 0);
+
+    keep_page_cache = true;
+    r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_page_cache);
+    ASSERT_EQ(r, 0);
+    EXPECT_FALSE(keep_page_cache)
+        << "open after a remote overwrite must invalidate the page cache";
+    r = fs_->release(nodeid, get_file_from_handle(rhandle));
+    ASSERT_EQ(r, 0);
+
+    auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
+    ASSERT_FALSE(inode->invalidate_data_cache)
+        << "open must clear the flag after consuming it";
+
+    keep_page_cache = false;
+    r = fs_->open(nodeid, O_RDONLY, &rhandle, &keep_page_cache);
+    ASSERT_EQ(r, 0);
+    EXPECT_TRUE(keep_page_cache)
+        << "open must keep the cache once the etag matches the remote again";
+    r = fs_->release(nodeid, get_file_from_handle(rhandle));
+    ASSERT_EQ(r, 0);
+  }
 };
 
 TEST_F(Ossfs2OpenCloseTest, verify_open) {
@@ -512,4 +596,13 @@ TEST_F(Ossfs2OpenCloseTest, verify_open_truncate_for_appendable_object) {
   SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_open_truncate();
+}
+
+TEST_F(Ossfs2OpenCloseTest, verify_open_keep_cache_with_etag) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.close_to_open = true;
+  SET_TEST_MODE(kTestOss);
+  init(opts);
+  verify_open_keep_cache_with_etag();
 }

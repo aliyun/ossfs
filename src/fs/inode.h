@@ -281,8 +281,9 @@ struct FileInode final : public Inode {
     return Inode::is_attr_valid(timeout);
   }
 
-  void invalidate_data_cache_if_needed(const struct stat *stbuf,
-                                       std::string_view remote_etag);
+  // Compare against the remote stat, mark the page cache for invalidation if
+  // data changed, then adopt the remote etag.
+  void refresh_etag(const struct stat *stbuf, std::string_view remote_etag);
 
   bool is_dirty_file() const {
     return is_dirty;

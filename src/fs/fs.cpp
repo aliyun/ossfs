@@ -103,49 +103,30 @@ OssFs::OssFs(const OssFsOptions &options, BackgroundVCpuEnv bg_vcpu_env,
   Attribute::set_default_mode(options_.dir_mode, options_.file_mode);
 
   init_prefetch_options();
-  upload_buffers_ = std::make_unique<FixedBlockMemoryPool>(
-      options_.upload_buffer_size, options_.upload_concurrency + 4,
-      options_.upload_concurrency + 4, options_.mempool_purge_interval_ms);
   // Derive base part size: aligned to chunk_size so parts never split chunks.
   random_write_base_part_size_ =
       align_up(options_.upload_buffer_size, options_.random_write_chunk_size);
-  if (enable_prefetching()) {
-    size_t blocks_per_prefetch_chunk =
-        (options_.prefetch_chunk_size + options_.cache_block_size - 1) /
-        options_.cache_block_size;
-    size_t cached_block_count =
-        blocks_per_prefetch_chunk * options_.prefetch_concurrency * 3;
-    size_t pool_capcacity = cached_block_count;
-    uint64_t purge_interval_ms = options_.mempool_purge_interval_ms;
 
-    // Override if user specified.
-    if (options_.prefetch_chunks > 0) {
-      cached_block_count = blocks_per_prefetch_chunk * options_.prefetch_chunks;
-      pool_capcacity = cached_block_count;
-    } else if (options_.prefetch_chunks < 0) {
-      // Unlimited mode.
-      pool_capcacity = std::numeric_limits<size_t>::max();
-    }
-
-    if (options_.memory_data_cache_size > 0) {
-      purge_interval_ms = 0;
-    }
-
-    download_buffers_ = std::make_shared<FixedBlockMemoryPool>(
-        options_.cache_block_size, pool_capcacity, cached_block_count,
-        purge_interval_ms);
+  auto budget = compute_data_buffer_budget(options_);
+  if (budget.needed) {
+    data_buffers_ = std::make_shared<SharedDataBufferPool>(
+        budget.block_size, budget.pool_capacity, budget.max_cached_blocks,
+        options_.mempool_purge_interval_ms, budget.read_quota_blocks);
   }
 
   if (enable_staged_cache()) {
     // We don't evict inodes when inserting, but inside the eviction background
     // thread.
-    staged_inodes_cache_ = new StagedInodeCache(options_.attr_timeout);
+    staged_inodes_cache_ =
+        std::make_unique<StagedInodeCache>(options_.attr_timeout);
   }
 
   if (enabled_negative_cache()) {
-    negative_cache_ = new NegativeCache(options_.oss_negative_cache_timeout,
-                                        options_.oss_negative_cache_size);
+    negative_cache_ = std::make_unique<NegativeCache>(
+        options_.oss_negative_cache_timeout, options_.oss_negative_cache_size);
   }
+
+  async_task_manager_ = new AsyncTaskManager(options_.async_task_limit);
 }
 
 OssFs::~OssFs() {
@@ -163,7 +144,16 @@ OssFs::~OssFs() {
     var = nullptr;      \
   }
 
-  JOIN_AND_DELETE_THREAD(creds_refresh_th_);
+  if (creds_refresh_executor_) {
+    bg_vcpu_env_.bg_obj_store_env->for_each_obj_store(
+        [](IObjStore *store) { store->set_creds_refresh_handler(nullptr); });
+    creds_refresh_executor_->perform([&]() {
+      delete creds_refresh_timer_;
+      creds_refresh_timer_ = nullptr;
+    });
+    delete creds_refresh_executor_;
+    creds_refresh_executor_ = nullptr;
+  }
   JOIN_AND_DELETE_THREAD(uds_server_th_);
   JOIN_AND_DELETE_THREAD(reverse_invalidate_th_);
   JOIN_AND_DELETE_THREAD(health_check_th_);
@@ -173,9 +163,8 @@ OssFs::~OssFs() {
     LOG_INFO("Remained staged inodes number: `", staged_inodes_cache_->size());
   }
 
+  DELETE_VAR(async_task_manager_);
   DELETE_VAR(creds_provider_);
-  DELETE_VAR(staged_inodes_cache_);
-  DELETE_VAR(negative_cache_);
 
   {
     std::lock_guard<std::mutex> l(inodes_map_lck_);
@@ -339,8 +328,7 @@ retry_with_write_path_lock:
     return r;
   }
 
-  invalidate_data_cache_if_needed(inode, stbuf, remote_etag);
-  update_inode_etag(inode, remote_etag);
+  refresh_inode_etag(inode, stbuf, remote_etag);
   inode->set_mode(stbuf->st_mode);
   inode->set_uid(stbuf->st_uid);
   inode->set_gid(stbuf->st_gid);
@@ -461,6 +449,15 @@ int OssFs::hdfs_setattr(uint64_t nodeid, struct stat *stbuf, int to_set,
   inode->set_mode(stbuf->st_mode);
   inode->set_uid(stbuf->st_uid);
   inode->set_gid(stbuf->st_gid);
+  // The backend cannot see unflushed streaming writes of a dirty open file,
+  // so its stat would report a stale (smaller) size. Keep the local size and
+  // mtime to avoid shrinking the cached view. In HDFS mode the union slot is
+  // hdfs_dirty_count, the number of open writing handles.
+  if (!inode->is_dir() &&
+      static_cast<FileInode *>(inode)->hdfs_dirty_count > 0) {
+    stbuf->st_size = inode->attr.size;
+    stbuf->st_mtim = inode->attr.mtime;
+  }
   inode->update_attr(stbuf->st_size, stbuf->st_mtim, stbuf->st_atim);
   inode->fill_statbuf(stbuf);
   return 0;
@@ -521,6 +518,7 @@ int OssFs::check_permission(PermOp op, Inode *inode, uid_t uid, gid_t gid) {
 
   struct stat stbuf;
   inode->fill_statbuf(&stbuf);
+  resolve_unresolved_uid_gid(&stbuf, uid, gid);
   return PERFORM_BACKGROUND_OBJ_REQUEST(this, check_permission, op, &stbuf, uid,
                                         gid);
 }
@@ -553,7 +551,9 @@ int OssFs::do_hdfs_setattr_times(Inode *inode, std::string_view path,
   int64_t old_mtime_ms = old_mtime.tv_sec * 1000 + old_mtime.tv_nsec / 1000000;
 
   // Permission check: non-owner non-root.
-  if (caller_uid != 0 && caller_uid != inode->get_uid()) {
+  uid_t owner_uid = inode->get_uid();
+  if (owner_uid == kReservedUnresolvedUid) owner_uid = caller_uid;
+  if (caller_uid != 0 && caller_uid != owner_uid) {
     bool atime_now = (to_set & FUSE_SET_ATTR_ATIME_NOW) != 0;
     bool mtime_now = (to_set & FUSE_SET_ATTR_MTIME_NOW) != 0;
     if (atime_now && mtime_now) {
@@ -871,7 +871,13 @@ int OssFs::do_rename_locked(DirInode *o_parent, DirInode *n_parent,
   // Check if the destination node exists.
   // It's possible we have no local inode created but the dir/file exists
   // remotely.
-  if (!dst_node && (flags & RENAME_NOREPLACE)) {
+  bool dst_exists = dst_node && !dst_node->is_stale;
+  if (is_hdfs_mode()) {
+    // Always probe even with a fresh local inode: other clients may have
+    // changed the remote dst behind our back.
+    int r = hdfs_probe_rename_dst(src_node, dst_path, flags, &dst_exists);
+    if (r < 0) return r;
+  } else if (!dst_node && (flags & RENAME_NOREPLACE)) {
     struct stat st;
     std::string unused_etag;
     int r =
@@ -901,19 +907,17 @@ int OssFs::do_rename_locked(DirInode *o_parent, DirInode *n_parent,
   int r = flush_dirty_inodes_for_rename(src_node, src_path);
   if (r < 0) return r;
 
-  // In random-write mode, hide an opened dst instead of overwriting it.
-  bool need_hide = write_mode() == WriteMode::Random && dst_node &&
-                   !dst_node->is_stale && dst_node->is_file() &&
-                   dst_node->open_ref_cnt > 0;
+  bool need_hide = enable_hide_inode() && dst_node && !dst_node->is_stale &&
+                   dst_node->is_file() && dst_node->open_ref_cnt > 0;
   if (need_hide) {
     r = hide_inode(n_parent, dst_node, dst_parent_path);
     if (r < 0) return r;
   }
 
   if (src_node->is_dir()) {
-    r = rename_dir(src_path, dst_path, dst_node != nullptr);
+    r = rename_dir(src_path, dst_path, dst_exists);
   } else {
-    r = rename_file(src_path, dst_path, dst_node != nullptr && !need_hide);
+    r = rename_file(src_path, dst_path, dst_exists && !need_hide);
   }
   if (r < 0) {
     LOG_ERROR("fail to rename from ` to ` on the cloud", src_path, dst_path);
@@ -959,6 +963,58 @@ int OssFs::do_rename_locked(DirInode *o_parent, DirInode *n_parent,
   // cache.
   rm_from_staged_cache_if_needed(new_parent, new_name);
 
+  return 0;
+}
+
+// Probe the remote dst before rename, in HDFS mode only. jdo_rename reports
+// success but silently misbehaves on an existing dst (no-op on a file, moves
+// src into a dir), so reject invalid renames (-EEXIST/-ENOTDIR/-EISDIR/
+// -ENOTEMPTY) and report the real existence via *dst_exists for the
+// pre-delete. This only shrinks, not closes, the race window.
+int OssFs::hdfs_probe_rename_dst(Inode *src_node, std::string_view dst_path,
+                                 unsigned int flags, bool *dst_exists) {
+  struct stat dst_st;
+  std::string unused_etag;
+  int r = PERFORM_BACKGROUND_OBJ_REQUEST(this, stat, dst_path, &dst_st,
+                                         &unused_etag);
+  if (r == -ENOENT) {
+    *dst_exists = false;
+    return 0;
+  }
+  if (r < 0) {
+    LOG_ERROR("fail to stat from cloud, path ` with error `", dst_path, r);
+    return r;
+  }
+
+  if (flags & RENAME_NOREPLACE) {
+    LOG_ERROR("dst ` already exists, rename is not supported", dst_path);
+    return -EEXIST;
+  }
+
+  bool dst_is_dir = S_ISDIR(dst_st.st_mode);
+  if (src_node->is_dir() && !dst_is_dir) {
+    LOG_ERROR("dst ` is a file, cannot rename dir to it", dst_path);
+    return -ENOTDIR;
+  }
+  if (!src_node->is_dir() && dst_is_dir) {
+    LOG_ERROR("dst ` is a dir, cannot rename file to it", dst_path);
+    return -EISDIR;
+  }
+
+  if (dst_is_dir) {
+    bool is_empty = false;
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, is_dir_empty, dst_path, is_empty);
+    if (r != 0) {
+      LOG_ERROR("fail to list dir `, with error: `", dst_path, r);
+      return r;
+    }
+    if (!is_empty) {
+      LOG_ERROR("dir ` is not empty in cloud, cannot rename", dst_path);
+      return -ENOTEMPTY;
+    }
+  }
+
+  *dst_exists = true;
   return 0;
 }
 
@@ -1080,10 +1136,7 @@ int OssFs::unlink(uint64_t parent, std::string_view name, uid_t caller_uid,
     if (r < 0) return r;
   }
 
-  // In random-write mode, hide an opened file instead of deleting it; the
-  // hidden object is removed on the last release.
-  if (write_mode() == WriteMode::Random && child->is_file() &&
-      child->open_ref_cnt > 0) {
+  if (enable_hide_inode() && child->is_file() && child->open_ref_cnt > 0) {
     return hide_inode(parent_inode, child, ref.parent_path);
   }
 
@@ -1146,23 +1199,19 @@ int OssFs::open(uint64_t nodeid, int flags, void **fh, bool *keep_page_cache) {
       return r;
     }
 
-    if (inode->is_data_changed(&stbuf, remote_etag)) {
-      inode->invalidate_data_cache = true;
-    }
-
-    inode->etag = remote_etag;
+    inode->refresh_etag(&stbuf, remote_etag);
     inode->update_attr(stbuf.st_size, stbuf.st_mtim, stbuf.st_atim);
     resync_randwrite_remote_size(inode);
   }
 
   if (inode->invalidate_data_cache) {
-    evict_inode_cache(inode);
+    evict_inode_cache(inode, full_path);
   }
 
   // Random write + prefetching needs shared cache so mark_clean() can drop it.
   if (inode->open_ref_cnt == 0 && enable_prefetching() &&
       (options_.share_fd_read_buffer || write_mode() == WriteMode::Random)) {
-    inode->cache = create_inode_cache();
+    inode->cache = create_inode_cache(inode->attr.size);
   }
 
   if (flags & O_TRUNC) {
@@ -1189,9 +1238,9 @@ int OssFs::open(uint64_t nodeid, int flags, void **fh, bool *keep_page_cache) {
 
   // clang-format off
   LOG_INFO(
-      "open file: `, nodeid: `, size: `, flags: `, read_only: `, truncate: `, append: `",
+      "open file: `, nodeid: `, size: `, flags: `, read_only: `, truncate: `, append: `, keep_cache: `",
       full_path, nodeid, inode->attr.size, flags, (flags & O_ACCMODE) == O_RDONLY,
-      (flags & O_TRUNC) > 0, (flags & O_APPEND) > 0);
+      (flags & O_TRUNC) > 0, (flags & O_APPEND) > 0, *keep_page_cache);
   // clang-format on
 
   return 0;
@@ -1702,8 +1751,8 @@ ssize_t OssFs::read(uint64_t nodeid, void *fh, size_t size, off_t off,
 
   DECLARE_METRIC_LATENCY(pread, Metric::MetricsType::kInternalMetrics);
   bool from_pool = false;
-  if (size <= options_.cache_block_size && download_buffers_ != nullptr) {
-    mem = static_cast<void *>(download_buffers_->allocate(1).front());
+  if (size <= options_.cache_block_size && data_buffers_ != nullptr) {
+    mem = static_cast<void *>(data_buffers_->allocate(1).front());
     from_pool = true;
   } else {
     r = posix_memalign(&mem, 4096, size);
@@ -1719,7 +1768,7 @@ ssize_t OssFs::read(uint64_t nodeid, void *fh, size_t size, off_t off,
 
   if (from_pool) {
     std::vector<char *> ptr_vec{static_cast<char *>(mem)};
-    download_buffers_->deallocate(ptr_vec);
+    data_buffers_->deallocate(ptr_vec);
   } else {
     free(mem);
   }
@@ -1885,8 +1934,7 @@ int OssFs::lookup_update_local_cache(
       increment_inode_lookupcnt(child_inode, parent_inode->nodeid, name);
       if (old_attr == child_inode->attr &&
           old_etag == get_inode_etag(child_inode)) {
-        invalidate_data_cache_if_needed(child_inode, stbuf, remote_etag);
-        update_inode_etag(child_inode, remote_etag);
+        refresh_inode_etag(child_inode, stbuf, remote_etag);
 
         child_inode->set_mode(stbuf->st_mode);
         child_inode->set_uid(stbuf->st_uid);
@@ -2153,7 +2201,7 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
 
   if (negative_cache_) negative_cache_->erase(full_path);
 
-  if (options_.hdfs_set_owner_on_create && is_hdfs_mode() && (uid || gid)) {
+  if (options_.hdfs_set_owner_on_create && is_hdfs_mode()) {
     int r2 =
         PERFORM_BACKGROUND_OBJ_REQUEST(this, set_owner, full_path, uid, gid,
                                        IObjStore::kSetUid | IObjStore::kSetGid);
@@ -2586,8 +2634,7 @@ void OssFs::try_update_inode_attr_from_list(Inode *inode, struct stat *stbuf,
     return;
   }
 
-  invalidate_data_cache_if_needed(inode, stbuf, remote_etag);
-  update_inode_etag(inode, remote_etag);
+  refresh_inode_etag(inode, stbuf, remote_etag);
   inode->set_mode((inode->get_mode() & ~kPermMask) | (perm & kPermMask));
   inode->set_uid(uid);
   inode->set_gid(gid);
@@ -2847,20 +2894,26 @@ int OssFs::init() {
   }
 
   if (!options_.ram_role.empty()) {
-    creds_provider_ = new_ram_role_creds_provider(options_.ram_role);
+    creds_provider_ = new_ram_role_creds_provider(
+        options_.ram_role, options_.credential_refresh_backoff);
   } else if (!options_.credential_process.empty()) {
     creds_provider_ = new_process_creds_provider(
-        options_.credential_process, options_.credential_refresh_interval);
+        options_.credential_process, options_.credential_refresh_interval,
+        options_.credential_refresh_backoff);
   }
 
   int r = 0;
   {
     auto t0 = std::chrono::steady_clock::now();
     if (creds_provider_) {
-      std::promise<int> result_promise;
-      creds_refresh_th_ = new std::thread(&OssFs::start_creds_refresher, this,
-                                          std::ref(result_promise));
-      r = result_promise.get_future().get();
+      creds_refresh_executor_ = new photon::Executor(
+          OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {}, EXECUTOR_QUEUE_OPTION);
+      r = creds_refresh_executor_->perform([&]() {
+        auto [result, next] = do_refresh_creds(true);
+        creds_refresh_timer_ =
+            new photon::Timer(next, {this, &OssFs::refresh_creds}, true);
+        return result;
+      });
     } else {
       r = PERFORM_BACKGROUND_OBJ_REQUEST(this, check_bucket);
     }
@@ -2873,6 +2926,10 @@ int OssFs::init() {
   if (r < 0) {
     LOG_ERROR("fail to check bucket with error `", r);
     return r;
+  }
+
+  if (creds_provider_) {
+    register_creds_refresh_handler();
   }
 
   if (is_hdfs_mode()) {
@@ -2922,18 +2979,23 @@ int OssFs::access(uint64_t nodeid, int mask, uid_t caller_uid,
   struct stat stbuf;
   int r = getattr(nodeid, &stbuf);
   if (r < 0) return r;
+  resolve_unresolved_uid_gid(&stbuf, caller_uid, caller_gid);
   return check_hdfs_access(&stbuf, mask, caller_uid, caller_gid);
 }
 
-std::shared_ptr<ICache> OssFs::create_inode_cache() {
+std::shared_ptr<ICache> OssFs::create_inode_cache(uint64_t file_size) {
   std::shared_ptr<ICache> cache = nullptr;
   switch (options_.cache_type) {
     case CacheType::kFhCache:
-      cache = std::make_shared<BlockCache>(download_buffers_);
+      cache = std::make_shared<BlockCache>(data_buffers_);
       break;
     case CacheType::kDiskCache:
-      cache = std::make_shared<DiskCache>(bg_vcpu_env_.bg_disk_cache_env,
-                                          download_buffers_);
+      if (file_size > options_.disk_data_cache_max_file_size) {
+        cache = std::make_shared<BlockCache>(data_buffers_);
+      } else {
+        cache = std::make_shared<DiskCache>(bg_vcpu_env_.bg_disk_cache_env,
+                                            data_buffers_);
+      }
       break;
     default:
       std::abort();
@@ -2941,9 +3003,10 @@ std::shared_ptr<ICache> OssFs::create_inode_cache() {
   return cache;
 }
 
-void OssFs::evict_inode_cache(FileInode *inode) {
+void OssFs::evict_inode_cache(FileInode *inode, std::string_view path) {
   if (inode->cache) {
-    inode->cache = create_inode_cache();
+    inode->cache->drop(
+        CacheKey{path, inode->etag, inode->attr.mtime, inode->attr.size});
   }
 }
 
@@ -2987,6 +3050,7 @@ int OssFs::truncate_inode_data(Inode *inode, std::string_view full_path,
                           to_size);
 
   struct stat stbuf = {};
+  std::string new_etag;
 
   auto background_env = bg_vcpu_env_.bg_obj_store_env->get_obj_store_env_next();
   int r = background_env.executor->perform([&]() {
@@ -3014,8 +3078,7 @@ int OssFs::truncate_inode_data(Inode *inode, std::string_view full_path,
       return ret;
     }
 
-    std::string unused_etag;
-    int stat_r = obj_store->stat(full_path, &stbuf, &unused_etag);
+    int stat_r = obj_store->stat(full_path, &stbuf, &new_etag);
     return static_cast<ssize_t>(stat_r);
   });
 
@@ -3024,7 +3087,7 @@ int OssFs::truncate_inode_data(Inode *inode, std::string_view full_path,
   }
 
   file_inode->invalidate_data_cache = true;
-  file_inode->etag.clear();
+  file_inode->etag = new_etag;
   file_inode->update_attr(0, stbuf.st_mtim, stbuf.st_atim);
   return 0;
 }
@@ -3775,14 +3838,11 @@ void OssFs::run_health_check() {
   while (!is_stopping_) AUTO_USLEEP(100000);
 }
 
-void OssFs::update_creds(const ObjCredentials &creds) {
-  auto ctxs = bg_vcpu_env_.bg_obj_store_env->get_all_env_cxts();
-  for (auto &ctx : ctxs) {
-    ctx.executor->perform([&]() {
-      ctx.obj_store->set_credentials(
-          {creds.accessKeyId, creds.accessKeySecret, creds.securityToken});
-    });
-  }
+void OssFs::update_creds(const ObjCredentials &creds, const CredsMeta &meta) {
+  bg_vcpu_env_.bg_obj_store_env->for_each_obj_store([&](IObjStore *store) {
+    store->set_credentials(
+        {creds.accessKeyId, creds.accessKeySecret, creds.securityToken}, meta);
+  });
 }
 
 int OssFs::validate_creds(const ObjCredentials &creds, bool allow_auto_create) {
@@ -3790,7 +3850,8 @@ int OssFs::validate_creds(const ObjCredentials &creds, bool allow_auto_create) {
   std::unique_ptr<IObjStore> obj_store =
       std::unique_ptr<IObjStore>(new_oss_store("", "", options));
   obj_store->set_credentials(
-      {creds.accessKeyId, creds.accessKeySecret, creds.securityToken});
+      {creds.accessKeyId, creds.accessKeySecret, creds.securityToken},
+      CredsMeta{});
   int r = obj_store->check_bucket(allow_auto_create);
   if (r != 0) {
     LOG_ERROR("Fail to check bucket with ak ` error `", creds.accessKeyId, r);
@@ -3799,6 +3860,7 @@ int OssFs::validate_creds(const ObjCredentials &creds, bool allow_auto_create) {
 }
 
 std::pair<int, uint64_t> OssFs::do_refresh_creds(bool allow_auto_create) {
+  SCOPED_LOCK(creds_refresh_mutex_);
   int r = -EINVAL;
   auto info =
       creds_provider_->refresh_credentials([&](const ObjCredentials &creds) {
@@ -3806,7 +3868,7 @@ std::pair<int, uint64_t> OssFs::do_refresh_creds(bool allow_auto_create) {
         return r == 0;
       });
   if (info.creds != nullptr) {
-    update_creds(*info.creds);
+    update_creds(*info.creds, info.meta);
   }
   return {r, info.next_refresh_interval_us};
 }
@@ -3815,14 +3877,36 @@ uint64_t OssFs::refresh_creds() {
   return do_refresh_creds().second;
 }
 
-void OssFs::start_creds_refresher(std::promise<int> &result_promise) {
-  INIT_PHOTON();
+int OssFs::force_refresh_creds(uint64_t observed_gen) {
+  if (is_stopping_ || !creds_refresh_executor_) return -1;
+  return creds_refresh_executor_->perform([&]() {
+    SCOPED_LOCK(creds_refresh_mutex_);
+    CredentialsProvider::CredentialsInfo info;
+    int r = creds_provider_->force_refresh(
+        observed_gen,
+        [&](const ObjCredentials &creds) { return validate_creds(creds) == 0; },
+        &info);
+    // Pushed even when unchanged: the expiry may have moved forward.
+    if (info.creds != nullptr) {
+      update_creds(*info.creds, info.meta);
+    }
+    return r;
+  });
+}
 
-  auto [result, next] = do_refresh_creds(true);
-  result_promise.set_value(result);
+void OssFs::register_creds_refresh_handler() {
+  bg_vcpu_env_.bg_obj_store_env->for_each_obj_store([this](IObjStore *store) {
+    store->set_creds_refresh_handler([this](uint64_t observed_gen) {
+      return force_refresh_creds(observed_gen);
+    });
+  });
+}
 
-  photon::Timer timer(next, {this, &OssFs::refresh_creds}, true);
-  while (!is_stopping_) AUTO_USLEEP(100000);
+int OssFs::warmup_internal(std::string_view warm_path) {
+  LOG_INFO("Warming up `", warm_path);
+  AUTO_USLEEP(3000000);  // 3s for test.
+  LOG_INFO("Warmup finished.");
+  return 0;
 }
 
 }  // namespace OssFileSystem

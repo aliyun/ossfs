@@ -85,7 +85,7 @@ bool is_subdir(const std::string &parent, const std::string &child) {
   }
 }
 
-int daemonize(int foreground, int pipefd, void (*log_exit_error)(char)) {
+int daemonize(int foreground, int pipefd[2], void (*log_exit_error)(char)) {
   int fd;
   char c;
 
@@ -94,16 +94,48 @@ int daemonize(int foreground, int pipefd, void (*log_exit_error)(char)) {
     return 0;
   }
 
-  switch (fork()) {
+  pid_t pid = fork();
+  switch (pid) {
     case -1:
       return -1;
     case 0:
+      // Do not close pipefd[0] here: the caller (main) closes both ends
+      // after FUSE exits, and closing the read end here while the caller
+      // still closes it later would be a double-close on a possibly
+      // recycled fd number.
       break;
-    default:
-      // wait for a completion signal
-      read(pipefd, &c, sizeof(c));
+    default: {
+      // Wait for the child to write its mount-completion status to the pipe.
+      // Close the write end so that if the daemon child dies without
+      // writing, read() gets EOF instead of blocking forever (the parent
+      // inherited its own copy of the write end).
+      close(pipefd[1]);
+      ssize_t n = read(pipefd[0], &c, sizeof(c));
+      if (n <= 0) {
+        // EOF means the child died before reporting mount completion, which
+        // is always a failure even if its exit code was 0.
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (WIFSIGNALED(status)) {
+          fprintf(stderr,
+                  "ERROR: ossfs2 daemon process %d was killed by signal %d, "
+                  "mount aborted\n",
+                  pid, WTERMSIG(status));
+          _exit(128 + WTERMSIG(status));
+        }
+        int exit_code = WEXITSTATUS(status);
+        if (exit_code == 0) {
+          exit_code = 1;
+        }
+        fprintf(stderr,
+                "ERROR: ossfs2 daemon process %d exited unexpectedly with "
+                "code %d before mount completed\n",
+                pid, WEXITSTATUS(status));
+        _exit(exit_code);
+      }
       log_exit_error(c);
       _exit(c);
+    }
   }
 
   if (setsid() == -1) {
@@ -175,6 +207,9 @@ void release_assert_fail(const char *file, int line, const char *expr) {
 std::optional<uint64_t> parse_bytes_string(std::string_view s) {
   auto trimed = trim_string_view(s);
   if (trimed.empty()) return std::nullopt;
+
+  // "-1" stands for unlimited (the max value).
+  if (trimed == "-1") return UINT64_MAX;
 
   size_t num_end = 0;
   while (num_end < trimed.size() && std::isdigit(trimed[num_end])) {

@@ -38,16 +38,31 @@ static_assert(sizeof(OptionsRegistry::kCategoryNames) /
                   OptionsRegistry::OptionCategory::kCount,
               "kCategoryNames size mismatch");
 
+std::vector<std::string> OptionsRegistry::get_inapplicable_options(
+    bool is_hdfs,
+    const std::function<bool(std::string_view)> &is_explicitly_set) {
+  uint8_t current_mode = is_hdfs ? kModeHdfs : kModeOss;
+  std::vector<std::string> result;
+  for (const auto &category : options_) {
+    for (const auto &option : category) {
+      if (option.modes & current_mode) continue;
+      if (!is_explicitly_set(option.name)) continue;
+      result.push_back(option.name);
+    }
+  }
+  return result;
+}
+
 // ==================== General options ====================
 DEFINE_OPTION(d, bool, false, "Run ossfs2 in foreground debugging mode",
-              kGeneralOptions, false, false);
+              kGeneralOptions, false, false, kModeAll);
 DEFINE_OPTION(f, bool, false, "Run ossfs2 in the foreground mode",
-              kGeneralOptions, false, false);
+              kGeneralOptions, false, false, kModeAll);
 DEFINE_OPTION(nonempty, bool, false, "Enable mounting to a non-empty directory",
-              kGeneralOptions, true, false);
+              kGeneralOptions, true, false, kModeAll);
 DEFINE_OPTION(total_mem_limit, string, "0",
               "The total memory soft limit. 0 means no limit", kGeneralOptions,
-              false, false);
+              false, false, kModeOss);
 
 static bool validate_bytes_string(const char *flagname,
                                   const std::string &value) {
@@ -57,7 +72,7 @@ DEFINE_validator(total_mem_limit, &validate_bytes_string);
 
 DEFINE_OPTION(total_rw_mem_ratio, double, 0.6,
               "The ratio of total memory allocated for read/write operations",
-              kGeneralOptions, true, true);
+              kGeneralOptions, true, true, kModeOss);
 static bool validate_total_rw_mem_ratio(const char *flagname, double value) {
   return value > 0 && value < 1.0;
 }
@@ -65,21 +80,21 @@ DEFINE_validator(total_rw_mem_ratio, &validate_total_rw_mem_ratio);
 
 // ==================== FileSystem Options ====================
 DEFINE_OPTION(ro, bool, false, "Run ossfs2 in read-only mode",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeAll);
 
 DEFINE_OPTION(uid, uint64, 0, "Owner user UID", kFileSystemOptions, false,
-              false);
+              false, kModeAll);
 static bool validate_gid_uid(const char *flagname, uint64_t value) {
   return value >= 0 && value <= std::numeric_limits<uint32_t>::max();
 }
 DEFINE_validator(uid, &validate_gid_uid);
 
 DEFINE_OPTION(gid, uint64, 0, "Owner group GID", kFileSystemOptions, false,
-              false);
+              false, kModeAll);
 DEFINE_validator(gid, &validate_gid_uid);
 
 DEFINE_OPTION(dir_mode, string, "0777", "Directory permissions(octal format)",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeAll);
 static bool validate_mode(const char *flagname, const std::string &value) {
   bool flag = true;
   if (value.size() != 4) {
@@ -99,53 +114,51 @@ static bool validate_mode(const char *flagname, const std::string &value) {
 DEFINE_validator(dir_mode, &validate_mode);
 
 DEFINE_OPTION(file_mode, string, "0777", "File permissions(octal format)",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeAll);
 DEFINE_validator(file_mode, &validate_mode);
 
 DEFINE_OPTION(fuse_threads, int32, 128, "The number of FUSE worker threads",
-              kFileSystemOptions, false, true);
+              kFileSystemOptions, false, true, kModeAll);
 static bool validate_fuse_threads(const char *flagname, int32_t value) {
   return value >= 1 && value <= 1024;
 }
 DEFINE_validator(fuse_threads, &validate_fuse_threads);
 
 DEFINE_OPTION(readdirplus, bool, true, "Enable FUSE readdirplus optimization",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeAll);
 DEFINE_OPTION(ignore_fsync, bool, true,
               "Ignore FUSE fsync requests. Defaults to false in random-write "
               "mode for correct POSIX semantics",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeOss);
 DEFINE_OPTION(allow_mark_dir_stale_recursively, bool, false,
               "Allow marking directory cache as stale recursively",
-              kFileSystemOptions, true, true);
+              kFileSystemOptions, true, true, kModeAll);
 DEFINE_OPTION(allow_rename_dir, bool, true, "Allow renaming directories",
-              kFileSystemOptions, true, true);
+              kFileSystemOptions, true, true, kModeAll);
 DEFINE_OPTION(
     rename_dir_limit, uint64, 2000000,
     "The maximum number of entries during a single rename-dir operation",
-    kFileSystemOptions, false, false);
+    kFileSystemOptions, false, false, kModeOss);
 
 DEFINE_OPTION(allow_other, bool, true,
               "Allow other users, including root, to access the filesystem",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeAll);
 
 DEFINE_OPTION(default_permissions, bool, false,
-              "Let kernel handle permission checks (HDFS mode only, forced "
-              "true in OSS mode)",
-              kFileSystemOptions, false, false);
+              "Let kernel handle permission checks", kFileSystemOptions, false,
+              false, kModeHdfs);
 
 DEFINE_OPTION(seq_read_detect_count, int32, 3,
               "The number of sequential reads required to trigger prefetching",
-              kFileSystemOptions, false, true);
+              kFileSystemOptions, false, true, kModeOss);
 
 DEFINE_OPTION(enable_symlink, bool, false, "Enable symlink support",
-              kFileSystemOptions, false, false);
-DEFINE_OPTION(enable_xattr, bool, true, "Enable xattr support (HDFS only)",
-              kFileSystemOptions, false, false);
-DEFINE_OPTION(
-    hdfs_set_owner_on_create, bool, false,
-    "Explicitly set file owner on HDFS backend after create/mkdir/mknod",
-    kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeAll);
+DEFINE_OPTION(enable_xattr, bool, false, "Enable xattr support",
+              kFileSystemOptions, false, false, kModeHdfs);
+DEFINE_OPTION(hdfs_set_owner_on_create, bool, false,
+              "Explicitly set file owner after create/mkdir/mknod",
+              kFileSystemOptions, false, false, kModeHdfs);
 
 static bool validate_seq_read_detect_count(const char *flagname,
                                            int32_t value) {
@@ -155,7 +168,7 @@ DEFINE_validator(seq_read_detect_count, &validate_seq_read_detect_count);
 
 // ==================== Oss Bucket Options ====================
 DEFINE_OPTION(oss_endpoint, string, "", "OSS endpoint", kOssBucketOptions,
-              false, false);
+              false, false, kModeAll);
 static bool validate_nonempty_string(const char *flagname,
                                      const std::string &value) {
   return !value.empty();
@@ -163,33 +176,33 @@ static bool validate_nonempty_string(const char *flagname,
 DEFINE_validator(oss_endpoint, &validate_nonempty_string);
 
 DEFINE_OPTION(oss_bucket, string, "", "OSS bucket name", kOssBucketOptions,
-              false, false);
+              false, false, kModeAll);
 DEFINE_validator(oss_bucket, &validate_nonempty_string);
 
 DEFINE_OPTION(oss_bucket_prefix, string, "", "OSS bucket prefix path",
-              kOssBucketOptions, false, false);
+              kOssBucketOptions, false, false, kModeAll);
 DEFINE_OPTION(oss_region, string, "",
               "OSS region ID. Used with the OSS signature v4",
-              kOssBucketOptions, false, false);
+              kOssBucketOptions, false, false, kModeOss);
 DEFINE_OPTION(auto_create_bucket, bool, false,
               "Auto create the bucket at mount time if it does not exist",
-              kOssBucketOptions, false, false);
+              kOssBucketOptions, false, false, kModeOss);
 DEFINE_OPTION(agentic_bucket, string, "",
               "Agentic bucket name attached when auto creating the bucket",
-              kOssBucketOptions, false, false);
+              kOssBucketOptions, false, false, kModeOss);
 
 // ==================== Oss Credential Options ====================
 DEFINE_OPTION(oss_access_key_id, string, "", "OSS access key ID",
-              kOssCredentialsOptions, false, false);
+              kOssCredentialsOptions, false, false, kModeAll);
 DEFINE_OPTION(oss_access_key_secret, string, "", "OSS access key secret",
-              kOssCredentialsOptions, false, false);
+              kOssCredentialsOptions, false, false, kModeAll);
 
 DEFINE_OPTION(ram_role, string, "", "RAM role name", kOssCredentialsOptions,
-              false, false);
+              false, false, kModeOss);
 
 DEFINE_OPTION(credential_process, string, "",
               "External credential process command", kOssCredentialsOptions,
-              false, false);
+              false, false, kModeOss);
 
 static bool validate_credential_process(const char *flagname,
                                         const std::string &value) {
@@ -213,7 +226,7 @@ DEFINE_validator(credential_process, &validate_credential_process);
 DEFINE_OPTION(credential_refresh_interval, uint64, 0,
               "Credential refresh interval in seconds (0 means use default "
               "expiration-based strategy)",
-              kOssCredentialsOptions, false, false);
+              kOssCredentialsOptions, false, false, kModeOss);
 
 static bool validate_credential_refresh_interval(const char *flagname,
                                                  uint64_t value) {
@@ -224,16 +237,22 @@ static bool validate_credential_refresh_interval(const char *flagname,
 DEFINE_validator(credential_refresh_interval,
                  &validate_credential_refresh_interval);
 
+DEFINE_OPTION(credential_refresh_backoff, bool, false,
+              "Enable exponential backoff with jitter when credential "
+              "refresh fails, and honor the Retry-After header on 429/503 "
+              "responses",
+              kOssCredentialsOptions, false, false, kModeOss);
+
 // ==================== Caching options ====================
 DEFINE_OPTION(attr_timeout, uint64, 60, "Attribute cache timeout in seconds",
-              kCachingOptions, false, false);
+              kCachingOptions, false, false, kModeAll);
 DEFINE_OPTION(negative_timeout, uint64, 0, "Negative cache timeout in seconds",
-              kCachingOptions, false, false);
+              kCachingOptions, false, false, kModeAll);
 
 DEFINE_OPTION(fuse_attr_timeout, int64, -1,
               "FUSE attribute cache timeout in seconds. -1 means to set it the "
               "same as attr_timeout",
-              kCachingOptions, false, true);
+              kCachingOptions, false, true, kModeAll);
 static bool validate_fuse_attr_timeout(const char *flagname, int64_t value) {
   return value == -1 || value >= 0;
 }
@@ -242,37 +261,45 @@ DEFINE_validator(fuse_attr_timeout, &validate_fuse_attr_timeout);
 DEFINE_OPTION(fuse_entry_timeout, int64, -1,
               "FUSE entry cache timeout in seconds. -1 means to set it the "
               "same as attr_timeout",
-              kCachingOptions, false, true);
+              kCachingOptions, false, true, kModeAll);
 DEFINE_validator(fuse_entry_timeout, &validate_fuse_attr_timeout);
 
 DEFINE_OPTION(kernel_readdir_cache_timeout, int64, 0,
               "Kernel readdir cache timeout in seconds. 0 means no cache",
-              kCachingOptions, false, false);
+              kCachingOptions, false, false, kModeAll);
 
 DEFINE_OPTION(close_to_open, bool, false, "Enable close-to-open consistency",
-              kCachingOptions, false, false);
+              kCachingOptions, false, false, kModeAll);
 
 DEFINE_OPTION(inode_cache_eviction_threshold, uint64, 0,
               "Inode cache eviction threshold. 0 means no eviction",
-              kCachingOptions, false, true);
+              kCachingOptions, false, true, kModeAll);
 DEFINE_OPTION(inode_cache_eviction_interval_ms, uint64, 30000,
               "Inode cache eviction interval in milliseconds", kCachingOptions,
-              false, true);
+              false, true, kModeAll);
+DEFINE_OPTION(async_task_limit, uint32, 1000, "Maximum number of async tasks",
+              kCachingOptions, true, true, kModeAll);
+static bool validate_async_task_limit(const char *flagname, uint32_t value) {
+  return value <= 1024 && value >= 1;
+}
+DEFINE_validator(async_task_limit, &validate_async_task_limit);
+
 DEFINE_OPTION(max_inode_cache_count, uint64, 0,
-              "Maximum number of cached inodes", kCachingOptions, true, true);
+              "Maximum number of cached inodes", kCachingOptions, true, true,
+              kModeAll);
 
 // oss_negative_cache_timeout should be smaller than attr_timeout
 DEFINE_OPTION(oss_negative_cache_timeout, uint64, 0,
               "OSS negative cache timeout in seconds", kCachingOptions, false,
-              false);
+              false, kModeAll);
 // 10000 entries cost at most about 20 MiB (assume fullpath's length is 1023)
 DEFINE_OPTION(oss_negative_cache_size, uint64, 10000,
               "The maximum number of entries in the OSS negative cache",
-              kCachingOptions, false, false);
+              kCachingOptions, false, false, kModeAll);
 
 DEFINE_OPTION(cache_type, string, "standard",
-              "Cache type. Valid values: standard", kCachingOptions, true,
-              true);
+              "Cache type. Valid values: standard", kCachingOptions, true, true,
+              kModeAll);
 static bool validate_cache_type(const char *flagname,
                                 const std::string &value) {
   return value == "standard";
@@ -285,22 +312,22 @@ DEFINE_OPTION(
     "speeds up file reads via concurrent access from multiple file "
     "descriptors. NOTICE: Currently cache is released once all file "
     "descriptors are closed",
-    kCachingOptions, false, false);
+    kCachingOptions, false, false, kModeOss);
 
 DEFINE_validator(memory_data_cache_size, &validate_bytes_string);
 
 DEFINE_OPTION(share_fd_read_buffer, bool, true, "Enable shared fd read buffer",
-              kCachingOptions, true, true);
+              kCachingOptions, true, true, kModeOss);
 
 DEFINE_OPTION(
     disk_data_cache_dir, string, "",
     "The directory for disk data cache. NOTICE: Directory must be empty",
-    kCachingOptions, false, false);
+    kCachingOptions, false, false, kModeOss);
 
 DEFINE_OPTION(disk_data_cache_size, string, "0",
               "The capacity for disk data cache. Value should be aligned "
               "to GiB",
-              kCachingOptions, false, false);
+              kCachingOptions, false, false, kModeOss);
 static bool validate_disk_data_cache_size(const char *flagname,
                                           const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -311,7 +338,7 @@ DEFINE_validator(disk_data_cache_size, &validate_disk_data_cache_size);
 
 DEFINE_OPTION(disk_data_cache_io_engine, string, "psync",
               "IO engine for disk data cache: libaio or psync", kCachingOptions,
-              false, false);
+              false, false, kModeOss);
 static bool validate_disk_data_cache_io_engine(const char *flagname,
                                                const std::string &value) {
   return value == "libaio" || value == "psync";
@@ -322,7 +349,7 @@ DEFINE_validator(disk_data_cache_io_engine,
 DEFINE_OPTION(libaio_vcpu_count, int32, 4,
               "Experimental: the number of background vCPUs for disk data "
               "cache, only effective with the libaio io engine",
-              kCachingOptions, true, true);
+              kCachingOptions, true, true, kModeOss);
 static bool validate_libaio_vcpu_count(const char *flagname, int32_t value) {
   return value >= 1 && value <= 64;
 }
@@ -330,7 +357,7 @@ DEFINE_validator(libaio_vcpu_count, &validate_libaio_vcpu_count);
 
 DEFINE_OPTION(disk_available_space, string, "1G",
               "Available space threshold for disk (default 1G)",
-              kCachingOptions, true, true);
+              kCachingOptions, true, true, kModeOss);
 static bool validate_disk_available_space(const char *flagname,
                                           const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -338,9 +365,16 @@ static bool validate_disk_available_space(const char *flagname,
 }
 DEFINE_validator(disk_available_space, &validate_disk_available_space);
 
+DEFINE_OPTION(disk_data_cache_max_file_size, string, "-1",
+              "Maximum object size to cache in disk data cache. "
+              "Objects larger than this size fall back to the memory cache. "
+              "-1 means no limit",
+              kCachingOptions, true, true, kModeOss);
+DEFINE_validator(disk_data_cache_max_file_size, &validate_bytes_string);
+
 // ==================== Oss Client Options ====================
-DEFINE_OPTION(upload_buffer_size, string, "8388608", "Upload buffer size",
-              kOssClientOptions, false, false);
+DEFINE_OPTION(upload_buffer_size, string, "8MiB", "Upload buffer size",
+              kOssClientOptions, false, false, kModeOss);
 static bool validate_upload_buffer_size(const char *flagname,
                                         const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -350,26 +384,27 @@ static bool validate_upload_buffer_size(const char *flagname,
 DEFINE_validator(upload_buffer_size, &validate_upload_buffer_size);
 
 DEFINE_OPTION(upload_concurrency, int32, 64, "Concurrency for multipart upload",
-              kOssClientOptions, false, false);
+              kOssClientOptions, false, false, kModeOss);
 static bool validate_upload_concurrency(const char *flagname, int32_t value) {
   return value >= 1 && value <= 1024;
 }
 DEFINE_validator(upload_concurrency, &validate_upload_concurrency);
 
 DEFINE_OPTION(upload_copy_concurrency, int32, 64,
-              "Concurrency for multipart copy", kOssClientOptions, false,
-              false);
+              "Concurrency for multipart copy", kOssClientOptions, false, false,
+              kModeOss);
 DEFINE_validator(upload_copy_concurrency, &validate_upload_concurrency);
 
 DEFINE_OPTION(prefetch_concurrency, int32, 256, "Global prefetch concurrency",
-              kOssClientOptions, false, false);
+              kOssClientOptions, false, false, kModeOss);
 static bool validate_prefetch_concurrency(const char *flagname, int32_t value) {
   return value >= 0 && value <= 4096;
 }
 DEFINE_validator(prefetch_concurrency, &validate_prefetch_concurrency);
 
 DEFINE_OPTION(prefetch_concurrency_per_file, int32, 64,
-              "Prefetch concurrency per file", kOssClientOptions, false, false);
+              "Prefetch concurrency per file", kOssClientOptions, false, false,
+              kModeOss);
 static bool validate_prefetch_concurrency_per_file(const char *flagname,
                                                    int32_t value) {
   return value >= 1 && value <= 4096;
@@ -377,8 +412,9 @@ static bool validate_prefetch_concurrency_per_file(const char *flagname,
 DEFINE_validator(prefetch_concurrency_per_file,
                  &validate_prefetch_concurrency_per_file);
 
-DEFINE_OPTION(prefetch_chunk_size, string, "8388608",
-              "Size of each Prefetch chunk", kOssClientOptions, false, false);
+DEFINE_OPTION(prefetch_chunk_size, string, "8MiB",
+              "Size of each Prefetch chunk", kOssClientOptions, false, false,
+              kModeOss);
 static bool validate_prefetch_chunk_size(const char *flagname,
                                          const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -390,7 +426,7 @@ DEFINE_validator(prefetch_chunk_size, &validate_prefetch_chunk_size);
 DEFINE_OPTION(prefetch_chunks, int32, 0,
               "The total prefetch chunk count. 0 means "
               "auto(prefetch_concurrency * 3), -1 means unlimited",
-              kOssClientOptions, false, false);
+              kOssClientOptions, false, false, kModeOss);
 static bool validate_prefetch_chunks(const char *flagname, int32_t value) {
   return value >= -1;
 }
@@ -398,7 +434,7 @@ DEFINE_validator(prefetch_chunks, &validate_prefetch_chunks);
 
 DEFINE_OPTION(min_reserved_buffer_size_per_file, uint64, 1048576,
               "The minimum reserved buffer size per file", kOssClientOptions,
-              false, true);
+              false, true, kModeOss);
 static bool validate_min_reserved_buffer_size_per_file(const char *flagname,
                                                        uint64_t value) {
   return value == 0 || value == 1048576;
@@ -408,10 +444,10 @@ DEFINE_validator(min_reserved_buffer_size_per_file,
 
 DEFINE_OPTION(enable_appendable_object, bool, false,
               "Using appendable object for upload with AppendObject API",
-              kOssClientOptions, false, false);
+              kOssClientOptions, false, false, kModeOss);
 DEFINE_OPTION(appendable_object_autoswitch_threshold, uint64, 0,
               "Threshold for automatically switching to appendable object",
-              kOssClientOptions, false, false);
+              kOssClientOptions, false, false, kModeOss);
 static bool validate_appendable_object_autoswitch_threshold(
     const char *flagname, uint64_t value) {
   return value >= 0 && value <= 5ULL * 1024 * 1024 * 1024;
@@ -424,12 +460,12 @@ DEFINE_OPTION(temp_dir, string, "",
               "Setting a non-empty path enables random-write mode. Empty "
               "disables the feature. Mutually exclusive with "
               "enable_appendable_object.",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeOss);
 
-DEFINE_OPTION(random_write_chunk_size, string, "2097152",
-              "Logical chunk size of the random-write context (bytes). "
-              "Range [1 MiB, 256 MiB]. Default 2 MiB.",
-              kFileSystemOptions, true, false);
+DEFINE_OPTION(random_write_chunk_size, string, "2MiB",
+              "Logical chunk size of the random-write context. "
+              "Range [1 MiB, 256 MiB]",
+              kFileSystemOptions, true, false, kModeOss);
 static bool validate_random_write_chunk_size(const char *flagname,
                                              const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -438,13 +474,13 @@ static bool validate_random_write_chunk_size(const char *flagname,
 }
 DEFINE_validator(random_write_chunk_size, &validate_random_write_chunk_size);
 
-DEFINE_OPTION(random_write_max_file_size, string, "107374182400",
-              "Maximum logical size of a single file in random-write mode "
-              "(bytes). Writes/truncates extending a file beyond this limit "
-              "fail with EFBIG. Default 100 GiB. Raise it for larger files; "
+DEFINE_OPTION(random_write_max_file_size, string, "100GiB",
+              "Maximum logical size of a single file in random-write mode. "
+              "Writes/truncates extending a file beyond this limit "
+              "fail with EFBIG. Raise it for larger files; "
               "hard upper bound is the OSS multipart capacity (10000 parts "
               "x 5 GiB, about 48.8 TiB).",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeOss);
 static bool validate_random_write_max_file_size(const char *flagname,
                                                 const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -455,12 +491,12 @@ static bool validate_random_write_max_file_size(const char *flagname,
 DEFINE_validator(random_write_max_file_size,
                  &validate_random_write_max_file_size);
 
-DEFINE_OPTION(temp_dir_free_bytes, string, "1073741824",
-              "Free disk space (bytes) to keep on the temp_dir filesystem. "
-              "Default 1 GiB. Minimum 64 MiB. When both temp_dir_free_bytes "
+DEFINE_OPTION(temp_dir_free_bytes, string, "1GiB",
+              "Free disk space to keep on the temp_dir filesystem. "
+              "Minimum 64 MiB. When both temp_dir_free_bytes "
               "and temp_dir_free_percent are set, the larger reserved size "
               "wins.",
-              kFileSystemOptions, false, false);
+              kFileSystemOptions, false, false, kModeOss);
 static bool validate_temp_dir_free_bytes(const char *flagname,
                                          const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -475,7 +511,7 @@ DEFINE_OPTION(
     "to keep free. Default 0 (disabled). The effective ratio is "
     "temp_dir_free_percent / 100. When both temp_dir_free_bytes and "
     "temp_dir_free_percent are set, the larger reserved size wins.",
-    kFileSystemOptions, false, false);
+    kFileSystemOptions, false, false, kModeOss);
 static bool validate_temp_dir_free_percent(const char *flagname,
                                            uint32_t value) {
   return value < 100;
@@ -484,25 +520,25 @@ DEFINE_validator(temp_dir_free_percent, &validate_temp_dir_free_percent);
 
 DEFINE_OPTION(sync_upload, bool, true,
               "Synchronized uploading before file closing", kFileSystemOptions,
-              true, false);
+              true, false, kModeAll);
 
 DEFINE_OPTION(enable_crc64, bool, true,
               "Enable CRC64 checksum verification when uploading files",
-              kOssClientOptions, false, false);
+              kOssClientOptions, false, false, kModeOss);
 
 DEFINE_OPTION(oss_vcpu_count, uint64, 8, "The number of OSS background vCPUs",
-              kOssClientOptions, false, true);
+              kOssClientOptions, false, true, kModeOss);
 static bool validate_oss_vcpu_count(const char *flagname, uint64_t value) {
   return value >= 1 && value <= 128;
 }
 DEFINE_validator(oss_vcpu_count, &validate_oss_vcpu_count);
 
 DEFINE_OPTION(use_list_obj_v2, bool, true, "Use ListObject API v2",
-              kOssClientOptions, true, true);
+              kOssClientOptions, true, true, kModeOss);
 DEFINE_OPTION(
     max_list_ret_count, int32, 100,
     "The maximum number of the items returned by a single ListObject request",
-    kOssClientOptions, true, true);
+    kOssClientOptions, true, true, kModeAll);
 static bool validate_max_list_ret_count(const char *flagname, int32_t value) {
   return value >= 100 && value <= 1000;
 }
@@ -510,7 +546,7 @@ DEFINE_validator(max_list_ret_count, &validate_max_list_ret_count);
 
 DEFINE_OPTION(oss_request_timeout_ms, uint64, 60000,
               "OSS request timeout in milliseconds", kOssClientOptions, false,
-              false);
+              false, kModeOss);
 static bool validate_oss_request_timeout_ms(const char *flagname,
                                             uint64_t value) {
   // [1s, 900s]
@@ -520,9 +556,9 @@ DEFINE_validator(oss_request_timeout_ms, &validate_oss_request_timeout_ms);
 
 DEFINE_OPTION(
     oss_hdfs_client_options, string, "",
-    "Comma-separated JindoSDK client options as key=value pairs (HDFS only). "
+    "Comma-separated JindoSDK client options as key=value pairs. "
     "Use sdk.config.file=/path to load options from a properties file.",
-    kOssClientOptions, false, false);
+    kOssClientOptions, false, false, kModeHdfs);
 static bool validate_oss_hdfs_client_options(const char *flagname,
                                              const std::string &value) {
   if (value.empty()) return true;
@@ -541,16 +577,25 @@ DEFINE_validator(oss_hdfs_client_options, &validate_oss_hdfs_client_options);
 
 DEFINE_OPTION(bind_ips, string, "",
               "Comma-separated list of IPs to bind(e.g. 127.0.0.1,127.0.0.2)",
-              kOssClientOptions, false, false);
+              kOssClientOptions, false, false, kModeOss);
+DEFINE_OPTION(enable_ipv6, bool, true,
+              "Allow IPv6 addresses when resolving the endpoint and proxy "
+              "host. Set false to connect over IPv4 only",
+              kOssClientOptions, false, false, kModeOss);
+DEFINE_OPTION(path_style, bool, false,
+              "Use path-style requests http(s)://endpoint/bucket/object "
+              "instead of the virtual-hosted style "
+              "http(s)://bucket.endpoint/object",
+              kOssClientOptions, false, false, kModeOss);
 DEFINE_OPTION(set_mime_for_rename_dst, bool, false,
               "Set MIME type for rename-object requests", kOssClientOptions,
-              true, true);
+              true, true, kModeOss);
 DEFINE_OPTION(use_auth_cache, bool, false, "Use OSS authentication cache",
-              kOssClientOptions, true, true);
+              kOssClientOptions, true, true, kModeOss);
 
 DEFINE_OPTION(rename_dir_concurrency, int32, 128,
               "Concurrency for directory rename operations", kOssClientOptions,
-              true, true);
+              true, true, kModeOss);
 static bool validate_rename_dir_concurrency(const char *flagname,
                                             int32_t value) {
   return value >= 1 && value <= 1024;
@@ -559,38 +604,38 @@ DEFINE_validator(rename_dir_concurrency, &validate_rename_dir_concurrency);
 
 DEFINE_OPTION(enable_transmission_control, bool, true,
               "Enable network transmission control", kOssClientOptions, false,
-              true);
+              true, kModeOss);
 DEFINE_OPTION(tc_max_latency_threshold_us, uint64, 5000000,
               "Maximum allowed latency threshold for transmission control in "
               "microseconds",
-              kOssClientOptions, false, true);
+              kOssClientOptions, false, true, kModeOss);
 
 DEFINE_OPTION(http_proxy, string, "", "The HTTP proxy to use",
-              kOssClientOptions, true, true);
+              kOssClientOptions, true, true, kModeOss);
 
 // ==================== Logging options ====================
 DEFINE_OPTION(log_dir, string, "/tmp/ossfs2/", "The directory for log files",
-              kLoggingOptions, false, false);
+              kLoggingOptions, false, false, kModeAll);
 DEFINE_OPTION(log_level, string, "info",
               "The log level. Valid values: info and debug", kLoggingOptions,
-              false, false);
+              false, false, kModeAll);
 DEFINE_OPTION(log_file_max_size, uint64, 64 * 1024 * 1024,
               "Maximum size of a single log file", kLoggingOptions, false,
-              false);
+              false, kModeAll);
 DEFINE_OPTION(log_file_max_count, uint64, 8,
               "The maximum count of log files to keep", kLoggingOptions, false,
-              false);
+              false, kModeAll);
 
 // ==================== Advanced options ====================
 DEFINE_OPTION(enable_photon_logs, bool, false, "Enable photon logs",
-              kAdvancedOptions, true, true);
+              kAdvancedOptions, true, true, kModeAll);
 DEFINE_OPTION(skip_trim_options, bool, false, "Skip trim options",
-              kAdvancedOptions, true, true);
+              kAdvancedOptions, true, true, kModeAll);
 
 DEFINE_OPTION(
     metrics_port, int32, 0,
     "HTTP server port number for metrics. 0 means not to start the HTTP server",
-    kAdvancedOptions, true, true);
+    kAdvancedOptions, true, true, kModeAll);
 static bool validate_http_server_port(const char *flagname, int32_t value) {
   return value >= 0 && value <= 65535;
 }
@@ -598,16 +643,16 @@ DEFINE_validator(metrics_port, &validate_http_server_port);
 
 DEFINE_OPTION(metrics_ip, string, "127.0.0.1",
               "The IP address to expose the metrics server on",
-              kAdvancedOptions, true, true);
+              kAdvancedOptions, true, true, kModeAll);
 
 DEFINE_OPTION(enable_test_signal_handler, bool, false,
               "Enable test signal handler for SIGUSR1", kAdvancedOptions, true,
-              true);
+              true, kModeAll);
 
 DEFINE_OPTION(enable_admin_server, bool, true, "Enable admin server",
-              kAdvancedOptions, true, true);
+              kAdvancedOptions, true, true, kModeAll);
 
 DEFINE_OPTION(fuse_device_fd, int32, -1,
-              "Pre-opened FUSE device file descriptor for unprivileged launch"
-              "-1 means ossfs2 opens /dev/fuse itself",
-              kAdvancedOptions, false, false);
+              "Pre-opened FUSE device file descriptor for unprivileged "
+              "launch. -1 means ossfs2 opens /dev/fuse itself",
+              kAdvancedOptions, false, false, kModeAll);

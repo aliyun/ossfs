@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -39,6 +40,15 @@ struct RangeBuffer {
   std::string token;
 };
 
+// Identity key of the cached source. Each store decides on its own which
+// fields it consumes.
+struct CacheKey {
+  std::string_view object_key;
+  std::string_view etag;
+  struct timespec mtime = {0, 0};
+  size_t size = 0;
+};
+
 class ICacheStore {
  public:
   virtual ~ICacheStore() = default;
@@ -48,9 +58,9 @@ class ICacheStore {
   virtual void unpin(off_t offset) = 0;
   virtual std::pair<off_t, size_t> query_refill_range(off_t offset,
                                                       size_t count) = 0;
-  // Reinitializes the store for (object_key, etag, size).
-  virtual void drop(std::string_view object_key, std::string_view etag,
-                    size_t size) = 0;
+  // Drops cached data; force=false keeps block-cache data for an unchanged
+  // etag.
+  virtual void drop(const CacheKey &key, bool force = true) = 0;
 
   // Acquires a writable cache buffer for range [offset, offset + count).
   // On success, populates 'buffer' that the caller can fill with data.
@@ -68,8 +78,9 @@ class ICache {
   virtual ~ICache() = default;
 
   virtual size_t block_size() const = 0;
-  virtual CacheHandle *get(std::string_view name, std::string_view etag,
-                           size_t size = 0) = 0;
+  virtual CacheHandle *get(const CacheKey &key) = 0;
+  // Unlike get(), never creates an entry; returns false if no store exists.
+  virtual bool drop(const CacheKey &key) = 0;
   virtual size_t capacity() = 0;
 
   virtual size_t try_expand_blocks(uint64_t count, uint64_t max_capacity,
@@ -102,8 +113,8 @@ struct CacheHandle {
     return cache_store->query_refill_range(offset, count);
   }
 
-  void drop(std::string_view object_key, std::string_view etag, size_t size) {
-    cache_store->drop(object_key, etag, size);
+  void drop(const CacheKey &key, bool force = true) {
+    cache_store->drop(key, force);
   }
 
   int acquire_write_buffer(RangeBuffer &range_buffer) {

@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 
@@ -36,6 +37,7 @@ namespace OssFileSystem {
 
 #define DO_OSS_CALL(func, ...)                               \
   ({                                                         \
+    refresh_creds_if_expired();                              \
     DECLARE_METRIC_LATENCY(oss_##func, Metric::kOssMetrics); \
     auto ret = oss_client_->func(__VA_ARGS__);               \
     if (ret < 0) {                                           \
@@ -54,6 +56,8 @@ namespace OssFileSystem {
 static constexpr mode_t kOssDirMode = (S_IFDIR | 0755);
 static constexpr mode_t kOssFileMode = (S_IFREG | 0755);
 static constexpr mode_t kOssSymlinkMode = (S_IFLNK | 0777);
+
+static constexpr time_t kCredsExpiryMarginSec = 60;
 
 namespace {
 struct FdWriterCtx {
@@ -150,8 +154,15 @@ static bool starts_with_dotdot(const std::filesystem::path &path) {
 OssStore::OssStore(const ObjStoreOptions &options, Authenticator *auth)
     : opts_(options), oss_client_(new_oss_client(options, auth)) {}
 
-void OssStore::set_credentials(ObjCredentials &&creds) {
+void OssStore::set_credentials(ObjCredentials &&creds, const CredsMeta &meta) {
   oss_client_->set_credentials(std::move(creds));
+  creds_meta_ = meta;
+}
+
+void OssStore::refresh_creds_if_expired() {
+  if (!creds_refresh_handler_ || creds_meta_.expiration <= 0) return;
+  if (time(nullptr) + kCredsExpiryMarginSec < creds_meta_.expiration) return;
+  creds_refresh_handler_(creds_meta_.generation);
 }
 
 int OssStore::head_object(std::string_view path, ObjHeaderMeta &meta) {
@@ -235,15 +246,18 @@ ssize_t OssStore::get_object_range_to_fd(std::string_view path, int fd,
 
 ssize_t OssStore::put_object(std::string_view path, const struct iovec *iov,
                              int iovcnt, uint64_t *expected_crc64,
-                             mode_t /*mode*/) {
+                             mode_t /*mode*/, std::string *etag) {
   auto time_before_req = std::chrono::steady_clock::now();
+  ObjectUploadOptions opts;
+  opts.expected_crc64 = expected_crc64;
+  opts.etag = etag;
   ssize_t r = 0;
   if (opts_.prefix.empty()) {
-    r = DO_OSS_CALL(put_object, path.substr(1), iov, iovcnt, expected_crc64);
+    r = DO_OSS_CALL(put_object, path.substr(1), iov, iovcnt, opts);
   } else {
     estring obj_path;
     obj_path.appends(opts_.prefix, path);
-    r = DO_OSS_CALL(put_object, obj_path, iov, iovcnt, expected_crc64);
+    r = DO_OSS_CALL(put_object, obj_path, iov, iovcnt, opts);
   }
 
   if (r > 0) {
@@ -281,18 +295,19 @@ ssize_t OssStore::put_object_from_fd(std::string_view path, int fd,
 
 ssize_t OssStore::append_object(std::string_view path, const struct iovec *iov,
                                 int iovcnt, off_t position,
-                                uint64_t *expected_crc64) {
+                                uint64_t *expected_crc64, std::string *etag) {
   auto time_before_req = std::chrono::steady_clock::now();
+  ObjectUploadOptions opts;
+  opts.expected_crc64 = expected_crc64;
+  opts.etag = etag;
   ssize_t r = 0;
 
   if (opts_.prefix.empty()) {
-    r = DO_OSS_CALL(append_object, path.substr(1), iov, iovcnt, position,
-                    expected_crc64);
+    r = DO_OSS_CALL(append_object, path.substr(1), iov, iovcnt, position, opts);
   } else {
     estring obj_path;
     obj_path.appends(opts_.prefix, path);
-    r = DO_OSS_CALL(append_object, obj_path, iov, iovcnt, position,
-                    expected_crc64);
+    r = DO_OSS_CALL(append_object, obj_path, iov, iovcnt, position, opts);
   }
 
   if (r > 0) {
@@ -356,8 +371,13 @@ ssize_t OssStore::upload_part_from_fd(void *context, int fd, off_t offset,
 
 int OssStore::upload_part_copy(void *context, off_t offset, size_t count,
                                int part_number, uint64_t *crc64_out) {
+  // Adapt to new photon API: upload_part_copy now takes
+  // ObjectPartCopyOptions& instead of uint64_t* for crc64 output.
+  ObjectPartCopyOptions copy_opts;
   int r = DO_OSS_CALL(upload_part_copy, context, offset, count, part_number,
-                      std::string_view{}, crc64_out);
+                      std::string_view{}, copy_opts);
+  if (r == 0 && crc64_out && copy_opts.crc64.has_value())
+    *crc64_out = copy_opts.crc64.value();
   // Simulate a copy-part response without the CRC64 header: photon leaves
   // the sentinel untouched in that case.
   FAULT_INJECTION(FI_RandomWrite_Copy_Part_No_Crc, [&]() {

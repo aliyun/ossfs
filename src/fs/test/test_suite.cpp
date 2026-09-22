@@ -37,16 +37,10 @@
 #include "oss/jdo_sdk_loader.h"
 #include "oss/obj_store.h"
 
-// for oss client
-DEFINE_string(oss_endpoint, "", "");
-DEFINE_string(oss_bucket, "", "");
-DEFINE_string(oss_bucket_prefix, "", "");
-DEFINE_string(oss_access_key_id, "", "");
-DEFINE_string(oss_access_key_secret, "", "");
-DEFINE_uint64(oss_request_timeout_ms, 32000, "oss request timeout");
+// oss_endpoint/oss_bucket/etc. are defined in src/options.cpp, which is
+// linked into ossfs2-test.
 DEFINE_string(disk_cache_io_engine, "random", "disk cache io engine");
 DEFINE_string(disk_cache_dir, "/root/tmp/ossfs2/cache", "disk cache dir");
-DEFINE_string(http_proxy, "", "HTTP proxy to use for tests");
 
 DEFINE_bool(write_with_fuse_bufvec, true, "");
 
@@ -628,7 +622,7 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
 
   bool use_list_obj_v2 = rand() % 2;
   bg_vcpu_env_.bg_obj_store_env = new OssFileSystem::BGVCpuObjStoreEnv;
-  int vcpu_num = rand() % 4 + 1;
+  int vcpu_num = bg_vcpu_num_ > 0 ? bg_vcpu_num_ : rand() % 4 + 1;
   LOG_INFO("create ` background vcpu oss client", vcpu_num);
 
   for (int i = 0; i < vcpu_num; i++) {
@@ -668,6 +662,8 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
       init_oss_signature = true;
       options.region = oss_region;
       options.bind_ips = bind_ips;
+      options.path_style = FLAGS_path_style;
+      options.ip_version = OssFileSystem::ip_version_for(FLAGS_enable_ipv6);
       options.request_timeout_us = timeout_ms * 1000;
       options.endpoint = endpoint;
       options.bucket = bucket;
@@ -689,16 +685,23 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
 
   if (fs_opts.cache_type == CacheType::kDiskCache) {
     fs_opts.share_fd_read_buffer = true;
+    int io_engine_type = random_disk_cache_io_engine(disk_cache_io_engine);
+    uint64_t photon_io_init = photon::INIT_IO_NONE;
+    if (io_engine_type == photon::fs::ioengine_libaio) {
+      LOG_INFO("Using libaio IO engine");
+      photon_io_init = photon::INIT_IO_LIBAIO;
+    }
+
     // Per-case isolation: use case-specific subdir to avoid conflicts in
     // parallel execution.
     auto case_name =
         ::testing::UnitTest::GetInstance()->current_test_info()->name();
-    bool is_eviction_test =
-        std::string(case_name).find("eviction") != std::string::npos;
-    if (!is_eviction_test && rand() % 2) {
+    // Eviction tests may also use tmpfs: each per-case cache pool is capped
+    // by its own 1GB quota, so the tmpfs footprint stays bounded no matter
+    // how much data the test pushes through OSS.
+    if (io_engine_type != photon::fs::ioengine_libaio && rand() % 2) {
       LOG_INFO("Using tmpfs for disk cache");
       disk_cache_dir_ = std::string("/dev/shm/ossfs2/cache/") + case_name;
-      disk_cache_io_engine = photon::fs::ioengine_psync;
     } else {
       disk_cache_dir_ = FLAGS_disk_cache_dir + "/" + std::string(case_name);
     }
@@ -706,13 +709,6 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
     sigset_t oldset;
     int bas = block_all_signal(&oldset);
     DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
-
-    int io_engine_type = random_disk_cache_io_engine(disk_cache_io_engine);
-    uint64_t photon_io_init = photon::INIT_IO_NONE;
-    if (io_engine_type == photon::fs::ioengine_libaio) {
-      LOG_INFO("Using libaio IO engine");
-      photon_io_init = photon::INIT_IO_LIBAIO;
-    }
 
     auto bg_disk_cache_env = new OssFileSystem::BGVCpuDiskCacheEnv();
     // libaio: random executor count in [1, 4]; psync: single primary

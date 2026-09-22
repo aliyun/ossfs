@@ -22,8 +22,8 @@
 namespace OssFileSystem {
 
 ProcessCredentialsProvider::ProcessCredentialsProvider(
-    std::string_view cmd, uint64_t refresh_interval_sec)
-    : CredentialsProvider(refresh_interval_sec), cmd_(cmd) {
+    std::string_view cmd, uint64_t refresh_interval_sec, bool backoff_enabled)
+    : CredentialsProvider(refresh_interval_sec, backoff_enabled), cmd_(cmd) {
   int r = split_command_tokens(cmd_, args_);
   if (r != 0) {
     LOG_ERROR("Failed to split command ` with r `", cmd_, r);

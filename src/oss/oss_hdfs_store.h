@@ -30,6 +30,10 @@ namespace OssFileSystem {
 // Defined in oss_hdfs_store.cpp, exposed for unit testing.
 int jdo_error_code_to_posix(int jdo_error_code);
 
+// Test-only login user override for JindoSDK::init, used together with
+// FAULT_INJECTION(FI_Hdfs_LoginUser_Override) to simulate non-root mounts.
+extern std::string g_test_hdfs_login_user;
+
 class OssHdfsStore : public IObjStore {
  public:
   OssHdfsStore(const char *key, const char *key_secret,
@@ -40,7 +44,7 @@ class OssHdfsStore : public IObjStore {
     return StorageBackend::kHDFS;
   }
 
-  void set_credentials(ObjCredentials &&creds) override;
+  void set_credentials(ObjCredentials &&creds, const CredsMeta &meta) override;
 
   const ObjStoreOptions &get_options() const override {
     return opts_;
@@ -60,12 +64,13 @@ class OssHdfsStore : public IObjStore {
   }
 
   ssize_t put_object(std::string_view path, const struct iovec *iov, int iovcnt,
-                     uint64_t *expected_crc64 = nullptr,
-                     mode_t mode = 0755) override;
+                     uint64_t *expected_crc64 = nullptr, mode_t mode = 0755,
+                     std::string *etag = nullptr) override;
 
   ssize_t append_object(std::string_view path, const struct iovec *iov,
                         int iovcnt, off_t position,
-                        uint64_t *expected_crc64 = nullptr) override {
+                        uint64_t *expected_crc64 = nullptr,
+                        std::string * /*etag*/ = nullptr) override {
     return -ENOTSUP;
   }
 

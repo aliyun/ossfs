@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 
@@ -74,7 +75,7 @@ class BaseLogOutput : public ILogOutput {
   virtual void destruct() override {}
 };
 
-// copied from photon alog.cpp
+// copied from photon alog.cpp, with recovery from externally deleted log dir
 class LogOutputFile final : public BaseLogOutput {
  public:
   uint64_t log_file_size_limit = 0;
@@ -144,8 +145,19 @@ class LogOutputFile final : public BaseLogOutput {
     return 0;
   }
 
+  // open(O_CREAT) cannot create parent directories
+  static void recreate_log_dir(const char *fn) {
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(fn).parent_path(),
+                                        ec);
+  }
+
   void reopen_log_output_file() {
     int fd = fopen(log_file_name);
+    if (fd < 0 && errno == ENOENT) {
+      recreate_log_dir(log_file_name);
+      fd = fopen(log_file_name);
+    }
     if (fd < 0) {
       static char msg[] = "failed to open log output file: ";
       std::ignore = ::write(log_file_fd, msg, sizeof(msg) - 1);

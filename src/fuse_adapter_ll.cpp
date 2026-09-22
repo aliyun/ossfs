@@ -76,7 +76,7 @@ static bool get_fuse_request_uid_gid(fuse_req_t req, uid_t *out_uid,
   return false;
 }
 
-static void resolve_unresolved_uid_gid(fuse_req_t req, struct stat *stbuf) {
+static void resolve_uid_gid_from_req(fuse_req_t req, struct stat *stbuf) {
   if (!fuse_options.replace_unresolved_uid_gid) {
     return;
   }
@@ -84,8 +84,7 @@ static void resolve_unresolved_uid_gid(fuse_req_t req, struct stat *stbuf) {
   uid_t req_uid;
   gid_t req_gid;
   if (get_fuse_request_uid_gid(req, &req_uid, &req_gid)) {
-    if (stbuf->st_uid == kReservedUnresolvedUid) stbuf->st_uid = req_uid;
-    if (stbuf->st_gid == kReservedUnresolvedGid) stbuf->st_gid = req_gid;
+    resolve_unresolved_uid_gid(stbuf, req_uid, req_gid);
   }
 }
 
@@ -105,13 +104,13 @@ static int dirent_filler(void *ctx, uint64_t nodeid, const char *name,
     e.attr_timeout = fuse_options.attr_timeout;
     e.entry_timeout = fuse_options.entry_timeout;
 
-    resolve_unresolved_uid_gid(c->req, &e.attr);
+    resolve_uid_gid_from_req(c->req, &e.attr);
 
     needed =
         fuse_add_direntry_plus(c->req, c->buf + c->pos, left, name, &e, off);
   } else {
     struct stat stbuf_copy = *stbuf;
-    resolve_unresolved_uid_gid(c->req, &stbuf_copy);
+    resolve_uid_gid_from_req(c->req, &stbuf_copy);
     needed = fuse_add_direntry(c->req, c->buf + c->pos, left, name, &stbuf_copy,
                                off);
   }
@@ -196,7 +195,7 @@ static void ossfs2_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   memset(&fe, 0, sizeof(fe));
   int r = fuse_ll_fs->lookup(parent, name, &fe.ino, &fe.attr);
   if (r == 0) {
-    resolve_unresolved_uid_gid(req, &fe.attr);
+    resolve_uid_gid_from_req(req, &fe.attr);
     fe.attr_timeout = fuse_options.attr_timeout;
     fe.entry_timeout = fuse_options.entry_timeout;
     common_reply_entry(req, &fe);
@@ -230,7 +229,7 @@ static void ossfs2_getattr(fuse_req_t req, fuse_ino_t ino,
   memset(&stbuf, 0, sizeof(stbuf));
   int r = fuse_ll_fs->getattr(ino, &stbuf);
   if (r == 0) {
-    resolve_unresolved_uid_gid(req, &stbuf);
+    resolve_uid_gid_from_req(req, &stbuf);
     fuse_reply_attr(req, &stbuf, fuse_options.attr_timeout);
   } else {
     fuse_reply_err(req, -r);
@@ -245,7 +244,7 @@ static void ossfs2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
   const struct fuse_ctx *ctx = fuse_req_ctx(req);
   int r = fuse_ll_fs->setattr(ino, attr, to_set, fi, ctx->uid, ctx->gid);
   if (r == 0) {
-    resolve_unresolved_uid_gid(req, attr);
+    resolve_uid_gid_from_req(req, attr);
     fuse_reply_attr(req, attr, fuse_options.attr_timeout);
   } else {
     fuse_reply_err(req, -r);
@@ -306,7 +305,7 @@ static void ossfs2_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
                             &fe.ino, &fe.attr);
 
   if (r == 0) {
-    resolve_unresolved_uid_gid(req, &fe.attr);
+    resolve_uid_gid_from_req(req, &fe.attr);
     fe.attr_timeout = fuse_options.attr_timeout;
     fe.entry_timeout = fuse_options.entry_timeout;
     common_reply_entry(req, &fe);
@@ -329,7 +328,7 @@ static void ossfs2_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
                             &fe.attr);
 
   if (r == 0) {
-    resolve_unresolved_uid_gid(req, &fe.attr);
+    resolve_uid_gid_from_req(req, &fe.attr);
     fe.attr_timeout = fuse_options.attr_timeout;
     fe.entry_timeout = fuse_options.entry_timeout;
     common_reply_entry(req, &fe);
@@ -367,7 +366,7 @@ static void ossfs2_symlink(fuse_req_t req, const char *link, fuse_ino_t parent,
   int r = fuse_ll_fs->symlink(parent, name, link, ctx->uid, ctx->gid, &fe.ino,
                               &fe.attr);
   if (r == 0) {
-    resolve_unresolved_uid_gid(req, &fe.attr);
+    resolve_uid_gid_from_req(req, &fe.attr);
     fe.attr_timeout = fuse_options.attr_timeout;
     fe.entry_timeout = fuse_options.entry_timeout;
     common_reply_entry(req, &fe);
@@ -403,7 +402,7 @@ static void ossfs2_create(fuse_req_t req, fuse_ino_t parent, const char *name,
   int r = fuse_ll_fs->creat(parent, name, fi->flags, mode, ctx->uid, ctx->gid,
                             ctx->umask, &fe.ino, &fe.attr, &fh);
   if (r == 0) {
-    resolve_unresolved_uid_gid(req, &fe.attr);
+    resolve_uid_gid_from_req(req, &fe.attr);
     fi->fh = reinterpret_cast<uint64_t>(fh);
     if (fuse_reply_create(req, &fe, fi) == -ENOENT) {
       // Interrupted: release fh and forget inode since kernel won't.

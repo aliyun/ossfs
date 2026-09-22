@@ -30,22 +30,18 @@
 #include <filesystem>
 #include <tuple>
 
-#include "admin/cli_stats.h"
+#include "admin/cli_handler.h"
 #include "admin/http_server.h"
 #include "common/fstab.h"
 #include "common/logger.h"
 #include "common/macros.h"
 #include "common/ssl_probe.h"
 #include "common/utils.h"
+#include "fs/disk_cache_env.h"
 #include "fs/fs.h"
 #include "fuse_adapter_ll.h"
 #include "options.h"
 #include "oss/oss_store.h"
-
-#define EXECUTOR_QUEUE_OPTION \
-  { 16, 1024 }
-#define LIBAIO_PHOTON_OPTION \
-  { 128 }
 
 #define DEV_STDOUT "/dev/stdout"
 #define LOG_SYSLOG "syslog"
@@ -155,6 +151,12 @@ int create_background_obj_stores() {
   options.bucket = bucket;
   // TODO: validate all ip addresses that can access OSS.
   options.bind_ips = FLAGS_bind_ips;
+  options.ip_version = OssFileSystem::ip_version_for(FLAGS_enable_ipv6);
+  if (!FLAGS_enable_ipv6) {
+    LOG_INFO(
+        "IPv6 disabled, resolving the endpoint and proxy host to IPv4 only");
+  }
+  options.path_style = FLAGS_path_style;
   options.prefix = prefix;
   options.use_auth_cache = FLAGS_use_auth_cache;
   options.enable_symlink = FLAGS_enable_symlink;
@@ -182,6 +184,15 @@ int create_background_obj_stores() {
   if (is_hdfs) {
     store_count = 1;
     options.hdfs_client_options = FLAGS_oss_hdfs_client_options;
+    options.append_hdfs_client_option("fs.oss.upload.async.concurrency", "64");
+    options.append_hdfs_client_option(
+        "fs.oss.upload.max.pending.tasks.per.stream", "64");
+    options.append_hdfs_client_option("fs.oss.download.async.concurrency",
+                                      "64");
+    options.append_hdfs_client_option("fs.oss.prefetchsize", "32");
+    options.append_hdfs_client_option(
+        "fs.oss.async.executor.number",
+        std::to_string(std::max(16u, std::thread::hardware_concurrency())));
 
     if (!FLAGS_log_dir.empty() && FLAGS_log_dir != "/dev/stdout") {
       options.append_hdfs_client_option(
@@ -190,6 +201,12 @@ int create_background_obj_stores() {
           OssFileSystem::kHdfsSdkOptLoggerDir,
           get_log_file_base_dir(FLAGS_log_dir.c_str()));
     }
+
+    // Identify ourselves to the DLS backend; "-hdfs" suffix distinguishes
+    // this from the HTTP OSS user agent.
+    options.append_hdfs_client_option(
+        OssFileSystem::kHdfsSdkOptUserAgentModule,
+        kUserAgentPrefix + MACRO_STR(OSSFS_VERSION_ID) + "-hdfs");
 
     if (gflags::GetCommandLineFlagInfoOrDie("enable_symlink").is_default) {
       options.enable_symlink = true;
@@ -462,6 +479,10 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->inode_cache_eviction_interval_ms =
       FLAGS_inode_cache_eviction_interval_ms;
   fs_options->max_inode_cache_count = FLAGS_max_inode_cache_count;
+  fs_options->async_task_limit = FLAGS_async_task_limit;
+
+  fs_options->disk_data_cache_max_file_size =
+      parse_bytes_string(FLAGS_disk_data_cache_max_file_size).value();
 
   fs_options->enable_symlink = FLAGS_enable_symlink;
   fs_options->enable_xattr = FLAGS_enable_xattr;
@@ -487,6 +508,7 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->ram_role = FLAGS_ram_role;
   fs_options->credential_process = FLAGS_credential_process;
   fs_options->credential_refresh_interval = FLAGS_credential_refresh_interval;
+  fs_options->credential_refresh_backoff = FLAGS_credential_refresh_backoff;
 
   mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
   fs_options->cache_refill_unit = fs_options->cache_block_size;
@@ -521,8 +543,6 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
     // HDFS-specific fs_options defaults
     fs_options->storage_backend =
         OssFileSystem::IObjStore::StorageBackend::kHDFS;
-    fs_options->upload_buffer_size = 1ULL * 1024 * 1024;
-    LOG_INFO("HDFS mode: upload_buffer_size forced to 1MB");
 
     if (gflags::GetCommandLineFlagInfoOrDie("kernel_readdir_cache_timeout")
             .is_default) {
@@ -638,6 +658,18 @@ static void dump_mount_options() {
 
   for (const auto &it : experimental_options) {
     LOG_INFO("Add mount option(experimental): --`=`", it.first, it.second);
+  }
+}
+
+static void warn_inapplicable_options(bool is_hdfs) {
+  auto is_explicitly_set = [](std::string_view name) {
+    return !gflags::GetCommandLineFlagInfoOrDie(std::string(name).c_str())
+                .is_default;
+  };
+  for (const auto &name :
+       OptionsRegistry::get_inapplicable_options(is_hdfs, is_explicitly_set)) {
+    LOG_WARN("option --` only applies to ` mode, ignored in ` mode", name,
+             is_hdfs ? "OSS" : "HDFS", is_hdfs ? "HDFS" : "OSS");
   }
 }
 
@@ -764,6 +796,8 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
   LOG_INFO("AddressSanitizer is enabled.");
 #endif
 
+  warn_inapplicable_options(
+      OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint));
   dump_mount_options();
   err = init_fs_options(&fs_options);
   if (err != 0) {
@@ -953,7 +987,15 @@ static void do_show_mount_help() {
       default_part = ". Default: " + flag.default_value;
     }
 
-    std::string info_part = flag.description + type_part + default_part;
+    std::string mode_part;
+    if (option.modes == OptionsRegistry::kModeOss) {
+      mode_part = " [OSS only]";
+    } else if (option.modes == OptionsRegistry::kModeHdfs) {
+      mode_part = " [HDFS only]";
+    }
+
+    std::string info_part =
+        flag.description + mode_part + type_part + default_part;
 
     printf("  %-*s", name_width, name_part.c_str());
 
@@ -1051,6 +1093,21 @@ int main(int argc, char *argv[]) {
       "-f,--filter", metrics_filter,
       "Enable metrics by filter (e.g. fs, oss)\n"
       "Set empty or not set will have io metrics enabled only");
+
+  std::string warmup_dir;
+  CLI::App *sub_run_task =
+      app.add_subcommand("run_task", "Run an asynchronous task.")->group("");
+  sub_run_task->add_option(
+      "-p,--pid", pid, "Run asynchronous tasks of ossfs2 of a specified pid");
+  CLI::App *sub_warmup =
+      sub_run_task->add_subcommand("warmup", "Warmup a directory.")
+          ->group("Subcommands");
+  sub_warmup->add_option("-d,--dir", warmup_dir,
+                         "Warmup the specific directory");
+
+  CLI::App *sub_dump =
+      sub_run_task->add_subcommand("dump", "Dump asynchronous task status.")
+          ->group("Subcommands");
 
   app.add_flag("-v,--version", show_version, "Show version");
 
@@ -1187,10 +1244,17 @@ int main(int argc, char *argv[]) {
     if (!FLAGS_log_dir.empty()) ::chmod(FLAGS_log_dir.c_str(), 0777);
 
     const std::string &dir = FLAGS_disk_data_cache_dir;
-    if (!dir.empty() && check_dir_empty(dir) == 1) {
-      fprintf(stderr, "ERROR: disk cache directory %s is not empty\n",
-              dir.c_str());
-      return -1;
+    if (!dir.empty()) {
+      // Check the cache-data sub dir: the persistent lock file at the cache
+      // dir root must not block remount. A missing sub dir is fine, it is
+      // created during disk cache init.
+      const std::string data_dir =
+          join_paths(dir, OssFileSystem::kDiskCacheDataSubDir);
+      if (check_dir_empty(data_dir) == 1) {
+        fprintf(stderr, "ERROR: disk cache directory %s is not empty\n",
+                data_dir.c_str());
+        return -1;
+      }
     }
 
     // Parse fuse options.
@@ -1235,7 +1299,7 @@ int main(int argc, char *argv[]) {
 
     int pipefd[2];
     if (pipe(pipefd)) return -1;
-    daemonize(FLAGS_f, pipefd[0], log_exit_error);
+    daemonize(FLAGS_f, pipefd, log_exit_error);
 
     r = create_ossfs_and_run_fuse(args, fuse_opts, pipefd[1]);
     close(pipefd[0]);
@@ -1262,6 +1326,22 @@ int main(int argc, char *argv[]) {
                                                               pid, interval);
     } else {
       printf("%s", sub_stats->help().c_str());
+      return -1;
+    }
+  } else if (sub_run_task->parsed()) {
+    log_output_level = ALOG_FATAL;
+    photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_NONE);
+    DEFER(photon::fini());
+    if (sub_dump->parsed()) {
+      return OssFileSystem::Admin::dump_task_status_command_handler(pid);
+    } else if (sub_warmup->parsed()) {
+      if (warmup_dir.empty()) {
+        fprintf(stderr, "ERROR:  warmup directory is not specified\n");
+        return -1;
+      }
+      return OssFileSystem::Admin::warmup_command_handler(pid, warmup_dir);
+    } else {
+      fprintf(stderr, "ERROR:  unknown task type.\n");
       return -1;
     }
   } else {

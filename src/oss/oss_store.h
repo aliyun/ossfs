@@ -49,7 +49,12 @@ class OssStore : public IObjStore {
   }
 
   // IObjStore interface implementation
-  void set_credentials(ObjCredentials &&creds) override;
+  void set_credentials(ObjCredentials &&creds, const CredsMeta &meta) override;
+
+  void set_creds_refresh_handler(
+      std::function<int(uint64_t)> handler) override {
+    creds_refresh_handler_ = std::move(handler);
+  }
 
   const ObjStoreOptions &get_options() const override {
     return opts_;
@@ -65,8 +70,8 @@ class OssStore : public IObjStore {
                                  off_t obj_offset, size_t count) override;
 
   ssize_t put_object(std::string_view path, const struct iovec *iov, int iovcnt,
-                     uint64_t *expected_crc64 = nullptr,
-                     mode_t mode = 0755) override;
+                     uint64_t *expected_crc64 = nullptr, mode_t mode = 0755,
+                     std::string *etag = nullptr) override;
 
   int open_object(std::string_view path, int flags, mode_t mode,
                   RawObjHandle **out_handle) override {
@@ -79,7 +84,8 @@ class OssStore : public IObjStore {
 
   ssize_t append_object(std::string_view path, const struct iovec *iov,
                         int iovcnt, off_t position,
-                        uint64_t *expected_crc64 = nullptr) override;
+                        uint64_t *expected_crc64 = nullptr,
+                        std::string *etag = nullptr) override;
 
   int copy_object(std::string_view src_path, std::string_view dst_path,
                   bool overwrite = false, bool set_mime = false) override;
@@ -176,8 +182,12 @@ class OssStore : public IObjStore {
   bool is_oss_symlink_target_valid(std::string_view target,
                                    bool validate_components);
 
+  void refresh_creds_if_expired();
+
   ObjStoreOptions opts_;
   std::unique_ptr<Client> oss_client_;
+  std::function<int(uint64_t)> creds_refresh_handler_;
+  CredsMeta creds_meta_;
 };
 
 IObjStore *new_oss_store(const char *key, const char *key_secret,

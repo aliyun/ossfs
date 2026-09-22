@@ -60,6 +60,12 @@ using HTTPClientPtr =
 // Global variable for reverse proxy statistics
 static std::atomic<int> g_proxy_request_count{0};
 
+// Counts requests that reached the slow backend, so a timeout test can prove
+// the backend was actually in the data path.
+static std::atomic<int> g_slow_request_count{0};
+
+static constexpr int kSlowResponseSec = 3;
+
 // Reverse proxy director - forwards requests to backend server
 static int proxy_director(void *arg, Request &src, Request &dst) {
   g_proxy_request_count.fetch_add(1);
@@ -89,10 +95,13 @@ static int proxy_modifier(void *arg, Response &src, Response &dst) {
   return 0;
 }
 
-// Slow server handler for timeout test
-static int slow_server_handler(Request &req, Response &resp, std::string_view) {
-  LOG_INFO("[SlowServer] Sleeping for 5 seconds...");
-  photon::thread_sleep(5);  // Sleep 5 seconds
+// Slow server handler for timeout test. The leading void* is required by
+// DelegateHTTPHandler's Func type; without it every argument shifts by one.
+static int slow_server_handler(void *, Request &, Response &resp,
+                               std::string_view) {
+  g_slow_request_count.fetch_add(1);
+  LOG_INFO("[SlowServer] Sleeping for ` seconds...", kSlowResponseSec);
+  photon::thread_sleep(kSlowResponseSec);
   resp.set_result(200);
   resp.headers.content_length(2);
   resp.write("OK", 2);
@@ -105,12 +114,15 @@ static std::string get_server_url(photon::net::ISocketServer *server) {
   return "http://127.0.0.1:" + std::to_string(addr.port) + "/";
 }
 
-// Reverse proxy resources structure
+// Reverse proxy resources structure.
+// Members destruct in reverse order, and HTTPServerImpl's destructor is what
+// drains in-flight handlers, so the client they forward through must outlive
+// the server. Freeing it first is a use-after-free.
 struct ReverseProxyResources {
-  SocketServerPtr server;
-  HTTPServerPtr http_server;
-  HTTPHandlerPtr handler;
   HTTPClientPtr client;
+  HTTPHandlerPtr handler;
+  HTTPServerPtr http_server;
+  SocketServerPtr server;
 };
 
 /**
@@ -185,6 +197,7 @@ class Ossfs2HttpProxyTest : public Ossfs2TestSuite {
 
     // Reset counter
     g_proxy_request_count.store(0);
+    g_slow_request_count.store(0);
   }
 
   void TearDown() override {
@@ -376,21 +389,19 @@ class Ossfs2HttpProxyTest : public Ossfs2TestSuite {
   }
 
   void verify_proxy_timeout_behavior() {
-    // Create a slow backend server (simulates timeout)
+    // Create a slow backend server that answers long after the client timeout
     SocketServerPtr slow_server(photon::net::new_tcp_socket_server());
     slow_server->timeout(10000UL * 1000);
-    slow_server->bind_v4localhost();
-    slow_server->listen();
+    ASSERT_EQ(slow_server->bind_v4localhost(), 0);
+    ASSERT_EQ(slow_server->listen(), 0);
 
     HTTPServerPtr slow_http_server(new_http_server());
-    slow_http_server->add_handler(&slow_server_handler);
+    slow_http_server->add_handler({nullptr, &slow_server_handler});
     slow_server->set_handler(slow_http_server->get_connection_handler());
     slow_server->start_loop();
 
     std::string slow_url = get_server_url(slow_server.get());
     LOG_INFO("Slow server started at: `", slow_url);
-
-    photon::thread_sleep(1);
 
     // Start reverse proxy pointing to slow server
     auto [proxy_url, proxy_resources] = start_reverse_proxy(slow_url);
@@ -398,10 +409,14 @@ class Ossfs2HttpProxyTest : public Ossfs2TestSuite {
 
     photon::thread_sleep(1);
 
-    // Create OSS adapter with short timeout
+    // The proxy forwards the request target verbatim, so the client has to name
+    // the slow server itself: plain http plus path style, no bucket subdomain.
+    // No trailing slash here, or the path-style URL gets a double slash.
     ObjStoreOptions options;
-    options.endpoint = "127.0.0.1";
+    options.endpoint =
+        "http://127.0.0.1:" + std::to_string(slow_server->getsockname().port);
     options.bucket = "test";
+    options.path_style = true;
     options.proxy = proxy_url;
     options.request_timeout_us = 1000000;  // 1 second timeout
     options.user_agent = "TimeoutTest/1.0";
@@ -413,6 +428,8 @@ class Ossfs2HttpProxyTest : public Ossfs2TestSuite {
     // This should timeout
     int ret = adapter->check_bucket();
     EXPECT_NE(ret, 0) << "Should timeout with slow backend";
+    EXPECT_GT(g_slow_request_count.load(), 0)
+        << "The slow backend was never reached, so the timeout proves nothing";
 
     LOG_INFO("✓ Timeout behavior test passed (ret=`, expected failure)", ret);
   }

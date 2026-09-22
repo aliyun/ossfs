@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 
-project(ossfs2 VERSION 2.0.9)
+project(ossfs2 VERSION 2.0.10)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 include(FindPackageHandleStandardArgs)
@@ -254,9 +254,10 @@ if (ENABLE_TESTING)
   file(GLOB ossfs2_test_srcs RELATIVE "${PROJECT_SOURCE_DIR}" 
     src/fs/test/*.cpp
     src/fs/test/hdfs/*.cpp
-    src/common/test/*.cpp)
+    src/common/test/*.cpp
+    src/test/*.cpp)
 
-  add_executable(ossfs2-test ${ossfs2_test_srcs})
+  add_executable(ossfs2-test ${ossfs2_test_srcs} src/options.cpp)
 
   set_target_properties(ossfs2-test PROPERTIES
     BUILD_RPATH "$ORIGIN:${LIBFUSE_LIB_DIR}:${JINDOSDK_LIB_DIR}:$ORIGIN/${JINDOSDK_DIR_NAME}/lib")
