@@ -57,6 +57,10 @@ TEST(CommonUtilsTest, parse_bytes_string) {
   EXPECT_EQ(parse_bytes_string("1234").value(), 1234ULL);
   EXPECT_EQ(parse_bytes_string("0").value(), 0ULL);
 
+  // "-1" stands for unlimited (the max value)
+  EXPECT_EQ(parse_bytes_string("-1").value(), UINT64_MAX);
+  EXPECT_EQ(parse_bytes_string(" -1 ").value(), UINT64_MAX);
+
   // Test with whitespace
   EXPECT_EQ(parse_bytes_string(" 1234 ").value(), 1234ULL);
 

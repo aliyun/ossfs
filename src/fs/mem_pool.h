@@ -34,13 +34,14 @@ class FixedBlockMemoryPool {
  public:
   FixedBlockMemoryPool(size_t block_size, size_t pool_capacity,
                        size_t max_cached_blocks, uint64_t purge_interval_ms);
-  ~FixedBlockMemoryPool();
+  virtual ~FixedBlockMemoryPool();
 
   // Allocates a specified number of memory blocks, ignoring pool capacity
   // limits.
   std::vector<char *> allocate(size_t count);
 
-  std::vector<char *> try_allocate(size_t count, bool ignore_limit = false);
+  virtual std::vector<char *> try_allocate(size_t count,
+                                           bool ignore_limit = false);
 
   void deallocate(const std::vector<char *> &addresses);
 
@@ -57,8 +58,19 @@ class FixedBlockMemoryPool {
   FixedBlockMemoryPool(FixedBlockMemoryPool &&) = delete;
   FixedBlockMemoryPool &operator=(FixedBlockMemoryPool &&) = delete;
 
- private:
+ protected:
   char *expand_one();
+
+  // Hands out up to `count` blocks, stopping once used_ reaches `limit`.
+  // Call with lock_ held.
+  std::vector<char *> take_blocks_locked(size_t count, size_t limit);
+
+  // Returns how many blocks were cached; the rest must go to free_excess()
+  // after the lock is released. Call with lock_ held.
+  size_t return_blocks_locked(const std::vector<char *> &addresses);
+
+  // Frees addresses[free_cnt:]. Call without lock_.
+  void free_excess(const std::vector<char *> &addresses, size_t free_cnt);
 
   void purge_thread_entry();
 
@@ -78,6 +90,7 @@ class FixedBlockMemoryPool {
   std::vector<char *> cached_block_list_;
   size_t used_ = 0;
 
+ private:
   std::mutex purger_lock_;
   bool purger_stop_ = {false};
   std::condition_variable purger_cv_;

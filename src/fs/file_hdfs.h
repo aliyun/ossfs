@@ -75,9 +75,21 @@ class HdfsFileHandle : public IFileHandleFuseLL {
   }
 
  private:
+  int open_with_flags(int flags);
+
+  // Close backend streams only, keeping the flock state intact.
+  int close_streams();
+
+  void release_flock();
+
   int seek_writer_to_offset(off_t offset);
 
+  // Close the stale reader stream and reopen it at the post-rename path.
+  int rebuild_reader_after_rename(std::string_view new_path);
+
   void finalize_write(ssize_t total_written);
+
+  void commit_written_size();
 
   OssFs *fs_ = nullptr;
   FileInode *inode_ = nullptr;

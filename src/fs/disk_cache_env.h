@@ -24,11 +24,16 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <string>
 
 #include "common/logger.h"
 #include "common/macros.h"
 
 namespace OssFileSystem {
+
+// Cached data lives in this sub directory of the disk cache dir. Exposed so
+// that other modules (e.g. main) can build the same path.
+static constexpr const char *kDiskCacheDataSubDir = "cache-data";
 
 struct DiskCacheOptions {
   DiskCacheOptions(std::string_view cache_dir, uint64_t cache_size_in_GB,
@@ -58,7 +63,15 @@ struct DiskCacheEnv {
   bool probe_xattr_support(photon::fs::IFileSystem *fs,
                            photon::fs::IFileSystemXAttr *xattr_fs);
 
+  int acquire_dir_exclusive_lock(const std::string &dir);
+
   DiskCacheOptions options;
+
+  // Cached data dir: <cache_dir>/cache-data.
+  std::string data_dir;
+
+  // Held for the env lifetime; flock is released when the fd is closed.
+  int dir_lock_fd = -1;
 
   photon::fs::ICachedFileSystem *cache_fs = nullptr;
   photon::fs::IFileSystemXAttr *local_xattr_fs = nullptr;

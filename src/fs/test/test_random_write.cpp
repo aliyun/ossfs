@@ -1976,6 +1976,16 @@ class Ossfs2RandomWriteTest : public OssOnlyTestSuite {
       }
     });
 
+    // Release handles on any exit path so ASSERT failures don't leak the
+    // RandomWriteContexts under LSan noise.
+    DEFER({
+      for (int i = 0; i < kConcurrency; i++) {
+        int r = fs_->release(nodeids[i], get_file_from_handle(handles[i]));
+        EXPECT_EQ(r, 0);
+      }
+      EXPECT_EQ(staging_disk_usage(), 0u);
+    });
+
     const uint64_t saved_interval = fs_->staging_avail_refresh_ns_;
     const uint64_t saved_free_bytes = fs_->options_.temp_dir_free_bytes;
     DEFER({
@@ -2009,11 +2019,12 @@ class Ossfs2RandomWriteTest : public OssOnlyTestSuite {
     fs_->options_.temp_dir_free_bytes = 1024;
     ASSERT_TRUE(write_all(0, static_cast<ssize_t>(kWriteSize)));
 
-    // Phase 2: stale-cache burst with diskfree pinned to the real avail;
-    // every writer must get -ENOSPC no matter who wins the election.
+    // Phase 2: unsatisfiable budget; every writer must get -ENOSPC no
+    // matter who wins the election. Not pinned to the sampled avail: peer
+    // CI workers freeing space on the same fs would let a write slip through.
     fs_->staging_avail_ts_ns_ = 0;
     uint64_t usage_before_enospc = staging_disk_usage();
-    fs_->options_.temp_dir_free_bytes = get_disk_avail_bytes();
+    fs_->options_.temp_dir_free_bytes = UINT64_MAX / 2;
     ASSERT_TRUE(write_all(static_cast<off_t>(kWriteSize), -ENOSPC));
     EXPECT_EQ(staging_disk_usage(), usage_before_enospc);
 
@@ -2021,12 +2032,6 @@ class Ossfs2RandomWriteTest : public OssOnlyTestSuite {
     fs_->options_.temp_dir_free_bytes = saved_free_bytes;
     ASSERT_TRUE(write_all(static_cast<off_t>(kWriteSize),
                           static_cast<ssize_t>(kWriteSize)));
-
-    for (int i = 0; i < kConcurrency; i++) {
-      int r = fs_->release(nodeids[i], get_file_from_handle(handles[i]));
-      ASSERT_EQ(r, 0);
-    }
-    EXPECT_EQ(staging_disk_usage(), 0u);
   }
 
   void verify_read_fresh_after_prefetch_write_cycle() {
@@ -3324,6 +3329,284 @@ class Ossfs2RandomWriteTest : public OssOnlyTestSuite {
     ASSERT_EQ(r, 0);
   }
 
+  // Reopen-path counterpart of verify_cache_dropped_on_mark_clean: flush
+  // backfills the etag so the next open keeps the page cache; a reader
+  // opened before the write still fetches fresh data via its etag check.
+  void verify_page_cache_retained_after_random_write() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    auto parent_path = nodeid_to_path(parent);
+
+    std::string filename = "rw_cache_retain";
+    std::string local_file = test_path_ + filename + ".src";
+    create_random_file(local_file, /*size_MB=*/1);
+    int rr = upload_file(local_file, parent_path + std::string("/") + filename,
+                         FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(rr, 0);
+
+    uint64_t nodeid = 0;
+    struct stat st;
+    int r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    void *handle = nullptr;
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_RDWR, &handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+
+    // Small overwrite staying on the flush_no_multipart (put_object) path.
+    const size_t kPatchSize = 64 * 1024;
+    std::string new_bytes = random_string(kPatchSize);
+    ssize_t w = write_to_file_handle(handle, new_bytes.data(), kPatchSize, 0);
+    ASSERT_EQ(w, (ssize_t)kPatchSize);
+
+    // Flush backfills the etag; the write handle must still read fresh data.
+    r = fsync_file_handle(handle, /*datasync=*/true);
+    ASSERT_EQ(r, 0);
+
+    // clang-format off
+    auto *inode =
+        static_cast<FileInode *>(get_file_from_handle(handle)->get_inode());
+    // clang-format on
+    ASSERT_FALSE(inode->is_dirty);
+    ASSERT_FALSE(inode->etag.empty()) << "flush must backfill the etag";
+    ASSERT_FALSE(inode->invalidate_data_cache)
+        << "backfilled etag must keep the page cache on mark_clean";
+
+    std::string got(kPatchSize, '\0');
+    ssize_t n = read_from_handle(handle, got.data(), kPatchSize, 0);
+    ASSERT_EQ(n, (ssize_t)kPatchSize);
+    EXPECT_EQ(got, new_bytes) << "post-flush read returned stale data";
+
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+
+    // Reopen: remote etag equals the backfilled one -> keep the page cache.
+    handle = nullptr;
+    keep_cache = false;
+    r = fs_->open(nodeid, O_RDONLY, &handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    EXPECT_TRUE(keep_cache)
+        << "reopen after random write flush must keep page cache";
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+  }
+
+  // Random writes with the DISK data cache enabled: overwriting a cached
+  // file must never serve stale cached bytes (dirty reads and post-flush
+  // reads), and a freshly random-written file must read back identically on
+  // cold and warm passes.
+  void verify_disk_cache_interaction_with_random_write() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    auto parent_path = nodeid_to_path(parent);
+    bool unused = false;
+
+    // ---- Part A: random-overwrite a CACHED remote file ----
+    const size_t kFileSize = 8 * 1024 * 1024;
+    std::string filename = "rw_dcache_overwrite";
+    std::string local_file = test_path_ + filename + ".src";
+    create_random_file(local_file, 8);
+    int rr = upload_file(local_file, parent_path + std::string("/") + filename,
+                         FLAGS_oss_bucket_prefix);
+    ASSERT_EQ(rr, 0);
+    int local_fd = reopen_mirror(local_file);
+    ASSERT_GE(local_fd, 0);
+    DEFER(::close(local_fd));
+
+    auto mirror_read = [&](std::string &buf) {
+      buf.assign(kFileSize, '\0');
+      ASSERT_EQ(::pread(local_fd, buf.data(), kFileSize, 0),
+                (ssize_t)kFileSize);
+    };
+
+    uint64_t nodeid = 0;
+    struct stat st;
+    int r = fs_->lookup(parent, filename.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    // Warm the disk cache with the original content, twice (miss + hit).
+    for (int pass = 0; pass < 2; pass++) {
+      void *rh = nullptr;
+      r = fs_->open(nodeid, O_RDONLY, &rh, &unused);
+      ASSERT_EQ(r, 0);
+      std::string buf, mirror;
+      buf.assign(kFileSize, '\0');
+      ssize_t n = read_from_handle(rh, buf.data(), kFileSize, 0);
+      fs_->release(nodeid, get_file_from_handle(rh));
+      ASSERT_EQ(n, (ssize_t)kFileSize);
+      mirror_read(mirror);
+      ASSERT_EQ(buf, mirror) << "cached read pass " << pass << " mismatch";
+    }
+
+    // Random-overwrite through a write handle, mirroring to the local file.
+    void *wh = nullptr;
+    r = fs_->open(nodeid, O_RDWR, &wh, &unused);
+    ASSERT_EQ(r, 0);
+    for (int p = 0; p < 3; p++) {
+      off_t off = (off_t)(p * 2 * 1024 * 1024 + 123 * 1024);
+      size_t len = 256 * 1024;
+      std::string patch = random_string(len);
+      auto w = write_to_file_handle(wh, patch.data(), len, off);
+      ASSERT_EQ(w, (ssize_t)len);
+      ASSERT_EQ(::pwrite(local_fd, patch.data(), len, off), (ssize_t)len);
+    }
+
+    // While dirty, reads (same handle and a fresh one) must return the NEW
+    // bytes, never the stale cached content.
+    {
+      std::string buf, mirror;
+      buf.assign(kFileSize, '\0');
+      ssize_t n = read_from_handle(wh, buf.data(), kFileSize, 0);
+      ASSERT_EQ(n, (ssize_t)kFileSize);
+      mirror_read(mirror);
+      ASSERT_EQ(buf, mirror) << "dirty read served stale cached bytes";
+    }
+    {
+      void *rh = nullptr;
+      r = fs_->open(nodeid, O_RDONLY, &rh, &unused);
+      ASSERT_EQ(r, 0);
+      std::string buf, mirror;
+      buf.assign(kFileSize, '\0');
+      ssize_t n = read_from_handle(rh, buf.data(), kFileSize, 0);
+      fs_->release(nodeid, get_file_from_handle(rh));
+      ASSERT_EQ(n, (ssize_t)kFileSize);
+      mirror_read(mirror);
+      ASSERT_EQ(buf, mirror) << "fresh-handle dirty read served stale cache";
+    }
+
+    // Release flushes (mark_clean drops the cache); new opens must read the
+    // flushed content on both cold and warm passes.
+    r = fs_->release(nodeid, get_file_from_handle(wh));
+    ASSERT_EQ(r, 0);
+    for (int pass = 0; pass < 2; pass++) {
+      void *rh = nullptr;
+      r = fs_->open(nodeid, O_RDONLY, &rh, &unused);
+      ASSERT_EQ(r, 0);
+      std::string buf, mirror;
+      buf.assign(kFileSize, '\0');
+      ssize_t n = read_from_handle(rh, buf.data(), kFileSize, 0);
+      fs_->release(nodeid, get_file_from_handle(rh));
+      ASSERT_EQ(n, (ssize_t)kFileSize);
+      mirror_read(mirror);
+      ASSERT_EQ(buf, mirror) << "post-flush read pass " << pass << " mismatch";
+    }
+
+    // ---- Part B: freshly random-written file, cold + warm read-back ----
+    const size_t kNewSize = 4 * 1024 * 1024;
+    std::string new_name = "rw_dcache_new";
+    uint64_t new_nodeid = 0;
+    void *new_handle = nullptr;
+    r = create_and_flush(parent, new_name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
+                         0, 0, &new_nodeid, &st, &new_handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(new_nodeid, 1));
+    std::string new_data = random_string(kNewSize);
+    auto w = write_to_file_handle(new_handle, new_data.data(), kNewSize, 0);
+    ASSERT_EQ(w, (ssize_t)kNewSize);
+    r = fs_->release(new_nodeid, get_file_from_handle(new_handle));
+    ASSERT_EQ(r, 0);
+
+    for (int pass = 0; pass < 2; pass++) {
+      void *rh = nullptr;
+      r = fs_->open(new_nodeid, O_RDONLY, &rh, &unused);
+      ASSERT_EQ(r, 0);
+      std::string buf;
+      buf.assign(kNewSize, '\0');
+      ssize_t n = read_from_handle(rh, buf.data(), kNewSize, 0);
+      fs_->release(new_nodeid, get_file_from_handle(rh));
+      ASSERT_EQ(n, (ssize_t)kNewSize);
+      ASSERT_EQ(buf, new_data) << "new-file read pass " << pass << " mismatch";
+    }
+
+    EXPECT_EQ(staging_disk_usage(), 0u);
+  }
+
+  // Concurrent read/write with disk cache + random write both enabled: 16
+  // workers create 53 x 50-100 MB files (~4 GB, far beyond the 1 GiB cache
+  // quota, so reads keep triggering eviction/refill), verify OSS-side CRCs
+  // via ossutil, then re-read every file twice. read_mode in [ONCE, RANDOM,
+  // ALL_FILES_PER_WORKER].
+  void verify_concurrent_rw_with_disk_cache_and_randwrite(
+      std::string_view read_mode = "ONCE", const int file_cnt = 53,
+      const int parallel_cnt = 16) {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    std::vector<uint64_t> nodeids(file_cnt, 0);
+    std::vector<uint64_t> file_crcs(file_cnt, 0);
+    std::vector<std::future<void>> tasks;
+    srand(time(nullptr));
+    for (int i = 0; i < parallel_cnt; i++) {
+      auto task = std::async(std::launch::async, [&, i]() {
+        INIT_PHOTON();
+        for (int j = i; j < file_cnt; j += parallel_cnt) {
+          std::string file_name = "testfile_" + std::to_string(j);
+          uint64_t file_size = 50 + rand() % 51;  // 50-100 MB
+          int file_draft = 1 + rand() % 1023;
+          file_crcs[j] = create_file_in_folder(parent, file_name, file_size,
+                                               nodeids[j], file_draft);
+          ASSERT_TRUE(file_crcs[j] > 0);
+          DEFER(fs_->forget(nodeids[j], 1));
+        }
+      });
+      tasks.push_back(std::move(task));
+    }
+    for (auto &task : tasks) {
+      task.wait();
+    }
+    auto result =
+        get_list_objects(get_test_osspath(""), FLAGS_oss_bucket_prefix);
+    ASSERT_EQ((size_t)file_cnt, result.size());
+    LOG_INFO("written ` files with rand-write + disk cache", file_cnt);
+    for (int i = 0; i < file_cnt; i++) {
+      std::string file_name = "testfile_" + std::to_string(i);
+      auto file_meta = get_file_meta(file_name, FLAGS_oss_bucket_prefix);
+      ASSERT_EQ(std::to_string(file_crcs[i]),
+                file_meta["X-Oss-Hash-Crc64ecma"]);
+    }
+
+    for (int wave = 0; wave < 2; wave++) {
+      tasks.clear();
+      for (int i = 0; i < parallel_cnt; i++) {
+        auto task = std::async(std::launch::async, [&, i]() {
+          INIT_PHOTON();
+          auto verify_fn = [&](const std::string &file_name, int index) {
+            uint64_t crc64 = 0;
+            ssize_t r = read_file_in_folder(parent, file_name, &crc64);
+            ASSERT_TRUE(r >= 0);
+            ASSERT_TRUE(file_crcs[index] == crc64);
+          };
+
+          if (read_mode == "ALL_FILES_PER_WORKER" || read_mode == "RANDOM") {
+            for (int j = 0; j < file_cnt; j++) {
+              int index = j;
+              std::string file_name = "testfile_" + std::to_string(j);
+              if (read_mode == "RANDOM") {
+                index = rand() % file_cnt;
+                file_name = "testfile_" + std::to_string(index);
+              }
+
+              verify_fn(file_name, index);
+            }
+          } else {
+            // default is ONCE
+            for (int j = i; j < file_cnt; j += parallel_cnt) {
+              std::string file_name = "testfile_" + std::to_string(j);
+              verify_fn(file_name, j);
+            }
+          }
+        });
+        tasks.push_back(std::move(task));
+      }
+      for (auto &task : tasks) {
+        task.wait();
+      }
+    }
+    EXPECT_EQ(staging_disk_usage(), 0u);
+  }
+
   // Regression: after a rename, truncate must refresh rw_ctx->upload_path,
   // else its sync flush re-creates the object at the stale pre-rename path.
   void verify_truncate_after_rename_uses_new_path() {
@@ -4475,6 +4758,53 @@ class Ossfs2RandomWriteTest : public OssOnlyTestSuite {
     EXPECT_EQ("",
               get_file_meta(hidden, FLAGS_oss_bucket_prefix)["Content-Length"]);
     r = fs_->release(src_nodeid, get_file_from_handle(src_handle));
+    ASSERT_EQ(r, 0);
+
+    // The same rename over a DIRTY open dst: its unflushed data must never
+    // surface on the dst name, and the hidden object is still reclaimed by
+    // the last release.
+    std::string src2_name = "rw_hide_src2", dst2_name = "rw_hide_dst2";
+    uint64_t src2_nodeid = 0, dst2_nodeid = 0;
+    void *src2_handle = nullptr, *dst2_handle = nullptr;
+    r = create_and_flush(parent, src2_name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
+                         0, 0, &src2_nodeid, &st, &src2_handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(src2_nodeid, 1));
+    r = create_and_flush(parent, dst2_name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
+                         0, 0, &dst2_nodeid, &st, &dst2_handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dst2_nodeid, 1));
+
+    std::string src2_data = random_string(64 * 1024);
+    w = write_to_file_handle(src2_handle, src2_data.data(), src2_data.size(),
+                             0);
+    ASSERT_EQ(w, (ssize_t)src2_data.size());
+    r = fsync_file_handle(src2_handle, /*datasync=*/true);
+    ASSERT_EQ(r, 0);
+    // The dst stays dirty: written but deliberately not fsync-ed. A
+    // different size keeps it distinguishable from the src content.
+    std::string stale_dst_data = random_string(96 * 1024);
+    w = write_to_file_handle(dst2_handle, stale_dst_data.data(),
+                             stale_dst_data.size(), 0);
+    ASSERT_EQ(w, (ssize_t)stale_dst_data.size());
+
+    auto dst2_inode = static_cast<FileInode *>(
+        get_file_from_handle(dst2_handle)->get_inode());
+    std::string hidden2 = hidden_name_of(dst2_nodeid, 0);
+
+    r = fs_->rename(parent, src2_name.c_str(), parent, dst2_name.c_str(), 0);
+    ASSERT_EQ(r, 0);
+    ASSERT_TRUE(dst2_inode->is_hidden);
+
+    // The dst name must serve the src content, never the stale dirty data.
+    auto meta2 = get_file_meta(dst2_name, FLAGS_oss_bucket_prefix);
+    EXPECT_EQ(std::to_string(src2_data.size()), meta2["Content-Length"]);
+
+    r = fs_->release(dst2_nodeid, get_file_from_handle(dst2_handle));
+    ASSERT_EQ(r, 0);
+    EXPECT_EQ(
+        "", get_file_meta(hidden2, FLAGS_oss_bucket_prefix)["Content-Length"]);
+    r = fs_->release(src2_nodeid, get_file_from_handle(src2_handle));
     ASSERT_EQ(r, 0);
     EXPECT_EQ(staging_disk_usage(), 0u);
     expect_no_hidden_objects();
@@ -6289,6 +6619,34 @@ TEST_F(Ossfs2RandomWriteTest, verify_cache_dropped_on_mark_clean) {
   opts.temp_dir = test_path_;
   init(opts);
   verify_cache_dropped_on_mark_clean();
+}
+
+TEST_F(Ossfs2RandomWriteTest, verify_page_cache_retained_after_random_write) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;
+  opts.close_to_open = true;
+  init(opts);
+  verify_page_cache_retained_after_random_write();
+}
+
+TEST_F(Ossfs2RandomWriteTest, verify_disk_cache_interaction_with_random_write) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+  verify_disk_cache_interaction_with_random_write();
+}
+
+TEST_F(Ossfs2RandomWriteTest,
+       verify_concurrent_rw_with_disk_cache_and_randwrite) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;
+  opts.cache_type = CacheType::kDiskCache;
+  init(opts);
+  verify_concurrent_rw_with_disk_cache_and_randwrite();
 }
 
 TEST_F(Ossfs2RandomWriteTest,

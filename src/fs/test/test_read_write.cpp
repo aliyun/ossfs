@@ -115,10 +115,20 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
 
     file = get_file_from_handle(handle);
     read_size = file->pread(buf_1MB, 1048576, 128ULL * 1024 * 1024 - 7);
-    ASSERT_EQ(read_size, -EINVAL);
+    if (fs_->options_.close_to_open) {
+      // open() HEADed the object and refreshed the size (99 MB): reads past
+      // EOF return 0, and the tail read serves the new content.
+      ASSERT_EQ(read_size, 0);
+    } else {
+      ASSERT_EQ(read_size, -EINVAL);
+    }
 
     read_size = file->pread(buf_1MB, 1048576, 99ULL * 1024 * 1024 - 7);
-    ASSERT_EQ(read_size, -EINVAL);
+    if (fs_->options_.close_to_open) {
+      ASSERT_EQ(read_size, 7);
+    } else {
+      ASSERT_EQ(read_size, -EINVAL);
+    }
 
     r = fs_->release(nodeid, file);
     ASSERT_EQ(r, 0);
@@ -390,7 +400,103 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
       }
     });
 
-    ASSERT_EQ(fs_->download_buffers_->used_blocks(), 0ULL);
+    ASSERT_EQ(fs_->data_buffers_->used_blocks(), 0ULL);
+  }
+
+  void verify_shared_data_buffers() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    ASSERT_NE(fs_->data_buffers_, nullptr);
+    ASSERT_EQ(fs_->data_buffers_->block_size(), fs_->options_.cache_block_size);
+    ASSERT_EQ(fs_->write_blocks_used(), 0ULL);
+
+    const size_t blocks_per_buffer = (fs_->options_.upload_buffer_size +
+                                      fs_->options_.cache_block_size - 1) /
+                                     fs_->options_.cache_block_size;
+
+    const int file_cnt = 3;
+    std::vector<uint64_t> nodeids(file_cnt, 0);
+    std::vector<void *> handles(file_cnt, nullptr);
+
+    char buf[4096];
+    memset(buf, 'S', sizeof(buf));
+
+    for (int i = 0; i < file_cnt; i++) {
+      struct stat st;
+      std::string file_name = "testfile_shared_pool_" + std::to_string(i);
+      int r = fs_->creat(parent, file_name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
+                         0, 0, &nodeids[i], &st, &handles[i]);
+      ASSERT_EQ(r, 0);
+
+      write_to_file_handle(handles[i], buf, sizeof(buf), 0);
+      ASSERT_EQ(fs_->write_blocks_used(),
+                blocks_per_buffer * static_cast<uint64_t>(i + 1));
+    }
+
+    for (int i = 0; i < file_cnt; i++) {
+      ASSERT_EQ(fsync_file_handle(handles[i]), 0);
+      ASSERT_EQ(fs_->release(nodeids[i], get_file_from_handle(handles[i])), 0);
+      fs_->forget(nodeids[i], 1);
+    }
+
+    ASSERT_EQ(fs_->write_blocks_used(), 0ULL);
+  }
+
+  void verify_read_quota_under_write_pressure() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    ASSERT_NE(fs_->data_buffers_, nullptr);
+    const size_t block_size = fs_->options_.cache_block_size;
+    const size_t blocks_per_buffer =
+        (fs_->options_.upload_buffer_size + block_size - 1) / block_size;
+    const size_t blocks_per_chunk =
+        (fs_->options_.prefetch_chunk_size + block_size - 1) / block_size;
+    const size_t read_capacity =
+        blocks_per_chunk * fs_->options_.prefetch_concurrency * 3;
+    ASSERT_GT(read_capacity, 0ULL);
+
+    auto baseline = fs_->data_buffers_->try_allocate(read_capacity + 1);
+    ASSERT_EQ(baseline.size(), read_capacity);
+    fs_->data_buffers_->deallocate(baseline);
+
+    const size_t handle_cnt =
+        (read_capacity + blocks_per_buffer - 1) / blocks_per_buffer +
+        fs_->options_.upload_concurrency + 8;
+
+    char buf[4096];
+    memset(buf, 'F', sizeof(buf));
+
+    std::vector<uint64_t> nodeids(handle_cnt, 0);
+    std::vector<void *> handles(handle_cnt, nullptr);
+    for (size_t i = 0; i < handle_cnt; i++) {
+      struct stat st;
+      std::string file_name = "testfile_read_quota_" + std::to_string(i);
+      int r = fs_->creat(parent, file_name.c_str(), CREATE_BASE_FLAGS, 0777, 0,
+                         0, 0, &nodeids[i], &st, &handles[i]);
+      ASSERT_EQ(r, 0);
+      ASSERT_EQ(write_to_file_handle(handles[i], buf, sizeof(buf), 0),
+                static_cast<ssize_t>(sizeof(buf)));
+    }
+
+    ASSERT_EQ(fs_->write_blocks_used(), handle_cnt * blocks_per_buffer);
+
+    auto under_pressure = fs_->data_buffers_->try_allocate(read_capacity + 1);
+    ASSERT_EQ(under_pressure.size(), read_capacity);
+    ASSERT_TRUE(fs_->data_buffers_->try_allocate(1).empty());
+    fs_->data_buffers_->deallocate(under_pressure);
+
+    for (size_t i = 0; i < handle_cnt; i++) {
+      ASSERT_EQ(fsync_file_handle(handles[i]), 0);
+      ASSERT_EQ(fs_->release(nodeids[i], get_file_from_handle(handles[i])), 0);
+      fs_->forget(nodeids[i], 1);
+    }
+
+    ASSERT_EQ(fs_->write_blocks_used(), 0ULL);
+    auto recovered = fs_->data_buffers_->try_allocate(read_capacity + 1);
+    ASSERT_EQ(recovered.size(), read_capacity);
+    fs_->data_buffers_->deallocate(recovered);
   }
 
   void verify_write_with_oss_error() {
@@ -1209,6 +1315,80 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     }
   }
 
+  void verify_retry_write_after_multipart_upload_limit() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    // part_size is the upload_buffer_size set in the TEST_F (128KB), so the
+    // 10000-part limit maps to ~1.22GiB. Build an object just below it: 9992
+    // full parts (a whole 1249MB) plus a half-part tail. Merging it on a clean
+    // handle leaves buffer_index_ = 9992 with a partial buffer, so a ~1MB write
+    // crosses the limit while a small retry still fits.
+    const size_t part_size = fs_->options_.upload_buffer_size;
+    const size_t full_parts = 9992;          // a whole 1249MB of 128KB parts
+    const size_t tail_size = part_size / 2;  // partial tail kept in buffer_
+    const size_t file_size = full_parts * part_size + tail_size;
+    const size_t final_size = file_size + tail_size;
+
+    // create_file_in_folder creates and writes the object in one step, using a
+    // 1MB buffer internally (no huge allocation). Size is size_MB * 1MB +
+    // drift.
+    std::string filename = "testfile";
+    uint64_t nodeid = 0;
+    create_file_in_folder(parent, filename, file_size / (1024 * 1024), nodeid,
+                          static_cast<int>(file_size % (1024 * 1024)));
+    DEFER(fs_->forget(nodeid, 1));
+
+    struct stat st;
+    int r = fs_->getattr(nodeid, &st);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(static_cast<size_t>(st.st_size), file_size);
+
+    // Reopen with a clean handle: the next write merges the ~10000 remote
+    // parts.
+    void *handle = nullptr;
+    bool unused = false;
+    r = fs_->open(nodeid, O_RDWR, &handle, &unused);
+    ASSERT_EQ(r, 0);
+
+    // A ~1MB write crosses the limit after the merge and gets -EFBIG. The early
+    // return skips cleanup, leaving upload_context_/buffer_ set and handle
+    // clean.
+    const size_t big_count = part_size * 8;
+    std::string first_data = random_string(big_count);
+    ssize_t w =
+        write_to_file_handle(handle, first_data.data(), big_count, file_size);
+    EXPECT_EQ(w, -EFBIG);
+
+    // Retry on the same clean handle re-enters on_first_write(); it must not
+    // merge twice (that trips the RELEASE_ASSERTs). The small write succeeds.
+    std::string retry_data = random_string(tail_size);
+    w = write_to_file_handle(handle, retry_data.data(), tail_size, file_size);
+    EXPECT_EQ(w, static_cast<ssize_t>(tail_size));
+
+    // Now dirty and near the limit: a further ~1MB write is still -EFBIG.
+    w = write_to_file_handle(handle, first_data.data(), big_count, final_size);
+    EXPECT_EQ(w, -EFBIG);
+
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    EXPECT_EQ(r, 0);
+
+    r = fs_->getattr(nodeid, &st);
+    EXPECT_EQ(r, 0);
+    EXPECT_EQ(static_cast<size_t>(st.st_size), final_size);
+
+    // Verify the retried write landed at the right offset (read the tail only;
+    // reading the whole ~1.22GiB object would be too expensive).
+    void *rhandle = nullptr;
+    r = fs_->open(nodeid, O_RDONLY, &rhandle, &unused);
+    ASSERT_EQ(r, 0);
+    std::string tail_buf(tail_size, '\0');
+    ssize_t rd = read_from_handle(rhandle, &tail_buf[0], tail_size, file_size);
+    EXPECT_EQ(rd, static_cast<ssize_t>(tail_size));
+    EXPECT_EQ(tail_buf, retry_data);
+    fs_->release(nodeid, get_file_from_handle(rhandle));
+  }
+
   void verify_create_and_write_with_different_handle(bool appendable = false) {
     uint64_t parent = get_test_dir_parent();
 
@@ -1381,8 +1561,6 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     if (fs_->options_.prefetch_chunks == 0) {
       max_prefetch_chunks = fs_->options_.prefetch_concurrency * 3;
     } else if (fs_->options_.prefetch_chunks > 0) {
-      // we always allocate at least one prefetch chunks, so max prefetch
-      // total blocks is aligned downward to prefetch_chunks
       max_prefetch_chunks = fs_->options_.prefetch_chunks;
       total_file_count = std::max(
           total_file_count,
@@ -1408,7 +1586,8 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     std::array<int, 2> parallel_cnts = {1, 8};
 
     for (auto parallel_cnt : parallel_cnts) {
-      ASSERT_EQ(fs_->download_buffers_->used_blocks(), 0ULL);
+      wait_write_blocks_released();
+      ASSERT_EQ(fs_->data_buffers_->used_blocks(), 0ULL);
       std::vector<std::future<void>> tasks;
 
       std::vector<void *> fds(total_file_count, 0);
@@ -1438,7 +1617,8 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
         task.wait();
       }
 
-      ASSERT_EQ(fs_->download_buffers_->used_blocks(),
+      wait_write_blocks_released();
+      ASSERT_EQ(fs_->data_buffers_->used_blocks(),
                 max_prefetch_chunks * (fs_->options_.prefetch_chunk_size /
                                        fs_->options_.cache_block_size));
 
@@ -2115,7 +2295,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
     if (fs_->get_cache_type() == CacheType::kDiskCache) {
       // After all reads are done, the buffer should be released for disk cache.
       std::this_thread::sleep_for(std::chrono::seconds(1));
-      ASSERT_EQ(fs_->download_buffers_->used_blocks(), 0ULL);
+      ASSERT_EQ(fs_->data_buffers_->used_blocks(), 0ULL);
     }
   }
 
@@ -2768,6 +2948,86 @@ TEST_F(Ossfs2ReadWriteTest, verify_min_reserved_buffer_size_per_file) {
   verify_concurrent_write_and_read();
 }
 
+TEST_F(Ossfs2ReadWriteTest, verify_shared_data_buffers) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_shared_data_buffers();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_shared_data_buffers_without_prefetch) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.prefetch_concurrency = 0;
+  init(opts);
+  verify_shared_data_buffers();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_upload_buffer_non_aligned_blocks) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  // 1.5 MB = 1 full 1MB block + 1 partial 0.5MB block per upload buffer.
+  opts.upload_buffer_size = 1572864;
+  init(opts);
+
+  uint64_t parent = get_test_dir_parent();
+  DEFER(fs_->forget(parent, 1));
+
+  uint64_t nodeid = 0;
+  auto crc = create_file_in_folder(parent, "testfile_cropped", 10, nodeid);
+  ASSERT_TRUE(crc > 0);
+  DEFER(fs_->forget(nodeid, 1));
+
+  auto file_path = nodeid_to_path(nodeid);
+  auto meta = get_file_meta(file_path, FLAGS_oss_bucket_prefix);
+  ASSERT_EQ(std::to_string(crc), meta["X-Oss-Hash-Crc64ecma"]);
+
+  void *handle = nullptr;
+  bool unused;
+  int r = fs_->open(nodeid, O_RDONLY, &handle, &unused);
+  ASSERT_EQ(r, 0);
+  DEFER(fs_->release(nodeid, get_file_from_handle(handle)));
+
+  char buf[4096];
+  uint64_t read_crc = 0;
+  off_t off = 0;
+  const size_t file_size = 10ULL * 1024 * 1024;
+  while (static_cast<size_t>(off) < file_size) {
+    size_t to_read =
+        std::min(sizeof(buf), file_size - static_cast<size_t>(off));
+    ssize_t n = read_from_handle(handle, buf, to_read, off);
+    ASSERT_EQ(n, static_cast<ssize_t>(to_read));
+    read_crc = crc64ecma(buf, static_cast<size_t>(n), read_crc);
+    off += n;
+  }
+  ASSERT_EQ(read_crc, crc);
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_shared_data_buffers_unlimited) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.prefetch_chunks = -1;
+  init(opts);
+  verify_shared_data_buffers();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_read_quota_under_write_pressure) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  // read quota = 3 blocks, one buffer = 1 block.
+  opts.upload_buffer_size = 1048576;
+  opts.upload_concurrency = 1;
+  opts.prefetch_chunk_size = 1048576;
+  opts.prefetch_concurrency = 1;
+  init(opts);
+  verify_read_quota_under_write_pressure();
+}
+
 TEST_F(Ossfs2ReadWriteTest, verify_write_with_oss_error) {
   SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
@@ -2878,6 +3138,15 @@ TEST_F(Ossfs2ReadWriteTest, verify_oss_multipart_upload_limit) {
   opts.upload_buffer_size = 1048576;
   init(opts);
   verify_oss_multipart_upload_limit();
+}
+
+TEST_F(Ossfs2ReadWriteTest, verify_retry_write_after_multipart_upload_limit) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.upload_buffer_size = 131072;
+  init(opts);
+  verify_retry_write_after_multipart_upload_limit();
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_create_and_write_with_different_handle) {
@@ -3143,6 +3412,10 @@ TEST_F(Ossfs2ReadWriteTest, verify_read_out_of_range_with_disk_cache) {
   opts.prefetch_chunk_size = 1048576 * 2;
   opts.attr_timeout = 120;
   opts.cache_type = CacheType::kDiskCache;
+  // The persistent disk cache is keyed by (path, etag); after a local write
+  // the inode etag matches the cloud, so an external overwrite is only
+  // detectable through the close-to-open HEAD.
+  opts.close_to_open = true;
   init(opts);
   verify_read_out_of_range();
 }

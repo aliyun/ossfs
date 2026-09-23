@@ -19,9 +19,13 @@
 #include <gflags/gflags.h>
 
 #include <array>
+#include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
+#include <string>
 #include <string_view>
+#include <vector>
 
 class OptionRegistrar;
 class OptionsRegistry {
@@ -38,12 +42,19 @@ class OptionsRegistry {
     kCount,
   };
 
+  enum OptionMode : uint8_t {
+    kModeOss = 1 << 0,
+    kModeHdfs = 1 << 1,
+    kModeAll = kModeOss | kModeHdfs,
+  };
+
   static const std::string_view kCategoryNames[];
 
   struct OptionAttribute {
     std::string name;
     bool hidden = false;
     bool experimental = false;
+    uint8_t modes = kModeAll;
   };
 
   using ContainerType =
@@ -53,6 +64,12 @@ class OptionsRegistry {
   static const ContainerType &get_all_options() {
     return options_;
   }
+
+  // Return names of options that do not apply to the current backend mode,
+  // filtered by is_explicitly_set (e.g. non-default gflags values at mount).
+  static std::vector<std::string> get_inapplicable_options(
+      bool is_hdfs,
+      const std::function<bool(std::string_view)> &is_explicitly_set);
 
   const static std::set<std::string> kSensitiveOptions;
 
@@ -66,18 +83,21 @@ class OptionRegistrar {
  public:
   OptionRegistrar(const std::string &name,
                   OptionsRegistry::OptionCategory category, bool hidden = false,
-                  bool experimental = false) {
-    OptionsRegistry::options_[category].push_back({name, hidden, experimental});
+                  bool experimental = false,
+                  uint8_t modes = OptionsRegistry::kModeAll) {
+    OptionsRegistry::options_[category].push_back(
+        {name, hidden, experimental, modes});
   }
 };
 
 #define DEFINE_OPTION(name, type, default_value, help_string, category,      \
-                      hidden, experimental)                                  \
+                      hidden, experimental, modes)                           \
   DEFINE_##type(name, default_value, help_string);                           \
   namespace {                                                                \
   static OptionRegistrar o_##name(#name,                                     \
                                   OptionsRegistry::OptionCategory::category, \
-                                  hidden, experimental);                     \
+                                  hidden, experimental,                      \
+                                  OptionsRegistry::OptionMode::modes);       \
   }
 
 // ==================== General options ====================
@@ -121,6 +141,7 @@ DECLARE_string(oss_access_key_secret);
 DECLARE_string(ram_role);
 DECLARE_string(credential_process);
 DECLARE_uint64(credential_refresh_interval);
+DECLARE_bool(credential_refresh_backoff);
 
 // ==================== Caching options ====================
 DECLARE_uint64(attr_timeout);
@@ -141,7 +162,9 @@ DECLARE_string(disk_data_cache_dir);
 DECLARE_string(disk_data_cache_size);
 DECLARE_string(disk_data_cache_io_engine);
 DECLARE_string(disk_available_space);
+DECLARE_string(disk_data_cache_max_file_size);
 DECLARE_int32(libaio_vcpu_count);
+DECLARE_uint32(async_task_limit);
 
 // ==================== Oss Client Options ====================
 DECLARE_string(upload_buffer_size);
@@ -166,6 +189,8 @@ DECLARE_int32(max_list_ret_count);
 DECLARE_uint64(oss_request_timeout_ms);
 DECLARE_string(oss_hdfs_client_options);
 DECLARE_string(bind_ips);
+DECLARE_bool(enable_ipv6);
+DECLARE_bool(path_style);
 DECLARE_bool(set_mime_for_rename_dst);
 DECLARE_bool(use_auth_cache);
 DECLARE_int32(rename_dir_concurrency);

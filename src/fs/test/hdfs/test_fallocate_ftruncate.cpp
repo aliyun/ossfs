@@ -253,6 +253,73 @@ class Ossfs2HdfsFallocateFtruncateTest : public OssHdfsTestSuite {
     r = fs_->release(nodeid, file);
     ASSERT_EQ(r, 0);
   }
+
+  // ftruncate shrink closes and reopens the handle. The reopen must not
+  // replay O_TRUNC, otherwise the just-truncated file is deleted and
+  // recreated empty while the inode still believes it holds the content.
+  void verify_ftruncate_shrink_after_trunc_open() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = create_and_flush(parent, "trunc_reopen", CREATE_BASE_FLAGS, 0777, 0,
+                             0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    const size_t data_size = 8192;
+    char *buf = new char[data_size];
+    DEFER(delete[] buf);
+    memset(buf, 'P', data_size);
+
+    auto file = get_file_from_handle(handle);
+    ASSERT_EQ(file->pwrite(buf, data_size, 0), (ssize_t)data_size);
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+
+    // Reopen with open(2)-style O_TRUNC (no O_CREAT).
+    bool keep_cache = false;
+    void *trunc_handle = nullptr;
+    r = fs_->open(nodeid, O_RDWR | O_TRUNC, &trunc_handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    auto tfile = get_file_from_handle(trunc_handle);
+
+    ASSERT_EQ(tfile->pwrite(buf, data_size, 0), (ssize_t)data_size);
+
+    // Shrink to 4KB via setattr; internally close -> truncate -> reopen.
+    struct stat new_stat;
+    memset(&new_stat, 0, sizeof(new_stat));
+    new_stat.st_size = 4096;
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(trunc_handle);
+    r = fs_->setattr(nodeid, &new_stat, FUSE_SET_ATTR_SIZE, &fi, 0, 0);
+    ASSERT_EQ(r, 0);
+
+    // The first 4KB must survive the shrink.
+    char verify[4096];
+    memset(verify, 0, sizeof(verify));
+    ssize_t n = tfile->pread(verify, 4096, 0);
+    ASSERT_EQ(n, (ssize_t)4096);
+    ASSERT_EQ(verify[0], 'P');
+    ASSERT_EQ(verify[4095], 'P');
+
+    r = fs_->release(nodeid, tfile);
+    ASSERT_EQ(r, 0);
+
+    // The backend must hold the truncated content.
+    void *rd_handle = nullptr;
+    r = fs_->open(nodeid, O_RDONLY, &rd_handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    memset(verify, 0, sizeof(verify));
+    n = get_file_from_handle(rd_handle)->pread(verify, 4096, 0);
+    ASSERT_EQ(n, (ssize_t)4096);
+    ASSERT_EQ(verify[4095], 'P');
+    r = fs_->release(nodeid, get_file_from_handle(rd_handle));
+    ASSERT_EQ(r, 0);
+  }
 };
 
 TEST_F(Ossfs2HdfsFallocateFtruncateTest, verify_fallocate_extend) {
@@ -295,4 +362,12 @@ TEST_F(Ossfs2HdfsFallocateFtruncateTest, verify_ftruncate_via_setattr) {
   OssFsOptions opts;
   init(opts);
   verify_ftruncate_via_setattr();
+}
+
+TEST_F(Ossfs2HdfsFallocateFtruncateTest,
+       verify_ftruncate_shrink_after_trunc_open) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_ftruncate_shrink_after_trunc_open();
 }

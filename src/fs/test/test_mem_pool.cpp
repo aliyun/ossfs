@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "fs/mem_pool.h"
+#include "fs/shared_data_pool.h"
 #include "test_suite.h"
 
 class FixedMemoryPoolTest : public Ossfs2TestSuite {
@@ -182,6 +183,138 @@ class FixedMemoryPoolTest : public Ossfs2TestSuite {
     ASSERT_DOUBLE_EQ(pool5.get_usage_ratio(), 0.0);
     pool5.deallocate(blocks4);
   }
+
+  void verify_read_quota_independent_of_writes() {
+    const size_t block_size = 1024;
+    const size_t pool_capacity = 10;
+    const size_t read_quota_blocks = 4;
+
+    SharedDataBufferPool pool(block_size, pool_capacity, pool_capacity, 0,
+                              read_quota_blocks);
+
+    auto write_blocks = pool.allocate_write(pool_capacity * 3);
+    ASSERT_EQ(pool.write_used_blocks(), pool_capacity * 3);
+    ASSERT_EQ(pool.used_blocks(), pool_capacity * 3);
+
+    auto blocks = pool.try_allocate(read_quota_blocks);
+    ASSERT_EQ(blocks.size(), read_quota_blocks);
+    ASSERT_TRUE(pool.try_allocate(1).empty());
+
+    pool.deallocate(blocks);
+    pool.deallocate_write(write_blocks);
+    ASSERT_EQ(pool.used_blocks(), 0ULL);
+  }
+
+  void verify_write_never_blocked_by_reads() {
+    const size_t block_size = 1024;
+    const size_t pool_capacity = 10;
+    const size_t read_quota_blocks = 8;
+
+    SharedDataBufferPool pool(block_size, pool_capacity, pool_capacity, 0,
+                              read_quota_blocks);
+
+    auto blocks = pool.try_allocate(read_quota_blocks);
+    ASSERT_EQ(blocks.size(), read_quota_blocks);
+    ASSERT_TRUE(pool.try_allocate(1).empty());
+    ASSERT_EQ(pool.cached_block_list_.size(), 0ULL);
+
+    auto write_blocks = pool.allocate_write(pool_capacity);
+    ASSERT_EQ(write_blocks.size(), pool_capacity);
+    ASSERT_EQ(pool.write_used_blocks(), pool_capacity);
+    ASSERT_EQ(pool.used_blocks(), read_quota_blocks + pool_capacity);
+
+    pool.deallocate_write(write_blocks);
+    pool.deallocate(blocks);
+    ASSERT_EQ(pool.used_blocks(), 0ULL);
+  }
+
+  void verify_read_quota_cap() {
+    const size_t block_size = 1024;
+    const size_t pool_capacity = 12;
+    const size_t read_quota_blocks = 8;
+
+    SharedDataBufferPool pool(block_size, pool_capacity, pool_capacity, 0,
+                              read_quota_blocks);
+
+    auto blocks = pool.try_allocate(pool_capacity);
+    ASSERT_EQ(blocks.size(), read_quota_blocks);
+    ASSERT_TRUE(pool.try_allocate(1).empty());
+
+    auto write_blocks = pool.allocate_write(4);
+    ASSERT_EQ(write_blocks.size(), 4ULL);
+    ASSERT_EQ(pool.used_blocks(), 12ULL);
+
+    ASSERT_TRUE(pool.try_allocate(1).empty());
+
+    auto fg = pool.try_allocate(1, true);
+    ASSERT_EQ(fg.size(), 1ULL);
+    pool.deallocate(fg);
+
+    pool.deallocate(blocks);
+    auto again = pool.try_allocate(3);
+    ASSERT_EQ(again.size(), 3ULL);
+
+    pool.deallocate(again);
+    pool.deallocate_write(write_blocks);
+    ASSERT_EQ(pool.used_blocks(), 0ULL);
+  }
+
+  void verify_usage_ratio_excludes_write_share() {
+    const size_t block_size = 1024;
+    const size_t pool_capacity = 12;
+    const size_t read_quota_blocks = 8;
+
+    SharedDataBufferPool pool(block_size, pool_capacity, pool_capacity, 0,
+                              read_quota_blocks);
+    ASSERT_DOUBLE_EQ(pool.read_usage_ratio(), 0.0);
+
+    auto reads = pool.try_allocate(read_quota_blocks / 2);
+    ASSERT_EQ(reads.size(), read_quota_blocks / 2);
+    ASSERT_DOUBLE_EQ(pool.read_usage_ratio(), 0.5);
+
+    auto writes = pool.allocate_write(pool_capacity);
+    ASSERT_EQ(pool.used_blocks(), read_quota_blocks / 2 + pool_capacity);
+    ASSERT_DOUBLE_EQ(pool.read_usage_ratio(), 0.5);
+
+    auto more = pool.try_allocate(read_quota_blocks - read_quota_blocks / 2);
+    ASSERT_EQ(more.size(), read_quota_blocks - read_quota_blocks / 2);
+    ASSERT_DOUBLE_EQ(pool.read_usage_ratio(), 1.0);
+
+    pool.deallocate(more);
+    pool.deallocate(reads);
+    pool.deallocate_write(writes);
+    ASSERT_EQ(pool.used_blocks(), 0ULL);
+
+    SharedDataBufferPool unlimited(
+        block_size, std::numeric_limits<size_t>::max(), pool_capacity, 0,
+        std::numeric_limits<size_t>::max());
+    auto any = unlimited.allocate(4);
+    ASSERT_EQ(any.size(), 4ULL);
+    ASSERT_DOUBLE_EQ(unlimited.read_usage_ratio(), 0.0);
+    unlimited.deallocate(any);
+  }
+
+  // Regression: unlimited read (read_quota == SIZE_MAX) with concurrent write
+  // borrowing must not overflow the bounded-read limit. Before the fix,
+  // read_quota_blocks_ + write_used_ wrapped to a tiny value and starved reads.
+  void verify_unlimited_read_not_starved_by_writes() {
+    const size_t block_size = 1024;
+    const size_t max_cached_blocks = 16;
+    SharedDataBufferPool pool(block_size, std::numeric_limits<size_t>::max(),
+                              max_cached_blocks, 0,
+                              std::numeric_limits<size_t>::max());
+
+    auto writes = pool.allocate_write(8);
+    ASSERT_EQ(writes.size(), 8ULL);
+
+    // Bounded read (ignore_limit = false) stays unbounded under unlimited read.
+    auto reads = pool.try_allocate(100);
+    ASSERT_EQ(reads.size(), 100ULL);
+
+    pool.deallocate(reads);
+    pool.deallocate_write(writes);
+    ASSERT_EQ(pool.used_blocks(), 0ULL);
+  }
 };
 
 TEST_F(FixedMemoryPoolTest, verify_allocate) {
@@ -198,4 +331,24 @@ TEST_F(FixedMemoryPoolTest, verify_purger) {
 
 TEST_F(FixedMemoryPoolTest, verify_get_usage_ratio) {
   verify_get_usage_ratio();
+}
+
+TEST_F(FixedMemoryPoolTest, verify_read_quota_independent_of_writes) {
+  verify_read_quota_independent_of_writes();
+}
+
+TEST_F(FixedMemoryPoolTest, verify_write_never_blocked_by_reads) {
+  verify_write_never_blocked_by_reads();
+}
+
+TEST_F(FixedMemoryPoolTest, verify_read_quota_cap) {
+  verify_read_quota_cap();
+}
+
+TEST_F(FixedMemoryPoolTest, verify_usage_ratio_excludes_write_share) {
+  verify_usage_ratio_excludes_write_share();
+}
+
+TEST_F(FixedMemoryPoolTest, verify_unlimited_read_not_starved_by_writes) {
+  verify_unlimited_read_not_starved_by_writes();
 }

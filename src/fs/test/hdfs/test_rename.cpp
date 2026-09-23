@@ -395,6 +395,374 @@ class Ossfs2HdfsRenameTest : public OssHdfsTestSuite {
     r = fs_->rename(parent, "rename_src", parent, "rename_dst", 0);
     ASSERT_EQ(r, -EIO);
   }
+
+  // RENAME_NOREPLACE must return -EEXIST even when the local dst inode is
+  // stale: the destination was recreated remotely after the local inode was
+  // marked stale, so only a remote probe can detect it.
+  void verify_rename_noreplace_stale_dst() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+    void *handle = nullptr;
+
+    uint64_t src_id = 0;
+    int r = create_and_flush(parent, "stale_src", CREATE_BASE_FLAGS, 0777, 0, 0,
+                             0, &src_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(src_id, 1));
+    if (handle) fs_->release(src_id, get_file_from_handle(handle));
+
+    uint64_t dst_id = 0;
+    handle = nullptr;
+    r = create_and_flush(parent, "stale_dst", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                         &dst_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dst_id, 1));
+    if (handle) fs_->release(dst_id, get_file_from_handle(handle));
+
+    // Remove dst via unlink (marks the local inode stale), then recreate
+    // dst remotely behind the local cache's back.
+    ASSERT_EQ(fs_->unlink(parent, "stale_dst", 0, 0), 0);
+    std::string dst_uri = hdfs_helper_->full_uri(nodeid_to_path(dst_id));
+    std::string local_file = join_paths(test_path_, "stale_dst_content");
+    create_random_file(local_file, 1);
+    ASSERT_EQ(hdfs_helper_->upload_file(local_file, dst_uri), 0);
+
+    r = fs_->rename(parent, "stale_src", parent, "stale_dst", RENAME_NOREPLACE);
+    ASSERT_EQ(r, -EEXIST);
+  }
+
+  // Read back a file via the fs and compare its content.
+  void verify_file_content(uint64_t parent, const char *name,
+                           const char *expected) {
+    struct stat st;
+    uint64_t id = 0;
+    ASSERT_EQ(fs_->lookup(parent, name, &id, &st), 0);
+    DEFER(fs_->forget(id, 1));
+    bool keep_cache = false;
+    void *rd = nullptr;
+    ASSERT_EQ(fs_->open(id, O_RDONLY, &rd, &keep_cache), 0);
+    char buf[64] = {};
+    ssize_t n = get_file_from_handle(rd)->pread(buf, sizeof(buf), 0);
+    ASSERT_EQ(n, (ssize_t)strlen(expected));
+    ASSERT_EQ(std::string(buf, n), expected);
+    ASSERT_EQ(fs_->release(id, get_file_from_handle(rd)), 0);
+  }
+
+  // Plain rename must replace a destination that exists only remotely (no
+  // local inode), per POSIX overwrite semantics.
+  void verify_rename_overwrite_remote_only_dst() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+    void *handle = nullptr;
+
+    uint64_t src_id = 0;
+    int r = create_and_flush(parent, "ow_src", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                             &src_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(src_id, 1));
+    auto file = get_file_from_handle(handle);
+    const char *data = "overwrite-content";
+    ASSERT_EQ(file->pwrite(data, strlen(data), 0), (ssize_t)strlen(data));
+    ASSERT_EQ(fs_->release(src_id, file), 0);
+
+    // dst exists only remotely and was never looked up locally.
+    auto parent_path = hdfs_helper_->full_uri(nodeid_to_path(parent));
+    std::string dst_uri = join_paths(parent_path, "ow_dst");
+    std::string local_file = join_paths(test_path_, "ow_dst_old");
+    create_random_file(local_file, 1);
+    ASSERT_EQ(hdfs_helper_->upload_file(local_file, dst_uri), 0);
+
+    r = fs_->rename(parent, "ow_src", parent, "ow_dst", 0);
+    ASSERT_EQ(r, 0);
+
+    // The destination must now hold the src content.
+    verify_file_content(parent, "ow_dst", data);
+  }
+
+  // Plain rename must overwrite a stale dst that was recreated remotely.
+  void verify_rename_overwrite_stale_dst() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+    void *handle = nullptr;
+
+    uint64_t src_id = 0;
+    int r = create_and_flush(parent, "os_src", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                             &src_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(src_id, 1));
+    auto file = get_file_from_handle(handle);
+    const char *data = "stale-overwrite-content";
+    ASSERT_EQ(file->pwrite(data, strlen(data), 0), (ssize_t)strlen(data));
+    ASSERT_EQ(fs_->release(src_id, file), 0);
+
+    uint64_t dst_id = 0;
+    handle = nullptr;
+    r = create_and_flush(parent, "os_dst", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                         &dst_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dst_id, 1));
+    if (handle) fs_->release(dst_id, get_file_from_handle(handle));
+
+    // unlink marks the local dst inode stale, then another client recreates
+    // the dst remotely with different content.
+    ASSERT_EQ(fs_->unlink(parent, "os_dst", 0, 0), 0);
+    std::string dst_uri = hdfs_helper_->full_uri(nodeid_to_path(dst_id));
+    std::string local_file = join_paths(test_path_, "os_dst_old");
+    create_random_file(local_file, 1);
+    ASSERT_EQ(hdfs_helper_->upload_file(local_file, dst_uri), 0);
+
+    r = fs_->rename(parent, "os_src", parent, "os_dst", 0);
+    ASSERT_EQ(r, 0);
+
+    // The destination must now hold the src content.
+    verify_file_content(parent, "os_dst", data);
+  }
+
+  // Renaming onto a remote-only dst of a different type must be rejected.
+  void verify_rename_type_mismatch_remote_dst() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+    void *handle = nullptr;
+    auto parent_uri = hdfs_helper_->full_uri(nodeid_to_path(parent));
+
+    // file -> remote-only dir dst
+    uint64_t src_id = 0;
+    int r = create_and_flush(parent, "tm_src", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                             &src_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(src_id, 1));
+    if (handle) fs_->release(src_id, get_file_from_handle(handle));
+
+    std::string dst_uri = join_paths(parent_uri, "tm_dir");
+    ASSERT_EQ(hdfs_helper_->create_dir(dst_uri), 0);
+    r = fs_->rename(parent, "tm_src", parent, "tm_dir", 0);
+    ASSERT_EQ(r, -EISDIR);
+
+    // dir -> remote-only file dst
+    uint64_t dir_id = 0;
+    r = fs_->mkdir(parent, "tm_src_dir", 0755, 0, 0, 0, &dir_id, &st);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dir_id, 1));
+
+    std::string file_uri = join_paths(parent_uri, "tm_file");
+    std::string local_file = join_paths(test_path_, "tm_file_content");
+    create_random_file(local_file, 1);
+    ASSERT_EQ(hdfs_helper_->upload_file(local_file, file_uri), 0);
+    r = fs_->rename(parent, "tm_src_dir", parent, "tm_file", 0);
+    ASSERT_EQ(r, -ENOTDIR);
+  }
+
+  // Stale dst replaced remotely with a different type must be rejected.
+  void verify_rename_type_mismatch_stale_dst() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+    void *handle = nullptr;
+
+    uint64_t src_id = 0;
+    int r = create_and_flush(parent, "ts_src", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                             &src_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(src_id, 1));
+    if (handle) fs_->release(src_id, get_file_from_handle(handle));
+
+    uint64_t dst_id = 0;
+    handle = nullptr;
+    r = create_and_flush(parent, "ts_dst", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                         &dst_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dst_id, 1));
+    if (handle) fs_->release(dst_id, get_file_from_handle(handle));
+
+    // unlink marks the local dst inode stale, then another client recreates
+    // it as a dir.
+    ASSERT_EQ(fs_->unlink(parent, "ts_dst", 0, 0), 0);
+    std::string dst_uri = hdfs_helper_->full_uri(nodeid_to_path(dst_id));
+    ASSERT_EQ(hdfs_helper_->create_dir(dst_uri), 0);
+
+    r = fs_->rename(parent, "ts_src", parent, "ts_dst", 0);
+    ASSERT_EQ(r, -EISDIR);
+  }
+
+  // The probe runs even with a fresh local dst inode: if another client
+  // changed the remote dst's type, the rename must be rejected.
+  void verify_rename_probe_fresh_local_dst() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+    void *handle = nullptr;
+
+    uint64_t src_id = 0;
+    int r = create_and_flush(parent, "fresh_src", CREATE_BASE_FLAGS, 0777, 0, 0,
+                             0, &src_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(src_id, 1));
+    if (handle) fs_->release(src_id, get_file_from_handle(handle));
+
+    uint64_t dst_id = 0;
+    handle = nullptr;
+    r = create_and_flush(parent, "fresh_dst", CREATE_BASE_FLAGS, 0777, 0, 0, 0,
+                         &dst_id, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(dst_id, 1));
+    if (handle) fs_->release(dst_id, get_file_from_handle(handle));
+
+    // Another client replaces the remote dst file with a dir.
+    std::string dst_uri = hdfs_helper_->full_uri(nodeid_to_path(dst_id));
+    ASSERT_EQ(hdfs_helper_->delete_file(dst_uri), 0);
+    ASSERT_EQ(hdfs_helper_->create_dir(dst_uri), 0);
+
+    r = fs_->rename(parent, "fresh_src", parent, "fresh_dst", 0);
+    ASSERT_EQ(r, -EISDIR);
+  }
+
+  // A reader opened before rename must keep serving data afterwards: the
+  // handle detects the path change and rebuilds its backend stream.
+  void verify_read_open_file_after_rename() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    create_file_in_folder(parent, "rename_rd_src", 16, nodeid);
+    DEFER(fs_->forget(nodeid, 1));
+
+    bool keep_cache = false;
+    void *handle = nullptr;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &handle, &keep_cache), 0);
+    auto *reader = get_file_from_handle(handle);
+    DEFER(fs_->release(nodeid, reader));
+
+    ASSERT_EQ(fs_->rename(parent, "rename_rd_src", parent, "rename_rd_dst", 0),
+              0);
+
+    // create_file_in_folder writes a local random file with the same name.
+    std::ifstream lf(join_paths(test_path_, "rename_rd_src"), std::ios::binary);
+    ASSERT_TRUE(lf.good());
+
+    const size_t kChunk = 1 << 20;
+    std::vector<char> buf(kChunk);
+    std::vector<char> expected(kChunk);
+    for (uint64_t off = 0; off < 16; off++) {
+      ssize_t n = reader->pread(buf.data(), kChunk, off * kChunk);
+      ASSERT_EQ(n, (ssize_t)kChunk) << "chunk " << off;
+      lf.read(expected.data(), kChunk);
+      ASSERT_EQ(memcmp(buf.data(), expected.data(), kChunk), 0)
+          << "chunk " << off;
+    }
+    ASSERT_EQ(reader->pread(buf.data(), kChunk, 16 * kChunk), 0);
+
+    // The new path must serve the same data to a freshly opened reader.
+    struct stat st;
+    uint64_t dst_id = 0;
+    ASSERT_EQ(fs_->lookup(parent, "rename_rd_dst", &dst_id, &st), 0);
+    DEFER(fs_->forget(dst_id, 1));
+    void *dst_handle = nullptr;
+    ASSERT_EQ(fs_->open(dst_id, O_RDONLY, &dst_handle, &keep_cache), 0);
+    auto *dst_reader = get_file_from_handle(dst_handle);
+    ASSERT_EQ(dst_reader->pread(buf.data(), kChunk, 0), (ssize_t)kChunk);
+    lf.clear();
+    lf.seekg(0);
+    lf.read(expected.data(), kChunk);
+    ASSERT_EQ(memcmp(buf.data(), expected.data(), kChunk), 0);
+    ASSERT_EQ(fs_->release(dst_id, dst_reader), 0);
+  }
+
+  // If the rebuild reopen fails, the pread must error out, and the next
+  // pread must retry the rebuild (the recorded path stays stale until a
+  // rebuild succeeds).
+  void verify_read_rebuild_reopen_fail_retries() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    create_file_in_folder(parent, "rebuild_fail_src", 1, nodeid);
+    DEFER(fs_->forget(nodeid, 1));
+
+    bool keep_cache = false;
+    void *handle = nullptr;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &handle, &keep_cache), 0);
+    auto *reader = get_file_from_handle(handle);
+    DEFER(fs_->release(nodeid, reader));
+
+    ASSERT_EQ(
+        fs_->rename(parent, "rebuild_fail_src", parent, "rebuild_fail_dst", 0),
+        0);
+
+    const size_t kChunk = 4096;
+    std::vector<char> buf(kChunk);
+
+    g_fault_injector->set_injection(FI_HdfsReaderRebuild_ReopenFail);
+    DEFER(g_fault_injector->clear_injection(FI_HdfsReaderRebuild_ReopenFail));
+    ASSERT_EQ(reader->pread(buf.data(), kChunk, 0), -EIO);
+
+    // Injection cleared; the next pread retries the rebuild and succeeds.
+    g_fault_injector->clear_injection(FI_HdfsReaderRebuild_ReopenFail);
+    ASSERT_EQ(reader->pread(buf.data(), kChunk, 0), (ssize_t)kChunk);
+  }
+
+  // A writer opened before rename must keep accepting writes afterwards:
+  // the SDK writer stream binds to the inode, not the path.
+  void verify_write_open_file_after_rename() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+    void *handle = nullptr;
+
+    uint64_t nodeid = 0;
+    int r = create_and_flush(parent, "rename_wr_src", CREATE_BASE_FLAGS, 0777,
+                             0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    if (handle) fs_->release(nodeid, get_file_from_handle(handle));
+
+    handle = nullptr;
+    bool keep_cache = false;
+    ASSERT_EQ(fs_->open(nodeid, O_RDWR, &handle, &keep_cache), 0);
+    DEFER(fs_->release(nodeid, get_file_from_handle(handle)));
+
+    ASSERT_EQ(fs_->rename(parent, "rename_wr_src", parent, "rename_wr_dst", 0),
+              0);
+
+    // Writes through the pre-rename handle must land in the renamed file.
+    const size_t kChunk = 1 << 20;
+    std::vector<char> data(kChunk);
+    for (size_t i = 0; i < kChunk; i++) data[i] = (char)(i * 7 + 13);
+    for (uint64_t off = 0; off < 4; off++) {
+      ASSERT_EQ(write_to_file_handle(handle, data.data(), kChunk, off * kChunk),
+                (ssize_t)kChunk)
+          << "chunk " << off;
+    }
+
+    // Flush so the written data is visible to a freshly opened reader.
+    ASSERT_EQ(fsync_file_handle(handle, true), 0);
+
+    // Old path gone, new path serves the exact written content.
+    uint64_t gone_id = 0;
+    ASSERT_EQ(fs_->lookup(parent, "rename_wr_src", &gone_id, &st), -ENOENT);
+
+    uint64_t dst_id = 0;
+    ASSERT_EQ(fs_->lookup(parent, "rename_wr_dst", &dst_id, &st), 0);
+    DEFER(fs_->forget(dst_id, 1));
+    ASSERT_EQ(st.st_size, (off_t)(4 * kChunk));
+
+    void *dst_handle = nullptr;
+    ASSERT_EQ(fs_->open(dst_id, O_RDONLY, &dst_handle, &keep_cache), 0);
+    auto *dst_reader = get_file_from_handle(dst_handle);
+    DEFER(fs_->release(dst_id, dst_reader));
+
+    std::vector<char> buf(kChunk);
+    for (uint64_t off = 0; off < 4; off++) {
+      ASSERT_EQ(dst_reader->pread(buf.data(), kChunk, off * kChunk),
+                (ssize_t)kChunk)
+          << "chunk " << off;
+      ASSERT_EQ(memcmp(buf.data(), data.data(), kChunk), 0) << "chunk " << off;
+    }
+    ASSERT_EQ(dst_reader->pread(buf.data(), kChunk, 4 * kChunk), 0);
+  }
 };
 
 TEST_F(Ossfs2HdfsRenameTest, verify_rename_remote_dir) {
@@ -448,6 +816,48 @@ TEST_F(Ossfs2HdfsRenameTest, verify_rename_predelete_fail) {
   verify_rename_predelete_fail();
 }
 
+TEST_F(Ossfs2HdfsRenameTest, verify_rename_noreplace_stale_dst) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_rename_noreplace_stale_dst();
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_rename_overwrite_remote_only_dst) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_rename_overwrite_remote_only_dst();
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_rename_overwrite_stale_dst) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_rename_overwrite_stale_dst();
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_rename_type_mismatch_remote_dst) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_rename_type_mismatch_remote_dst();
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_rename_type_mismatch_stale_dst) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_rename_type_mismatch_stale_dst();
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_rename_probe_fresh_local_dst) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_rename_probe_fresh_local_dst();
+}
+
 // rename_dir error path.
 TEST_F(Ossfs2HdfsRenameTest, verify_rename_dir_call_fail) {
   INIT_PHOTON();
@@ -469,4 +879,26 @@ TEST_F(Ossfs2HdfsRenameTest, verify_rename_dir_call_fail) {
 
   r = fs_->rename(parent, "src_dir", parent, "dst_dir", 0);
   ASSERT_EQ(r, -EIO);
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_read_open_file_after_rename) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_read_open_file_after_rename();
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_read_rebuild_reopen_fail_retries) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_read_rebuild_reopen_fail_retries();
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_write_open_file_after_rename) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  FLAGS_write_with_fuse_bufvec = false;
+  init(opts);
+  verify_write_open_file_after_rename();
 }

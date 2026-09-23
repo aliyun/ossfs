@@ -177,3 +177,78 @@ TEST(OssFsOptionsTest, verify_random_write_validation) {
   options.random_write_chunk_size = 2ULL << 20;
   EXPECT_EQ(OssFsOptions::validate_random_write(options), 0);
 }
+
+TEST(DataBufferBudgetTest, verify_read_share) {
+  OssFsOptions options;  // defaults: 1 MiB blocks, 8 MiB chunks, 256 prefetch
+  auto budget = compute_data_buffer_budget(options);
+
+  ASSERT_TRUE(budget.needed);
+  ASSERT_EQ(budget.block_size, options.cache_block_size);
+
+  // Legacy download pool capacity.
+  const size_t blocks_per_chunk =
+      options.prefetch_chunk_size / options.cache_block_size;
+  const size_t legacy_read_capacity =
+      blocks_per_chunk * options.prefetch_concurrency * 3;
+  EXPECT_EQ(budget.read_quota_blocks, legacy_read_capacity);
+
+  // Legacy upload pool capacity.
+  const size_t blocks_per_buffer =
+      options.upload_buffer_size / options.cache_block_size;
+  const size_t legacy_write_capacity = blocks_per_buffer * (64 + 4);
+  EXPECT_EQ(options.upload_concurrency, 64U);
+  EXPECT_EQ(budget.pool_capacity, legacy_read_capacity + legacy_write_capacity);
+  EXPECT_EQ(budget.max_cached_blocks, budget.pool_capacity);
+}
+
+TEST(DataBufferBudgetTest, verify_write_share_isolated) {
+  OssFsOptions small;
+  OssFsOptions large = small;
+  large.upload_buffer_size = 32ULL << 20;
+
+  auto small_budget = compute_data_buffer_budget(small);
+  auto large_budget = compute_data_buffer_budget(large);
+
+  EXPECT_EQ(small_budget.read_quota_blocks, large_budget.read_quota_blocks);
+  EXPECT_GT(large_budget.pool_capacity, small_budget.pool_capacity);
+}
+
+TEST(DataBufferBudgetTest, verify_modes) {
+  OssFsOptions base;
+  const size_t read_capacity =
+      compute_data_buffer_budget(base).read_quota_blocks;
+
+  OssFsOptions ro = base;
+  ro.readonly = true;
+  auto ro_budget = compute_data_buffer_budget(ro);
+  ASSERT_TRUE(ro_budget.needed);
+  EXPECT_EQ(ro_budget.read_quota_blocks, read_capacity);
+  EXPECT_EQ(ro_budget.pool_capacity, read_capacity);
+
+  OssFsOptions none = ro;
+  none.prefetch_concurrency = 0;
+  EXPECT_FALSE(compute_data_buffer_budget(none).needed);
+
+  OssFsOptions unlimited = base;
+  unlimited.prefetch_chunks = -1;
+  auto unlimited_budget = compute_data_buffer_budget(unlimited);
+  EXPECT_EQ(unlimited_budget.pool_capacity, std::numeric_limits<size_t>::max());
+  EXPECT_EQ(unlimited_budget.read_quota_blocks,
+            std::numeric_limits<size_t>::max());
+  EXPECT_LT(unlimited_budget.max_cached_blocks,
+            std::numeric_limits<size_t>::max());
+
+  OssFsOptions fixed = base;
+  fixed.prefetch_chunks = 10;
+  auto fixed_budget = compute_data_buffer_budget(fixed);
+  EXPECT_EQ(fixed_budget.read_quota_blocks,
+            (base.prefetch_chunk_size / base.cache_block_size) * 10);
+
+  // main.cpp translates memory_data_cache_size into prefetch_chunks.
+  const size_t cache_chunks = (1ULL << 30) / base.prefetch_chunk_size;
+  OssFsOptions cached = base;
+  cached.prefetch_chunks = static_cast<int32_t>(cache_chunks);
+  auto cached_budget = compute_data_buffer_budget(cached);
+  EXPECT_EQ(cached_budget.read_quota_blocks,
+            (base.prefetch_chunk_size / base.cache_block_size) * cache_chunks);
+}

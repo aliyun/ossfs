@@ -234,10 +234,13 @@ class Ossfs2NegativeCacheTest : public Ossfs2TestSuite {
     create_random_file(local_file, 3);
 
     std::string new_parent_name = parent_name + "_renamed";
-    // Clean up leftover _renamed dir from a previous aborted run
+    // Clean up leftover _renamed dir from a previous run: the rename at the
+    // end of this test moves the test dir to _renamed and never removes it.
     if (is_hdfs_mode_) {
       hdfs_helper_->delete_dir_recursive(
           hdfs_helper_->full_uri("/" + new_parent_name));
+    } else {
+      delete_dir(new_parent_name, FLAGS_oss_bucket_prefix);
     }
     uint64_t newpid;
     struct stat st;

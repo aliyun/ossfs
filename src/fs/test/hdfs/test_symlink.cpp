@@ -345,6 +345,40 @@ class Ossfs2HdfsSymlinkTest : public OssHdfsTestSuite {
     fs_->forget(nodeid, 1);
   }
 
+  void verify_sibling_prefix_target_uri() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    struct stat st;
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+
+    int r = create_and_flush(parent, "sib_target", CREATE_BASE_FLAGS, 0777, 0,
+                             0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    r = fs_->release(nodeid, reinterpret_cast<IFileHandleFuseLL *>(handle));
+    ASSERT_EQ(r, 0);
+
+    uint64_t link_nodeid = 0;
+    r = fs_->symlink(parent, "sib_link", "sib_target", 0, 0, &link_nodeid, &st);
+    ASSERT_EQ(r, 0);
+
+    g_fault_injector->set_injection(FI_HdfsSymlink_SiblingPrefix);
+    DEFER(g_fault_injector->clear_injection(FI_HdfsSymlink_SiblingPrefix));
+
+    char buf[PATH_MAX + 1] = {0};
+    ssize_t len = fs_->readlink(link_nodeid, buf, sizeof(buf) - 1);
+    EXPECT_EQ(len, -EIO)
+        << "readlink should return EIO for a sibling-prefix target URI";
+
+    r = fs_->unlink(parent, "sib_link");
+    ASSERT_EQ(r, 0);
+    r = fs_->unlink(parent, "sib_target");
+    ASSERT_EQ(r, 0);
+    fs_->forget(link_nodeid, 1);
+    fs_->forget(nodeid, 1);
+  }
+
   // Symlink target that would escape the mount root.
   // put_symlink normalizes and rejects targets like "../../etc/passwd".
   void verify_symlink_target_escape_root() {
@@ -563,6 +597,14 @@ TEST_F(Ossfs2HdfsSymlinkTest, verify_escape_target_uri) {
   opts.enable_symlink = true;
   init(opts);
   verify_escape_target_uri();
+}
+
+TEST_F(Ossfs2HdfsSymlinkTest, verify_sibling_prefix_target_uri) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.enable_symlink = true;
+  init(opts);
+  verify_sibling_prefix_target_uri();
 }
 
 TEST_F(Ossfs2HdfsSymlinkTest, verify_symlink_target_escape_root) {

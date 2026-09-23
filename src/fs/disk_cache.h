@@ -44,8 +44,8 @@ class DiskCache : public ICache {
     return memory_pool_->block_size();
   }
 
-  CacheHandle *get(std::string_view name, std::string_view etag,
-                   size_t size = 0) override;
+  CacheHandle *get(const CacheKey &key) override;
+  bool drop(const CacheKey &key) override;
   void release(CacheHandle *h, uint64_t count) override;
 
   size_t capacity() override {

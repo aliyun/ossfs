@@ -60,6 +60,12 @@ std::string gid_to_groupname(gid_t gid) {
   return "";
 }
 
+void resolve_unresolved_uid_gid(struct stat *stbuf, uid_t req_uid,
+                                gid_t req_gid) {
+  if (stbuf->st_uid == kReservedUnresolvedUid) stbuf->st_uid = req_uid;
+  if (stbuf->st_gid == kReservedUnresolvedGid) stbuf->st_gid = req_gid;
+}
+
 // Check if caller's username is listed in file_gid's group member list.
 static bool is_uid_include_group(uid_t caller_uid, gid_t file_gid) {
   // 1. Resolve caller uid to username (reuses uid_to_username with FI mock).

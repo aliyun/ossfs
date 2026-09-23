@@ -38,15 +38,27 @@
 
 namespace OssFileSystem {
 
+// Composes the on-disk identity of the cached source. The byte layout must
+// stay stable: it feeds cityhash128 for the cache file name and is persisted
+// verbatim in the trusted.ossfs2.source_key xattr.
+static std::string make_source_key(const CacheKey &key) {
+  // Fallback version signal for backends without ETag (e.g. OSS-HDFS).
+  if (key.etag.empty()) {
+    return std::string(key.object_key) + "/" + std::to_string(key.size) + "@" +
+           std::to_string(key.mtime.tv_sec) + "." +
+           std::to_string(key.mtime.tv_nsec);
+  }
+  return std::string(key.object_key) + "/" + std::string(key.etag);
+}
+
 class DiskCacheStore : public ICacheStore {
  public:
-  DiskCacheStore(DiskCache *cache, std::string_view object_key)
-      : cache_(cache) {
+  explicit DiskCacheStore(DiskCache *cache) : cache_(cache) {
     serialize_writes_ = !cache_->dispatch_to_bg_vcpu_;
   }
   ~DiskCacheStore();
 
-  int init(std::string_view object_key, std::string_view etag, size_t size);
+  int init(const CacheKey &key);
 
   ssize_t pin(off_t offset, size_t count, void **buf) override {
     return -ENOTSUP;
@@ -59,8 +71,7 @@ class DiskCacheStore : public ICacheStore {
   ssize_t pread(char *buf, off_t offset, size_t count) override;
   std::pair<off_t, size_t> query_refill_range(off_t offset,
                                               size_t count) override;
-  void drop(std::string_view object_key, std::string_view etag,
-            size_t size) override;
+  void drop(const CacheKey &key, bool force = true) override;
 
   int acquire_write_buffer(RangeBuffer &range_buffer) override;
   void release_write_buffer(const RangeBuffer &range_buffer,
@@ -89,9 +100,8 @@ class DiskCacheStore : public ICacheStore {
   bool serialize_writes_ = false;
 };
 
-int DiskCacheStore::init(std::string_view object_key, std::string_view etag,
-                         size_t size) {
-  auto source_key = std::string(object_key) + "/" + std::string(etag);
+int DiskCacheStore::init(const CacheKey &key) {
+  auto source_key = make_source_key(key);
   auto cache_key = "/" + cityhash128_base64url(source_key);
   // Split the first 3 characters to construct the prefix directory,
   // to avoid flat directory structure.
@@ -118,11 +128,11 @@ int DiskCacheStore::init(std::string_view object_key, std::string_view etag,
     }
   }
   if (unlikely(ret != 0)) {
-    LOG_ERROR("Failed to init disk cache for `, key: `, ret: `", object_key,
+    LOG_ERROR("Failed to init disk cache for `, key: `, ret: `", key.object_key,
               cache_key, ret);
   } else {
-    local_store_->set_actual_size(size);
-    LOG_DEBUG("Init disk cache for `, key: `", object_key, cache_key);
+    local_store_->set_actual_size(key.size);
+    LOG_DEBUG("Init disk cache for `, key: `", key.object_key, cache_key);
   }
   return ret;
 }
@@ -209,8 +219,7 @@ std::pair<off_t, size_t> DiskCacheStore::query_refill_range(off_t offset,
                               count);
 }
 
-void DiskCacheStore::drop(std::string_view object_key, std::string_view etag,
-                          size_t size) {
+void DiskCacheStore::drop(const CacheKey &key, bool /* force */) {
   photon::scoped_rwlock l(store_lock_, photon::WLOCK);
   if (likely(local_store_ != nullptr)) {
     auto cache_pool = get_env()->get_disk_cache_pool();
@@ -219,12 +228,12 @@ void DiskCacheStore::drop(std::string_view object_key, std::string_view etag,
     release_store();
   }
 
-  auto ret = init(object_key, etag, size);
+  auto ret = init(key);
   if (unlikely(ret != 0)) {
-    LOG_ERROR("Failed to reopen disk cache for `, ret `", object_key, ret);
+    LOG_ERROR("Failed to reopen disk cache for `, ret `", key.object_key, ret);
     return;
   }
-  LOG_DEBUG("Reopen disk cache for `", object_key);
+  LOG_DEBUG("Reopen disk cache for `", key.object_key);
 }
 
 int DiskCacheStore::acquire_write_buffer(RangeBuffer &range_buffer) {
@@ -289,20 +298,18 @@ void DiskCacheStore::release_write_buffer(const RangeBuffer &range_buffer,
 }
 
 DiskCache::~DiskCache() {
-  std::lock_guard<std::mutex> l(mtx_);
   RELEASE_ASSERT(ref_cnt_ == 0);
   RELEASE_ASSERT(cache_store_ == nullptr);
 }
 
-CacheHandle *DiskCache::get(std::string_view name, std::string_view etag,
-                            size_t size) {
+CacheHandle *DiskCache::get(const CacheKey &key) {
   std::lock_guard<std::mutex> l(mtx_);
   if (cache_store_ == nullptr) {
-    cache_store_ = new DiskCacheStore(this, name);
-    auto ret = cache_store_->init(name, etag, size);
+    cache_store_ = new DiskCacheStore(this);
+    auto ret = cache_store_->init(key);
 
     if (unlikely(ret != 0)) {
-      LOG_ERROR("Failed to init disk cache for `, ret: `", name, ret);
+      LOG_ERROR("Failed to init disk cache for `, ret: `", key.object_key, ret);
       delete cache_store_;
       cache_store_ = nullptr;
       return nullptr;
@@ -310,6 +317,13 @@ CacheHandle *DiskCache::get(std::string_view name, std::string_view etag,
   }
   ++ref_cnt_;
   return new CacheHandle(cache_store_, &range_lock_);
+}
+
+bool DiskCache::drop(const CacheKey &key) {
+  std::lock_guard<std::mutex> l(mtx_);
+  if (cache_store_ == nullptr) return false;
+  cache_store_->drop(key);
+  return true;
 }
 
 void DiskCache::release(CacheHandle *h, uint64_t count) {

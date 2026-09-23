@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "common/fuse.h"
@@ -123,4 +124,21 @@ inline ssize_t fuse_read_bufvec_full(char *dst, struct fuse_bufvec *srcv,
     total += n;
   }
   return static_cast<ssize_t>(total);
+}
+
+// Returns the bytes copied, which may be short when the source is exhausted.
+inline ssize_t fuse_bufvec_to_iov_copy(const struct iovec *iov, int iovcnt,
+                                       struct fuse_bufvec *srcv, size_t len) {
+  size_t copied = 0;
+  for (int i = 0; i < iovcnt && copied < len; i++) {
+    // fuse_bufvec_to_buf_copy dereferences the current buffer without a check.
+    if (fuse_bufvec_current(srcv) == nullptr) break;
+    size_t to_copy = std::min(iov[i].iov_len, len - copied);
+    ssize_t r = fuse_bufvec_to_buf_copy(static_cast<char *>(iov[i].iov_base),
+                                        srcv, to_copy);
+    if (r < 0) return copied > 0 ? static_cast<ssize_t>(copied) : r;
+    copied += r;
+    if (static_cast<size_t>(r) < to_copy) break;
+  }
+  return static_cast<ssize_t>(copied);
 }

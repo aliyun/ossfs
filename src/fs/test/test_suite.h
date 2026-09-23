@@ -25,12 +25,15 @@
 #include <photon/common/string_view.h>
 #include <photon/photon.h>
 
+#include <chrono>
 #include <fstream>
 #include <queue>
 #include <random>
+#include <thread>
 
 #include "common/filesystem.h"
 #include "common/fuse.h"
+#include "common/macros.h"
 #include "common/test/test_common.h"
 #include "common/utils.h"
 #include "fs/file.h"
@@ -39,11 +42,6 @@
 #include "test_util.h"
 
 using namespace OssFileSystem;
-
-#define EXECUTOR_QUEUE_OPTION \
-  { 16, 1024 }
-#define LIBAIO_PHOTON_OPTION \
-  { 128 }
 
 DECLARE_string(oss_endpoint);
 DECLARE_string(oss_bucket);
@@ -54,6 +52,8 @@ DECLARE_uint64(oss_request_timeout_ms);
 DECLARE_bool(enable_locking_debug_logs);
 DECLARE_bool(write_with_fuse_bufvec);
 DECLARE_string(http_proxy);
+DECLARE_bool(enable_ipv6);
+DECLARE_bool(path_style);
 
 DECLARE_string(disk_cache_dir);
 DECLARE_string(disk_cache_io_engine);
@@ -267,6 +267,8 @@ class Ossfs2TestSuite : public ::testing::Test {
 
   AuditableOssFs *fs_ = nullptr;
   BackgroundVCpuEnv bg_vcpu_env_;
+  // Set before init() to pin the background obj-store vcpu count; -1 = random.
+  int bg_vcpu_num_ = -1;
 
   uint64_t root_nodeid_ = 1;
   std::string test_path_ = "/tmp/OssFs2Test/";
@@ -331,6 +333,14 @@ class Ossfs2TestSuite : public ::testing::Test {
 
   inline int fsync_file_handle(void *fh, bool datasync = false) {
     return fs_->fsync(get_nodeid_from_handle(fh), fh, datasync);
+  }
+
+  // File creation uploads asynchronously; the pool counts those blocks too.
+  void wait_write_blocks_released() {
+    for (int i = 0; i < 3000 && fs_->write_blocks_used() != 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(fs_->write_blocks_used(), 0ULL);
   }
 
   ssize_t read_from_handle(void *fh, char *buf, size_t size, off_t offset,

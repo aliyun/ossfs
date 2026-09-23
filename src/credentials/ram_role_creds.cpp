@@ -39,7 +39,8 @@ std::string_view kECSMetadataTokenDefaultTTL = "180";
 std::string_view kRamUrlBase =
     "http://100.100.100.200/latest/meta-data/ram/security-credentials/";
 
-static int get_ecs_meta(std::string_view url, std::string &resp) {
+int RamRoleCredentialsProvider::get_ecs_meta(std::string_view url,
+                                             std::string &resp) {
   RELEASE_ASSERT(photon::CURRENT);
 
   auto client = photon::net::http::new_http_client();
@@ -96,6 +97,14 @@ static int get_ecs_meta(std::string_view url, std::string &resp) {
     if (op->status_code != 200) {
       LOG_ERROR("failed to get ecs metadata: `, status: `", url,
                 op->status_code);
+      if (op->status_code == 429 || op->status_code == 503) {
+        // Only the delta-seconds form of Retry-After is supported.
+        uint64_t retry_after_sec =
+            estring_view(op->resp.headers.get_value("Retry-After")).to_uint64();
+        if (retry_after_sec > 0) {
+          set_retry_after(retry_after_sec);
+        }
+      }
       return -EIO;
     }
 
@@ -112,7 +121,8 @@ static int get_ecs_meta(std::string_view url, std::string &resp) {
 }
 
 RamRoleCredentialsProvider::RamRoleCredentialsProvider(
-    std::string_view ram_role) {
+    std::string_view ram_role, bool backoff_enabled)
+    : CredentialsProvider(backoff_enabled) {
   estring_view esv(ram_role);
   if (esv.starts_with("http://")) {
     url_ = std::string(ram_role);

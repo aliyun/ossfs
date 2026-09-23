@@ -18,12 +18,57 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <limits>
 #include <string>
 
 #include "common/logger.h"
 #include "fs.h"
 
 namespace OssFileSystem {
+
+// Spare buffers on top of the parts already in flight: a write handle holds one
+// while filling it.
+static constexpr size_t kExtraCachedWriteBuffers = 4;
+
+DataBufferBudget compute_data_buffer_budget(const OssFsOptions &opts) {
+  DataBufferBudget budget;
+  const bool prefetching = opts.prefetch_concurrency > 0;
+  if (!prefetching && opts.readonly) return budget;
+
+  budget.needed = true;
+  budget.block_size = opts.cache_block_size;
+  size_t blocks_per_upload_buffer =
+      (opts.upload_buffer_size + budget.block_size - 1) / budget.block_size;
+
+  size_t write_capacity = 0;
+  if (!opts.readonly) {
+    write_capacity = blocks_per_upload_buffer *
+                     (opts.upload_concurrency + kExtraCachedWriteBuffers);
+  }
+
+  size_t read_capacity = 0;
+  bool unlimited_read = false;
+  if (prefetching) {
+    size_t blocks_per_prefetch_chunk =
+        (opts.prefetch_chunk_size + budget.block_size - 1) / budget.block_size;
+    read_capacity = blocks_per_prefetch_chunk * opts.prefetch_concurrency * 3;
+
+    // Override if user specified.
+    if (opts.prefetch_chunks > 0) {
+      read_capacity = blocks_per_prefetch_chunk * opts.prefetch_chunks;
+    } else if (opts.prefetch_chunks < 0) {
+      // Unlimited mode.
+      unlimited_read = true;
+    }
+  }
+
+  budget.max_cached_blocks = write_capacity + read_capacity;
+  budget.pool_capacity = unlimited_read ? std::numeric_limits<size_t>::max()
+                                        : write_capacity + read_capacity;
+  budget.read_quota_blocks =
+      unlimited_read ? std::numeric_limits<size_t>::max() : read_capacity;
+  return budget;
+}
 
 // - temp_dir (WriteMode::Random) is mutually exclusive with
 //   enable_appendable_object (WriteMode::Appendable)

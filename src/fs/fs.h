@@ -22,6 +22,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "async_task.h"
 #include "bg_vcpu_env.h"
 #include "common/fault_injector.h"
 #include "common/filesystem.h"
@@ -31,8 +32,8 @@
 #include "dir.h"
 #include "fs/id_manager.h"
 #include "inode.h"
-#include "mem_pool.h"
 #include "negative_cache.h"
+#include "shared_data_pool.h"
 #include "staged_inode_cache.h"
 #include "test/class_declarations.h"
 
@@ -161,14 +162,18 @@ struct OssFsOptions {
   uint64_t inode_cache_eviction_threshold = 0;
   uint64_t inode_cache_eviction_interval_ms = 0;
   uint64_t max_inode_cache_count = 0;
+  uint32_t async_task_limit = 1000;
 
   uint64_t oss_negative_cache_timeout = 0;
   uint64_t oss_negative_cache_size = 0;
+
+  uint64_t disk_data_cache_max_file_size = UINT64_MAX;
 
   std::string ram_role;
   std::string credential_process;
   uint64_t credential_refresh_interval =
       0;  // 0 means use default expiration-based strategy.
+  bool credential_refresh_backoff = false;
 
   bool enable_admin_server = true;
   bool enable_symlink = false;
@@ -183,6 +188,18 @@ struct OssFsOptions {
 
   uint64_t mempool_purge_interval_ms = 5000;
 };
+
+// Block budget of the shared data buffer pool, derived purely from the options.
+struct DataBufferBudget {
+  bool needed = false;
+  size_t block_size = 0;
+  size_t pool_capacity = 0;
+  size_t max_cached_blocks = 0;
+  // Upper bound on the read share, in blocks.
+  size_t read_quota_blocks = 0;
+};
+
+DataBufferBudget compute_data_buffer_budget(const OssFsOptions &opts);
 
 struct LockQueueElement;
 class OssFs : public IFileSystemFuseLL {
@@ -273,6 +290,11 @@ class OssFs : public IFileSystemFuseLL {
     return is_hdfs_mode();
   }
 
+  // Async tasks related.
+  int warmup_internal(std::string_view warm_path);
+  std::string warmup(std::string_view warm_path);
+  std::string dump_status();
+
   // Get objstore pointer for direct calls (HDFS bypasses executor).
   IObjStore *get_obj_store_direct() {
     return bg_vcpu_env_.bg_obj_store_env->obj_stores[0];
@@ -302,8 +324,19 @@ class OssFs : public IFileSystemFuseLL {
     return write_mode_;
   }
 
-  std::shared_ptr<FixedBlockMemoryPool> get_download_buffers() {
-    return download_buffers_;
+  // Opened files are renamed to ".fuse_hiddenXXX" on unlink or rename-over
+  // instead of being deleted, so open handles keep working until the last
+  // release removes the hidden object.
+  bool enable_hide_inode() const {
+    return write_mode() == WriteMode::Random || is_hdfs_mode();
+  }
+
+  std::shared_ptr<FixedBlockMemoryPool> get_data_buffers() {
+    return data_buffers_;
+  }
+
+  uint64_t write_blocks_used() {
+    return data_buffers_ ? data_buffers_->write_used_blocks() : 0;
   }
 
   const OssFsOptions &get_options() const {
@@ -413,8 +446,8 @@ class OssFs : public IFileSystemFuseLL {
                                        mode_t perm = 0, uid_t uid = 0,
                                        gid_t gid = 0);
 
-  std::shared_ptr<ICache> create_inode_cache();
-  void evict_inode_cache(FileInode *inode);
+  std::shared_ptr<ICache> create_inode_cache(uint64_t file_size);
+  void evict_inode_cache(FileInode *inode, std::string_view path);
 
   int try_invalidate_inode(uint64_t nodeid, uint64_t nlookup, bool recursive);
 
@@ -470,6 +503,11 @@ class OssFs : public IFileSystemFuseLL {
                        std::string_view old_name, std::string_view new_name,
                        uint64_t new_parent, std::string_view src_parent_path,
                        std::string_view dst_parent_path, unsigned int flags);
+  // Probe the remote dst before rename, in HDFS mode only. On success sets
+  // *dst_exists; returns a negative errno to reject the rename or on request
+  // failure.
+  int hdfs_probe_rename_dst(Inode *src_node, std::string_view dst_path,
+                            unsigned int flags, bool *dst_exists);
   // Caller must hold the unique inode_lock of the parent dir and src_node.
   int hide_inode(DirInode *parent, Inode *src_node,
                  std::string_view parent_path);
@@ -504,17 +542,10 @@ class OssFs : public IFileSystemFuseLL {
     dirty_nodeids_.erase(nodeid);
   }
 
-  void invalidate_data_cache_if_needed(Inode *inode, const struct stat *stbuf,
-                                       std::string_view remote_etag) {
+  void refresh_inode_etag(Inode *inode, const struct stat *stbuf,
+                          std::string_view remote_etag) {
     if (!inode->is_file()) return;
-    static_cast<FileInode *>(inode)->invalidate_data_cache_if_needed(
-        stbuf, remote_etag);
-  }
-
-  void update_inode_etag(Inode *inode, std::string_view remote_etag) {
-    if (!inode->is_file()) return;
-    static_cast<FileInode *>(inode)->etag.assign(remote_etag.data(),
-                                                 remote_etag.size());
+    static_cast<FileInode *>(inode)->refresh_etag(stbuf, remote_etag);
   }
 
   std::string_view get_inode_etag(Inode *inode) {
@@ -532,10 +563,11 @@ class OssFs : public IFileSystemFuseLL {
                                 std::function<int(const DentryView &)> cb);
   int reverse_invalidate_kernel_entry(const DentryView &dentry);
 
-  void start_creds_refresher(std::promise<int> &result_promise);
+  int force_refresh_creds(uint64_t observed_gen);
+  void register_creds_refresh_handler();
   uint64_t refresh_creds();
   std::pair<int, uint64_t> do_refresh_creds(bool allow_auto_create = false);
-  void update_creds(const ObjCredentials &creds);
+  void update_creds(const ObjCredentials &creds, const CredsMeta &meta);
   int validate_creds(const ObjCredentials &creds,
                      bool allow_auto_create = false);
 
@@ -603,8 +635,8 @@ class OssFs : public IFileSystemFuseLL {
 
   Inode *mp_inode_ = nullptr;
 
-  StagedInodeCache *staged_inodes_cache_ = nullptr;
-  NegativeCache *negative_cache_ = nullptr;
+  std::unique_ptr<StagedInodeCache> staged_inodes_cache_;
+  std::unique_ptr<NegativeCache> negative_cache_;
 
   std::unique_ptr<IIdManager> id_manager_;
 
@@ -630,11 +662,10 @@ class OssFs : public IFileSystemFuseLL {
   // for renaming directory
   std::unique_ptr<photon::semaphore> rename_sem_;
 
+  std::shared_ptr<SharedDataBufferPool> data_buffers_;
+
   // Global seq for generating ".fuse_hiddenXXX" names in hide_inode.
   std::atomic<uint32_t> hidden_inode_seq_ = ATOMIC_VAR_INIT(0);
-
-  std::unique_ptr<FixedBlockMemoryPool> upload_buffers_;
-  std::shared_ptr<FixedBlockMemoryPool> download_buffers_;
 
   // Derived from upload_buffer_size at construction, aligned to chunk_size.
   uint64_t random_write_base_part_size_ = 0;
@@ -652,7 +683,10 @@ class OssFs : public IFileSystemFuseLL {
   std::thread *uds_server_th_ = nullptr;
 
   CredentialsProvider *creds_provider_ = nullptr;
-  std::thread *creds_refresh_th_ = nullptr;
+
+  photon::Executor *creds_refresh_executor_ = nullptr;
+  photon::Timer *creds_refresh_timer_ = nullptr;
+  photon::mutex creds_refresh_mutex_;
 
   std::atomic<uint64_t> total_create_cnt_ = ATOMIC_VAR_INIT(0);
   std::atomic<uint64_t> active_file_handles_ = ATOMIC_VAR_INIT(0);
@@ -674,6 +708,8 @@ class OssFs : public IFileSystemFuseLL {
       std::numeric_limits<uint64_t>::max();  // f_bavail*f_frsize at refresh
   uint64_t staging_avail_usage_snap_ = 0;    // staging_disk_usage_ at refresh
   std::atomic<bool> staging_avail_refreshing_ = ATOMIC_VAR_INIT(false);
+
+  AsyncTaskManager *async_task_manager_ = nullptr;
 
   friend class OssWriter;
   friend class OssSeqWriter;

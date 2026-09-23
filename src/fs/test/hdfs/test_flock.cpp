@@ -19,6 +19,8 @@
 #include <chrono>
 #include <thread>
 
+#include "common/fault_injector.h"
+#include "fs/file_hdfs.h"
 #include "fs/test/test_suite.h"
 
 class Ossfs2HdfsFlockTest : public OssHdfsTestSuite {
@@ -260,6 +262,128 @@ class Ossfs2HdfsFlockTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
   }
 
+  // flock must survive ftruncate shrink (internal close -> truncate ->
+  // reopen): the fd stays open, so BSD semantics require the lock to persist.
+  void verify_flock_survives_ftruncate_shrink() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = create_and_flush(parent, "trunc_lock", CREATE_BASE_FLAGS, 0777, 0,
+                             0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    auto *file = get_file_from_handle(handle);
+
+    // Write 8KB so the shrink path (close -> truncate -> reopen) is taken.
+    const size_t initial_size = 8192;
+    char buf[initial_size];
+    memset(buf, 'L', initial_size);
+    ASSERT_EQ(file->pwrite(buf, initial_size, 0), (ssize_t)initial_size);
+    r = fs_->flush(nodeid, handle);
+    ASSERT_EQ(r, 0);
+
+    // HDFS: release and reopen to close the write stream before locking.
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_RDWR, &handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    auto *hfile = static_cast<HdfsFileHandle *>(get_file_from_handle(handle));
+
+    // Acquire exclusive lock.
+    r = fs_->flock(nodeid, handle, LOCK_EX | LOCK_NB, 1);
+    ASSERT_EQ(r, 0);
+    ASSERT_TRUE(hfile->holds_flock());
+
+    // Shrink to 4KB via setattr (ftruncate).
+    struct stat new_stat;
+    memset(&new_stat, 0, sizeof(new_stat));
+    new_stat.st_size = 4096;
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(handle);
+    r = fs_->setattr(nodeid, &new_stat, FUSE_SET_ATTR_SIZE, &fi, 0, 0);
+    ASSERT_EQ(r, 0);
+
+    // The fd is still open, the lock must not have been dropped by the
+    // internal stream reopen.
+    EXPECT_TRUE(hfile->holds_flock())
+        << "ftruncate shrink silently released the fd's flock";
+
+    // Explicit unlock and close path must still work afterwards.
+    r = fs_->flock(nodeid, handle, LOCK_UN, 1);
+    ASSERT_EQ(r, 0);
+    EXPECT_FALSE(hfile->holds_flock());
+
+    r = fs_->release(nodeid, hfile);
+    ASSERT_EQ(r, 0);
+  }
+
+  // flock must also survive a failed ftruncate shrink: the lock is bound to
+  // the fd, not the backend streams.
+  void verify_flock_survives_ftruncate_failure() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = create_and_flush(parent, "trunc_lock_fail", CREATE_BASE_FLAGS, 0777,
+                             0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    auto *file = get_file_from_handle(handle);
+
+    // Write 8KB so the shrink path (close -> truncate -> reopen) is taken.
+    const size_t initial_size = 8192;
+    char buf[initial_size];
+    memset(buf, 'F', initial_size);
+    ASSERT_EQ(file->pwrite(buf, initial_size, 0), (ssize_t)initial_size);
+    r = fs_->flush(nodeid, handle);
+    ASSERT_EQ(r, 0);
+
+    // HDFS: release and reopen to close the write stream before locking.
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_RDWR, &handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    auto *hfile = static_cast<HdfsFileHandle *>(get_file_from_handle(handle));
+
+    // Acquire exclusive lock.
+    r = fs_->flock(nodeid, handle, LOCK_EX | LOCK_NB, 1);
+    ASSERT_EQ(r, 0);
+    ASSERT_TRUE(hfile->holds_flock());
+
+    // Fail the shrink after the streams are closed.
+    g_fault_injector->set_injection(FI_OssError_Call_Failed);
+    DEFER(g_fault_injector->clear_injection(FI_OssError_Call_Failed));
+    struct stat new_stat;
+    memset(&new_stat, 0, sizeof(new_stat));
+    new_stat.st_size = 4096;
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(handle);
+    r = fs_->setattr(nodeid, &new_stat, FUSE_SET_ATTR_SIZE, &fi, 0, 0);
+    ASSERT_NE(r, 0);
+    g_fault_injector->clear_injection(FI_OssError_Call_Failed);
+
+    // The fd is still open, so the lock must survive the failed shrink.
+    EXPECT_TRUE(hfile->holds_flock())
+        << "failed ftruncate shrink released the fd's flock";
+
+    // Explicit unlock and close path must still work afterwards.
+    r = fs_->flock(nodeid, handle, LOCK_UN, 1);
+    ASSERT_EQ(r, 0);
+    EXPECT_FALSE(hfile->holds_flock());
+
+    r = fs_->release(nodeid, hfile);
+    ASSERT_EQ(r, 0);
+  }
+
   // F_SETLK + F_WRLCK: write lock via fcntl interface.
 };
 
@@ -296,4 +420,18 @@ TEST_F(Ossfs2HdfsFlockTest, verify_flock_release_on_close) {
   OssFsOptions opts;
   init(opts);
   verify_flock_release_on_close();
+}
+
+TEST_F(Ossfs2HdfsFlockTest, verify_flock_survives_ftruncate_shrink) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_flock_survives_ftruncate_shrink();
+}
+
+TEST_F(Ossfs2HdfsFlockTest, verify_flock_survives_ftruncate_failure) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_flock_survives_ftruncate_failure();
 }

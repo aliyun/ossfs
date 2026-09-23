@@ -46,6 +46,9 @@
 
 namespace OssFileSystem {
 
+// Test-only login user override; see oss_hdfs_store.h.
+std::string g_test_hdfs_login_user;
+
 static uid_t username_to_uid(std::string_view username) {
   if (username.empty()) return kReservedUnresolvedUid;
 
@@ -195,8 +198,12 @@ static bool is_file_name_valid(std::string_view obj) {
 int jdo_error_code_to_posix(int jdo_error_code) {
   switch (jdo_error_code) {
     case 0:
-    case JDO_EOF_ERROR:
       return 0;
+
+    // Normal EOF is a negative read return, not an error; EOF surfaced as an
+    // error is a real failure, so map it to EIO instead of swallowing it.
+    case JDO_EOF_ERROR:
+      return -EIO;
 
     // Client errors.
     case JDO_CLIENT_ERROR:
@@ -540,8 +547,15 @@ int OssHdfsStore::init_jindosdk() {
   START_CALL(jdo_store_, "init", "");
   // The user identity passed to JindoSDK::init() determines the owner of
   // newly created files/directories on the HDFS server.
-  char *login_name = getlogin();
-  JindoSDK::init(ctx, login_name ? login_name : "root");
+  std::string login_user;
+  FAULT_INJECTION(FI_Hdfs_LoginUser_Override,
+                  [&] { login_user = g_test_hdfs_login_user; });
+  if (login_user.empty()) {
+    char *login_name = getlogin();
+    login_user = login_name ? login_name : "root";
+  }
+  LOG_INFO("JindoSDK init with login user: `", login_user);
+  JindoSDK::init(ctx, login_user.c_str());
   END_CALL();
   return jdo_error_code_to_posix(error_code);
 }
@@ -659,7 +673,7 @@ void OssHdfsStore::rebuild_store(const char *key, const char *key_secret) {
   jdo_store_ = JindoSDK::createStore(jdo_opts_, uri_.c_str());
 }
 
-void OssHdfsStore::set_credentials(ObjCredentials &&creds) {
+void OssHdfsStore::set_credentials(ObjCredentials &&creds, const CredsMeta &) {
   if (sdk_initialized_) return;
 
   // TODO: support sts token.
@@ -784,7 +798,7 @@ int OssHdfsStore::do_create_file(std::string_view path, mode_t mode) {
 
 ssize_t OssHdfsStore::put_object(std::string_view path, const struct iovec *iov,
                                  int iovcnt, uint64_t *expected_crc64,
-                                 mode_t mode) {
+                                 mode_t mode, std::string * /*etag*/) {
   std::string path_str(path);
 
   if (!path_str.empty() && path_str.back() == '/') {
@@ -1633,19 +1647,17 @@ int OssHdfsStore::get_symlink(std::string_view path, std::string &target) {
   // Fault injection: simulate backend returning a URI that escapes mount root.
   FAULT_INJECTION(FI_HdfsSymlink_EscapePath,
                   [&] { target_uri = uri_ + "/../../etc/passwd"; });
+  FAULT_INJECTION(FI_HdfsSymlink_SiblingPrefix,
+                  [&] { target_uri = uri_ + "x/foo"; });
 
-  if (target_uri.size() < uri_.size() ||
-      target_uri.substr(0, uri_.size()) != uri_) {
-    LOG_ERROR("symlink target URI ` does not start with expected prefix `",
-              target_uri, uri_);
+  if (!is_subdir(uri_, target_uri)) {
+    LOG_ERROR("symlink target URI ` is not under expected prefix `", target_uri,
+              uri_);
     return -EIO;
   }
 
-  // "oss://bucket.endpoint/a/b/target" -> "/a/b/target" -> "a/b/target"
-  std::string internal_path = target_uri.substr(uri_.size());
-  if (!internal_path.empty() && internal_path.front() == '/') {
-    internal_path.erase(0, 1);
-  }
+  // "oss://bucket.endpoint/a/b/target" -> "a/b/target"
+  std::string internal_path = target_uri.substr(uri_.size() + 1);
 
   // Both paths relative to mount root (strip leading '/').
   // path: "/a/c/link" -> "a/c/link", parent: "a/c"

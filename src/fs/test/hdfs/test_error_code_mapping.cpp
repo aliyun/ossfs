@@ -23,7 +23,6 @@ class Ossfs2HdfsErrorCodeMappingTest : public OssHdfsTestSuite {};
 
 TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_success) {
   ASSERT_EQ(jdo_error_code_to_posix(0), 0);
-  ASSERT_EQ(jdo_error_code_to_posix(JDO_EOF_ERROR), 0);
 }
 
 TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_client_errors) {
@@ -61,6 +60,8 @@ TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_file_errors) {
 TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_resource_errors) {
   ASSERT_EQ(jdo_error_code_to_posix(JDO_RESOURCE_ERROR), -EIO);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_IO_ERROR), -EIO);
+  // EOF surfaced as an error is a real failure, not a normal end of read.
+  ASSERT_EQ(jdo_error_code_to_posix(JDO_EOF_ERROR), -EIO);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_CORRUPT_DATA_ERROR), -EIO);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_SERVER_INTERNAL_ERROR), -EIO);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_NO_SERVER_ERROR), -EHOSTUNREACH);

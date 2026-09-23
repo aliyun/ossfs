@@ -31,7 +31,7 @@ class BlockCacheStoreTest : public ::testing::Test {
  protected:
   void SetUp() override {
     block_size_ = 4096;
-    cache_ = std::make_unique<BlockCacheStore>(block_size_);
+    cache_ = std::make_unique<BlockCacheStore>(block_size_, CacheKey{});
     rng_.seed(std::random_device{}());
   }
 
@@ -277,6 +277,61 @@ class BlockCacheStoreTest : public ::testing::Test {
     ASSERT_GT(total_evictions, 0);
   };
 
+  void verify_drop_invalidation_by_identity() {
+    // Fake blocks: only metadata is exercised, block memory is never
+    // dereferenced because pread() is called with a nullptr destination.
+    std::vector<char *> blocks;
+    for (int i = 1; i <= 8; i++) {
+      blocks.push_back(reinterpret_cast<char *>(static_cast<uintptr_t>(i)));
+    }
+    cache_->expand_blocks(blocks);
+
+    const ssize_t full_block = static_cast<ssize_t>(block_size_);
+
+    // Refill block 0; a freshly filled block is always readable.
+    auto refill = [&]() {
+      ASSERT_EQ(fill_cache_range(0, block_size_), 0);
+      ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), full_block);
+    };
+
+    // Establish identity "etagA" (bumps the generation once).
+    refill();
+    cache_->drop({"obj", "etagA"}, block_size_);
+    ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
+
+    // Same etag after a rename-like re-key: blocks must survive (no bump).
+    refill();
+    cache_->drop({"renamed/obj", "etagA"}, /*force=*/false);
+    ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), full_block);
+
+    // Different etag: invalidate.
+    cache_->drop({"obj", "etagB"}, block_size_);
+    ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
+
+    // Empty etag: conservative invalidation.
+    refill();
+    cache_->drop({"obj", ""}, block_size_);
+    ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
+
+    // A repeated empty-etag drop still invalidates: an empty identity
+    // never short-circuits, so the drop-on-open in streaming/appendable
+    // modes never serves stale blocks across reopens.
+    refill();
+    cache_->drop({"obj", ""}, block_size_);
+    ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
+
+    // drop with force=true: skips the same-identity shortcut but still
+    // records the passed identity.
+    refill();
+    cache_->drop({"obj", "etagA"}, /*force=*/true);
+    ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
+
+    // Same etag after a forced drop: no-op again.
+    refill();
+    cache_->drop({"obj", "etagA"}, /*force=*/false);
+    ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), full_block);
+  };
+
  private:
   int fill_cache_range(off_t offset, size_t count) {
     IOVector blocks;
@@ -326,4 +381,8 @@ TEST_F(BlockCacheStoreTest, verify_eviction) {
 
 TEST_F(BlockCacheStoreTest, verify_eviction_with_random_ranges) {
   verify_eviction_with_random_ranges();
+}
+
+TEST_F(BlockCacheStoreTest, verify_drop_invalidation_by_identity) {
+  verify_drop_invalidation_by_identity();
 }
