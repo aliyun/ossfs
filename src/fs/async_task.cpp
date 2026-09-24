@@ -23,6 +23,7 @@
 
 #include <sstream>
 
+#include "common/utils.h"
 #include "fs.h"
 
 namespace OssFileSystem {
@@ -34,6 +35,7 @@ void WarmupTask::process() {
 AsyncTaskManager::AsyncTaskManager(uint32_t task_limit)
     : task_limit_(task_limit) {
   size_t vcpu_num = task_limit_ < 4 ? task_limit_ : 4;
+  ScopedBlockAllSignal block_signals;
   task_pool_ = std::make_unique<photon::WorkPool>(
       vcpu_num, OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, task_limit_);
 }

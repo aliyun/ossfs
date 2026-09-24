@@ -54,14 +54,6 @@ static std::string g_mountpoint;
 static bool g_log_to_stdout = false;
 static bool g_log_to_syslog = false;
 
-static int block_all_signal(sigset_t *oldset) {
-  sigset_t sigset;
-  int r = sigfillset(&sigset);
-  if (r != 0) return r;
-  r = sigprocmask(SIG_SETMASK, &sigset, oldset);
-  return r;
-}
-
 std::tuple<std::string, std::string> get_oss_credentials() {
   // Use env vars if they are not specified in the command line or the config
   // file.
@@ -223,9 +215,7 @@ int create_background_obj_stores() {
         std::to_string(FLAGS_attr_timeout * 1000));
   }
 
-  sigset_t oldset;
-  int bas = block_all_signal(&oldset);
-  DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
+  ScopedBlockAllSignal block_signals;
 
   g_bg_vcpu_env.bg_obj_store_env = new OssFileSystem::BGVCpuObjStoreEnv;
 
@@ -262,9 +252,7 @@ static int create_background_disk_cache(OssFileSystem::OssFsOptions *fs_opts) {
   fs_opts->cache_type = OssFileSystem::CacheType::kDiskCache;
   fs_opts->share_fd_read_buffer = true;
 
-  sigset_t oldset;
-  int bas = block_all_signal(&oldset);
-  DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
+  ScopedBlockAllSignal block_signals;
 
   static const rlim_t kNofileLimit = 1048576;
   rlimit nofile_limit{.rlim_cur = kNofileLimit, .rlim_max = kNofileLimit};

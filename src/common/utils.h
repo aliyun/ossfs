@@ -17,6 +17,7 @@
 #pragma once
 
 #include <photon/common/string_view.h>
+#include <signal.h>
 #include <stdint.h>
 
 #include <functional>
@@ -70,3 +71,26 @@ bool normalize_dir_flag(std::string &dir);
 bool validate_dir_params(std::string_view log_dir, std::string_view cache_dir,
                          std::string_view temp_dir,
                          std::string_view mountpoint);
+
+// Blocks every blockable signal for the dynamic scope and restores the
+// previous mask on exit. A new thread inherits its creator's mask, so wrap a
+// spawn in this to keep signals off that thread -- blocking at the top of the
+// new thread's routine instead would leave a window in which a signal could
+// still reach it.
+class ScopedBlockAllSignal {
+ public:
+  ScopedBlockAllSignal() {
+    sigset_t all;
+    sigfillset(&all);
+    saved_ = pthread_sigmask(SIG_SETMASK, &all, &old_) == 0;
+  }
+  ~ScopedBlockAllSignal() {
+    if (saved_) pthread_sigmask(SIG_SETMASK, &old_, nullptr);
+  }
+  ScopedBlockAllSignal(const ScopedBlockAllSignal &) = delete;
+  ScopedBlockAllSignal &operator=(const ScopedBlockAllSignal &) = delete;
+
+ private:
+  sigset_t old_;
+  bool saved_ = false;
+};
