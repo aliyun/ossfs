@@ -33,6 +33,7 @@ FixedBlockMemoryPool::FixedBlockMemoryPool(size_t block_size,
       max_cached_blocks_(max_cached_blocks),
       purge_interval_ms_(purge_interval_ms) {
   if (purge_interval_ms_ > 0) {
+    ScopedBlockAllSignal block_signals;
     purger_ =
         std::make_unique<std::thread>([this]() { this->purge_thread_entry(); });
   }

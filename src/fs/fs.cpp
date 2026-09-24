@@ -2906,6 +2906,7 @@ int OssFs::init() {
   {
     auto t0 = std::chrono::steady_clock::now();
     if (creds_provider_) {
+      ScopedBlockAllSignal block_signals;
       creds_refresh_executor_ = new photon::Executor(
           OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {}, EXECUTOR_QUEUE_OPTION);
       r = creds_refresh_executor_->perform([&]() {

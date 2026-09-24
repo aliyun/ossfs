@@ -23,7 +23,6 @@
 #include <jdo_list_dir_result.h>
 #include <jdo_option_keys.h>
 #include <jdo_options.h>
-#include <signal.h>
 
 #include <filesystem>
 #include <fstream>
@@ -33,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "common/utils.h"
 #include "fs/disk_cache_env.h"
 #include "oss/jdo_sdk_loader.h"
 #include "oss/obj_store.h"
@@ -474,14 +474,6 @@ std::string random_string(int length) {
   return result;
 }
 
-static int block_all_signal(sigset_t *oldset) {
-  sigset_t sigset;
-  int r = sigfillset(&sigset);
-  if (r != 0) return r;
-  r = sigprocmask(SIG_SETMASK, &sigset, oldset);
-  return r;
-}
-
 int Ossfs2TestSuite::filler(void *ctx, const uint64_t nodeid, const char *name,
                             const struct stat *stbuf, off_t off) {
   std::vector<TestInode> *nodes =
@@ -626,9 +618,7 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
   LOG_INFO("create ` background vcpu oss client", vcpu_num);
 
   for (int i = 0; i < vcpu_num; i++) {
-    sigset_t oldset;
-    int bas = block_all_signal(&oldset);
-    DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
+    ScopedBlockAllSignal block_signals;
 
     auto executor = new photon::Executor(
         OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {}, EXECUTOR_QUEUE_OPTION);
@@ -706,9 +696,7 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
       disk_cache_dir_ = FLAGS_disk_cache_dir + "/" + std::string(case_name);
     }
     std::filesystem::remove_all(disk_cache_dir_);
-    sigset_t oldset;
-    int bas = block_all_signal(&oldset);
-    DEFER(if (bas == 0) sigprocmask(SIG_SETMASK, &oldset, NULL));
+    ScopedBlockAllSignal block_signals;
 
     auto bg_disk_cache_env = new OssFileSystem::BGVCpuDiskCacheEnv();
     // libaio: random executor count in [1, 4]; psync: single primary
