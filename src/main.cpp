@@ -1280,9 +1280,16 @@ int main(int argc, char *argv[]) {
     fuse_opt_add_arg(&args, "-osubtype=ossfs2");
     // fuse_opt_add_arg internally copies the string, so local std::string is
     // safe.
-    std::string fsname_opt =
-        "-ofsname=" + build_fsname(FLAGS_oss_bucket, FLAGS_oss_endpoint,
-                                   FLAGS_oss_bucket_prefix);
+    // Use the customized filesystem source name if configured.
+    // Otherwise preserve the original ossfs2 naming convention.
+    std::string fsname = FLAGS_fsname.empty()
+        ? build_fsname(FLAGS_oss_bucket,
+                      FLAGS_oss_endpoint,
+                      FLAGS_oss_bucket_prefix)
+        : FLAGS_fsname;
+
+    // fuse_opt_add_arg copies the string, so this local variable is safe.
+    std::string fsname_opt = "-ofsname=" + fsname;
     fuse_opt_add_arg(&args, fsname_opt.c_str());
 
     int pipefd[2];

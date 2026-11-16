@@ -82,6 +82,41 @@ DEFINE_validator(total_rw_mem_ratio, &validate_total_rw_mem_ratio);
 DEFINE_OPTION(ro, bool, false, "Run ossfs2 in read-only mode",
               kFileSystemOptions, false, false, kModeAll);
 
+DEFINE_OPTION(
+    fsname, string, "",
+    "Custom filesystem source name shown by df/mount (empty: auto)",
+    kFileSystemOptions, false, false, kModeAll);
+
+static bool validate_fsname(const char *flagname,
+                            const std::string &value) {
+  // Empty means using the original ossfs2 naming convention.
+  if (value.empty()) {
+    return true;
+  }
+
+  // Avoid excessively long mount source names.
+  if (value.size() > 128) {
+    return false;
+  }
+
+  // Only allow ASCII letters, digits, dot, underscore, and hyphen.
+  for (unsigned char c : value) {
+    bool valid =
+        (c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.';
+
+    if (!valid) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+DEFINE_validator(fsname, &validate_fsname);
+
 DEFINE_OPTION(uid, uint64, 0, "Owner user UID", kFileSystemOptions, false,
               false, kModeAll);
 static bool validate_gid_uid(const char *flagname, uint64_t value) {

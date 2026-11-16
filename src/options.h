@@ -109,6 +109,7 @@ DECLARE_double(total_rw_mem_ratio);
 
 // ==================== FileSystem Options ====================
 DECLARE_bool(ro);
+DECLARE_string(fsname);
 DECLARE_uint64(uid);
 DECLARE_uint64(gid);
 DECLARE_string(dir_mode);
