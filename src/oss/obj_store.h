@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "common/compact_etag.h"
 #include "common/filesystem.h"
 #include "common/utils.h"
 #include "oss_patched.h"
@@ -60,13 +61,13 @@ constexpr const char kHdfsSdkOptUserAgentModule[] = "fs.oss.user.agent.module";
 
 struct ObjDirent {
   ObjDirent(std::string_view name, uint64_t size, struct timespec mtime,
-            unsigned char type, std::string_view etag, mode_t mode = 0,
+            unsigned char type, CompactEtag etag, mode_t mode = 0,
             uid_t uid = 0, gid_t gid = 0, struct timespec atime = {})
       : size_(size),
         mtime_(mtime),
         atime_(atime),
         type_(type),
-        etag_(etag),
+        etag_(std::move(etag)),
         mode_(mode),
         uid_(uid),
         gid_(gid) {
@@ -104,7 +105,7 @@ struct ObjDirent {
     return type_;
   }
 
-  std::string_view etag() const {
+  const CompactEtag &etag() const noexcept {
     return etag_;
   }
 
@@ -125,7 +126,7 @@ struct ObjDirent {
   struct timespec mtime_ = {};
   struct timespec atime_ = {};
   unsigned char type_ = 0;  // same as d_type in dirent
-  std::string etag_;
+  CompactEtag etag_;
   char name_[255 + 1] = {};  // kMaxFileNameLength
   uint16_t name_size_ = 0;
 
@@ -152,31 +153,32 @@ class RawObjHandle {
   virtual ~RawObjHandle() = default;
 
   // Sequential read from current position.
-  virtual ssize_t read(void *buffer, size_t length) = 0;
+  virtual ssize_t read(std::string_view path, void *buffer, size_t length) = 0;
 
   // Random read from specified offset.
-  virtual ssize_t pread(void *buffer, size_t length, off_t offset) = 0;
+  virtual ssize_t pread(std::string_view path, void *buffer, size_t length,
+                        off_t offset) = 0;
 
   // Sequential write at current position.
-  virtual ssize_t write(const void *buffer, size_t length) = 0;
+  virtual ssize_t write(std::string_view path, const void *buffer,
+                        size_t length) = 0;
 
   // Flush buffered data to storage.
-  virtual int flush() = 0;
+  virtual int flush(std::string_view path) = 0;
 
   // Close the stream and release resources.
-  virtual int close() = 0;
+  virtual int close(std::string_view path) = 0;
 
   // Get file length.
-  virtual ssize_t get_length() = 0;
+  virtual ssize_t get_length(std::string_view path) = 0;
 
   // Get current position.
-  virtual ssize_t tell() = 0;
+  virtual ssize_t tell(std::string_view path) = 0;
 
   // Seek to position.
-  virtual ssize_t seek(off_t offset) = 0;
+  virtual ssize_t seek(std::string_view path, off_t offset) = 0;
 
-  // Allocate space for the file.
-  virtual int fallocate(off_t offset, off_t length) = 0;
+  virtual int fallocate(std::string_view path, off_t offset, off_t length) = 0;
 };
 
 bool is_hdfs_endpoint(std::string_view endpoint);

@@ -344,6 +344,75 @@ class Ossfs2HdfsXattrTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
   }
 
+  // POSIX permits nullptr for an empty xattr; it must not be dereferenced.
+  void verify_setxattr_null_value_empty() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "xattr_null_empty", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    const char *name = "user.null_empty";
+    int r = fs_->setxattr(nodeid, name, nullptr, 0, 0);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->getxattr(nodeid, name, nullptr, 0);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+  }
+
+  void verify_setxattr_null_value_with_nonzero_size() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "xattr_null_size", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    const char *name = "user.null_size";
+    int r = fs_->setxattr(nodeid, name, nullptr, 4, 0);
+    ASSERT_EQ(r, -EINVAL);
+
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+  }
+
+  // A non-null pointer with size 0 must also store an empty xattr.
+  void verify_setxattr_empty_value() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "xattr_empty", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    const char *name = "user.empty_val";
+    const char placeholder = 'x';
+    int r = fs_->setxattr(nodeid, name, &placeholder, 0, 0);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->getxattr(nodeid, name, nullptr, 0);
+    ASSERT_EQ(r, 0);
+
+    char buf[4] = {0};
+    r = fs_->getxattr(nodeid, name, buf, sizeof(buf));
+    ASSERT_EQ(r, 0);
+
+    char list[64] = {0};
+    r = fs_->listxattr(nodeid, list, sizeof(list));
+    ASSERT_GT(r, 0);
+    ASSERT_NE(strstr(list, name), nullptr);
+
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+  }
+
   // getxattr with size=0 returns value length.
   void verify_getxattr_size_query() {
     uint64_t parent = get_test_dir_parent();
@@ -555,6 +624,27 @@ TEST_F(Ossfs2HdfsXattrTest, verify_setxattr_value_too_large) {
   OssFsOptions opts;
   init(opts);
   verify_setxattr_value_too_large();
+}
+
+TEST_F(Ossfs2HdfsXattrTest, verify_setxattr_null_value_empty) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_setxattr_null_value_empty();
+}
+
+TEST_F(Ossfs2HdfsXattrTest, verify_setxattr_null_value_with_nonzero_size) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_setxattr_null_value_with_nonzero_size();
+}
+
+TEST_F(Ossfs2HdfsXattrTest, verify_setxattr_empty_value) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_setxattr_empty_value();
 }
 
 TEST_F(Ossfs2HdfsXattrTest, verify_getxattr_size_query) {

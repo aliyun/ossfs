@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <photon/common/callback.h>
 #include <photon/common/iovector.h>
 #include <photon/common/range-lock.h>
 #include <sys/uio.h>
@@ -28,7 +29,10 @@
 #include <string_view>
 #include <utility>
 
+#include "common/compact_etag.h"
+
 class BlockCacheTest;
+class Ossfs2DiskCacheTest;
 
 namespace OssFileSystem {
 
@@ -42,9 +46,13 @@ struct RangeBuffer {
 
 // Identity key of the cached source. Each store decides on its own which
 // fields it consumes.
+// NOTE: etag non-owning references a CompactEtag owned elsewhere (e.g. the
+// inode); it is passed as a pointer so a temporary CompactEtag can never
+// bind to it. It must stay valid for the duration of the call consuming the
+// key and must never be stored.
 struct CacheKey {
-  std::string_view object_key;
-  std::string_view etag;
+  std::string_view object_key{};
+  const CompactEtag *etag = nullptr;
   struct timespec mtime = {0, 0};
   size_t size = 0;
 };
@@ -117,6 +125,34 @@ struct CacheHandle {
     cache_store->drop(key, force);
   }
 
+  // Runs `filler` inside the write-buffer protocol: acquire, filler(buffer),
+  // commit when filler returns >= 0, discard otherwise. `filler` fills the
+  // buffer (e.g. a range GET) and returns the number of bytes filled or a
+  // negative errno.
+  ssize_t fill_range(off_t offset, size_t count,
+                     Delegate<ssize_t, RangeBuffer &> filler) {
+    RangeBuffer rb;
+    rb.offset = offset;
+    rb.count = count;
+    int ret = cache_store->acquire_write_buffer(rb);
+    if (ret < 0) return ret;
+
+    ssize_t got = filler(rb);
+    if (got < 0 || got != static_cast<ssize_t>(count)) {
+      cache_store->release_write_buffer(rb, true);
+      return got < 0 ? got : -EIO;
+    }
+    cache_store->release_write_buffer(rb);
+    return got;
+  }
+
+  virtual void on_read_success(off_t offset, size_t prefetch_buffer_size) {}
+
+ protected:
+  ICacheStore *cache_store = nullptr;
+  RangeLock *range_lock = nullptr;
+
+ private:
   int acquire_write_buffer(RangeBuffer &range_buffer) {
     return cache_store->acquire_write_buffer(range_buffer);
   }
@@ -126,13 +162,8 @@ struct CacheHandle {
     cache_store->release_write_buffer(range_buffer, evict);
   }
 
-  virtual void on_read_success(off_t offset, size_t prefetch_buffer_size) {}
-
- protected:
-  ICacheStore *cache_store = nullptr;
-  RangeLock *range_lock = nullptr;
-
   friend class ::BlockCacheTest;
+  friend class ::Ossfs2DiskCacheTest;
 };
 
 }  // namespace OssFileSystem

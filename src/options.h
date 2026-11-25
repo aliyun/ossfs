@@ -118,6 +118,7 @@ DECLARE_bool(readdirplus);
 DECLARE_bool(ignore_fsync);
 DECLARE_bool(allow_mark_dir_stale_recursively);
 DECLARE_bool(allow_rename_dir);
+DECLARE_bool(rmdir_complete_empty_check);
 DECLARE_uint64(rename_dir_limit);
 DECLARE_bool(allow_other);
 DECLARE_bool(default_permissions);
@@ -134,6 +135,7 @@ DECLARE_string(oss_bucket_prefix);
 DECLARE_string(oss_region);
 DECLARE_bool(auto_create_bucket);
 DECLARE_string(agentic_bucket);
+DECLARE_bool(skip_check_bucket);
 
 // ==================== Oss Credential Options ====================
 DECLARE_string(oss_access_key_id);
@@ -187,6 +189,10 @@ DECLARE_uint64(oss_vcpu_count);
 DECLARE_bool(use_list_obj_v2);
 DECLARE_int32(max_list_ret_count);
 DECLARE_uint64(oss_request_timeout_ms);
+DECLARE_uint64(oss_max_idle_timeout_ms);
+DECLARE_int32(oss_request_max_retries);
+DECLARE_string(oss_additional_headers);
+DECLARE_uint64(oss_qps_limit_retry_timeout_ms);
 DECLARE_string(oss_hdfs_client_options);
 DECLARE_string(bind_ips);
 DECLARE_bool(enable_ipv6);

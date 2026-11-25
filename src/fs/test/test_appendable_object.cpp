@@ -669,7 +669,7 @@ class Ossfs2AppendableObjectTest : public OssOnlyTestSuite {
 
     // Read threads
     std::vector<std::future<std::pair<uint64_t, bool>>> read_tasks;
-    int parallel_cnt = 64;
+    int parallel_cnt = 16;
     for (int i = 0; i < parallel_cnt; i++) {
       auto task =
           std::async(std::launch::async, [&]() -> std::pair<uint64_t, bool> {

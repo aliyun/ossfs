@@ -173,7 +173,7 @@ bool OssCachedReader::refresh_attr_if_needed_and_drop_cache(off_t clean_size) {
   if (unlikely(clean_size != remote_size_ ||
                inode_->attr.mtime.tv_sec != mtime_.tv_sec ||
                inode_->attr.mtime.tv_nsec != mtime_.tv_nsec ||
-               inode_->etag != etag_)) {
+               !inode_->etag.equals(etag_))) {
     remote_size_ = clean_size;
     mtime_ = inode_->attr.mtime;
     etag_ = inode_->etag;
@@ -366,28 +366,45 @@ ssize_t OssCachedReader::do_refill_range(IObjStore *obj_store,
 
   DEFER({ range_lock()->unlock(refill_off, refill_size); });
 
-  RangeBuffer range_buffer;
-  range_buffer.offset = refill_off;
-  range_buffer.count = refill_size;
-  ret = cache_handle_->acquire_write_buffer(range_buffer);
-  if (ret < 0) return ret;
-
-  DECLARE_METRIC_LATENCY(refill_range, Metric::kInternalMetrics);
-
-  auto &buffer = range_buffer.buffer;
+  bool filler_invoked = false;
   auto start_time = std::chrono::steady_clock::now();
-  DEFER({
+  DEFER(if (filler_invoked) {
     auto end_time = std::chrono::steady_clock::now();
     uint64_t lat = std::chrono::duration_cast<std::chrono::microseconds>(
                        end_time - start_time)
                        .count();
     fs_->update_max_refill_range_lat(lat);
+    DECLARE_METRIC_VALUE(refill_range, Metric::kInternalMetrics, lat, 0, 1);
   });
 
-  ret = do_verified_refill_get(obj_store, buffer.iovec(), buffer.iovcnt(),
-                               refill_off);
+  // Fills the write buffer with a verified range GET and copies out the
+  // requested tail while the buffer is still populated.
+  auto filler = [&](RangeBuffer &rb) -> ssize_t {
+    filler_invoked = true;
+    auto &buffer = rb.buffer;
+    ssize_t got = do_verified_refill_get(obj_store, buffer.iovec(),
+                                         buffer.iovcnt(), refill_off);
+    if (got < 0) return got;
+
+    if (input) {
+      RELEASE_ASSERT(offset >= static_cast<off_t>(refill_off));
+
+      iovector_view tail_buffer;
+      tail_buffer.iovcnt = 0;
+      size_t tail_size = refill_size - (offset - refill_off);
+      buffer.slice(tail_size, offset - refill_off, &tail_buffer);
+      auto copied = tail_buffer.memcpy_to(input, count);
+      RELEASE_ASSERT(copied == static_cast<size_t>(count));
+    }
+
+    FAULT_INJECTION(FaultInjectionId::FI_Do_Refill_Range_Delay_Before_Release,
+                    []() { AUTO_USLEEP(2'000'000); });
+
+    return got;
+  };
+
+  ret = cache_handle_->fill_range(refill_off, refill_size, filler);
   if (ret < 0) {
-    cache_handle_->release_write_buffer(range_buffer, true);
     if (is_refill_verify_error(ret)) {
       if (!from_bg_prefetch) {
         return ret;
@@ -405,21 +422,6 @@ ssize_t OssCachedReader::do_refill_range(IObjStore *obj_store,
     return ret;
   }
 
-  if (input) {
-    RELEASE_ASSERT(offset >= static_cast<off_t>(refill_off));
-
-    iovector_view tail_buffer;
-    tail_buffer.iovcnt = 0;
-    size_t tail_size = refill_size - (offset - refill_off);
-    buffer.slice(tail_size, offset - refill_off, &tail_buffer);
-    ret = tail_buffer.memcpy_to(input, count);
-    RELEASE_ASSERT(ret == static_cast<ssize_t>(count));
-  }
-
-  FAULT_INJECTION(FaultInjectionId::FI_Do_Refill_Range_Delay_Before_Release,
-                  []() { AUTO_USLEEP(2'000'000); });
-
-  cache_handle_->release_write_buffer(range_buffer);
   return count;
 }
 
@@ -450,7 +452,7 @@ ssize_t OssRandWriterCachedReader::do_verified_refill_get(
     IObjStore *obj_store, const struct iovec *iov, int iovcnt,
     uint64_t refill_off) {
   RELEASE_ASSERT(obj_store != nullptr);
-  std::string expected_etag;
+  CompactEtag expected_etag;
   std::string path_snap;
   {
     SCOPED_LOCK(attr_lock_);
@@ -471,10 +473,10 @@ ssize_t OssRandWriterCachedReader::do_verified_refill_get(
   if (ret < 0) return ret;
 
   if (!expected_etag.empty() && !response_etag.empty() &&
-      response_etag != expected_etag) {
+      !expected_etag.equals(response_etag)) {
     // clang-format off
     LOG_WARN("verified refill etag mismatch, path `, expected etag `, response etag `",
-             path_snap, expected_etag, response_etag);
+             path_snap, expected_etag.to_string(), response_etag);
     // clang-format on
     return -E_REFILL_ETAG_MISMATCH;
   }
@@ -764,7 +766,7 @@ std::unique_ptr<IReader> create_oss_reader(OssFs *fs, std::string_view path,
     if (cache == nullptr) {
       cache = std::make_shared<BlockCache>(fs->get_data_buffers());
     }
-    CacheKey key{path, inode->etag, inode->attr.mtime, inode->attr.size};
+    CacheKey key{path, &inode->etag, inode->attr.mtime, inode->attr.size};
     auto cache_handle = cache->get(key);
     if (cache_handle) {
       switch (fs->write_mode()) {

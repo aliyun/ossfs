@@ -24,6 +24,7 @@ OptionsRegistry::ContainerType OptionsRegistry::options_;
 const std::set<std::string> OptionsRegistry::kSensitiveOptions = {
     "oss_access_key_id",
     "oss_access_key_secret",
+    "oss_additional_headers",
     "http_proxy",
 };
 
@@ -135,6 +136,10 @@ DEFINE_OPTION(allow_mark_dir_stale_recursively, bool, false,
               kFileSystemOptions, true, true, kModeAll);
 DEFINE_OPTION(allow_rename_dir, bool, true, "Allow renaming directories",
               kFileSystemOptions, true, true, kModeAll);
+DEFINE_OPTION(rmdir_complete_empty_check, bool, false,
+              "When enabled, rmdir also checks the remote for emptiness, "
+              "not just the local cache",
+              kFileSystemOptions, false, false, kModeAll);
 DEFINE_OPTION(
     rename_dir_limit, uint64, 2000000,
     "The maximum number of entries during a single rename-dir operation",
@@ -145,8 +150,10 @@ DEFINE_OPTION(allow_other, bool, true,
               kFileSystemOptions, false, false, kModeAll);
 
 DEFINE_OPTION(default_permissions, bool, false,
-              "Let kernel handle permission checks", kFileSystemOptions, false,
-              false, kModeHdfs);
+              "Let kernel handle permission checks. In OSS mode this defaults "
+              "to on when uid/gid/file_mode/dir_mode is set explicitly, and to "
+              "off otherwise",
+              kFileSystemOptions, false, false, kModeAll);
 
 DEFINE_OPTION(seq_read_detect_count, int32, 3,
               "The number of sequential reads required to trigger prefetching",
@@ -190,6 +197,11 @@ DEFINE_OPTION(auto_create_bucket, bool, false,
 DEFINE_OPTION(agentic_bucket, string, "",
               "Agentic bucket name attached when auto creating the bucket",
               kOssBucketOptions, false, false, kModeOss);
+DEFINE_OPTION(skip_check_bucket, bool, false,
+              "Skip the mount-time bucket existence validation; bucket errors "
+              "then surface on the first real I/O instead of failing the "
+              "mount. Periodic credential revalidation is unaffected",
+              kOssBucketOptions, false, false, kModeAll);
 
 // ==================== Oss Credential Options ====================
 DEFINE_OPTION(oss_access_key_id, string, "", "OSS access key ID",
@@ -553,6 +565,59 @@ static bool validate_oss_request_timeout_ms(const char *flagname,
   return value >= 1000 && value <= 900000;
 }
 DEFINE_validator(oss_request_timeout_ms, &validate_oss_request_timeout_ms);
+
+DEFINE_OPTION(oss_max_idle_timeout_ms, uint64, 0,
+              "Max idle time in milliseconds before a pooled OSS connection "
+              "is closed by the client. 0 (default) keeps idle connections "
+              "until the peer closes them",
+              kOssClientOptions, false, false, kModeOss);
+static bool validate_oss_max_idle_timeout_ms(const char *flagname,
+                                             uint64_t value) {
+  // 0 (disabled) or [1s, 1h]
+  return value == 0 || (value >= 1000 && value <= 3600000);
+}
+DEFINE_validator(oss_max_idle_timeout_ms, &validate_oss_max_idle_timeout_ms);
+
+DEFINE_OPTION(oss_request_max_retries, int32, 2,
+              "Maximum number of retries after the initial attempt for OSS "
+              "requests (total attempts = oss_request_max_retries + 1)",
+              kOssClientOptions, false, false, kModeOss);
+static bool validate_oss_request_max_retries(const char *flagname,
+                                             int32_t value) {
+  return value >= 0 && value <= 10;
+}
+DEFINE_validator(oss_request_max_retries, &validate_oss_request_max_retries);
+
+DEFINE_OPTION(oss_qps_limit_retry_timeout_ms, uint64, 0,
+              "Total retry time in milliseconds for OSS QPS-limit "
+              "(QpsLimitExceeded) errors. 0 (default) falls back to "
+              "oss_request_timeout_ms. A single backoff sleep is capped "
+              "at 20 seconds",
+              kOssClientOptions, false, false, kModeOss);
+static bool validate_oss_qps_limit_retry_timeout_ms(const char *flagname,
+                                                    uint64_t value) {
+  // 0 (follow request timeout) or [1s, 7d]. The 7-day ceiling is a sanity
+  // bound no real workload should hit; long budgets are a customer choice.
+  return value == 0 || (value >= 1000 && value <= 7ULL * 24 * 3600 * 1000);
+}
+DEFINE_validator(oss_qps_limit_retry_timeout_ms,
+                 &validate_oss_qps_limit_retry_timeout_ms);
+
+DEFINE_OPTION(
+    oss_additional_headers, string, "",
+    "Additional headers for all OSS requests as semicolon-separated "
+    "name=base64(value) pairs. Every value must use standard Base64; an empty "
+    "value is allowed. Names are case-insensitive; spaces or tabs around names "
+    "and encoded values are trimmed. Values are decoded before sending; "
+    "decoded CR, LF and NUL are rejected. No URL encoding or decoding is "
+    "performed",
+    kOssClientOptions, false, false, kModeOss);
+static bool validate_oss_additional_headers(const char *flagname,
+                                            const std::string &value) {
+  std::vector<std::pair<std::string, std::string>> headers;
+  return parse_oss_additional_headers(value, &headers);
+}
+DEFINE_validator(oss_additional_headers, &validate_oss_additional_headers);
 
 DEFINE_OPTION(
     oss_hdfs_client_options, string, "",

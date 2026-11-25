@@ -29,7 +29,7 @@ TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_client_errors) {
   ASSERT_EQ(jdo_error_code_to_posix(JDO_CLIENT_ERROR), -EINVAL);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_CLIENT_ILLEGAL_CONF_ERROR), -EINVAL);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_CLIENT_ILLEGAL_REQUEST_ERROR), -EINVAL);
-  ASSERT_EQ(jdo_error_code_to_posix(JDO_CLIENT_CHECKSUM_ERROR), -EINVAL);
+  ASSERT_EQ(jdo_error_code_to_posix(JDO_CLIENT_CHECKSUM_ERROR), -EIO);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_JNI_OBJ_ALLOCATION_ERROR), -EINVAL);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_CONFIG_OPTION_ERROR), -EINVAL);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_CLIENT_NO_ENOUGHT_RESERVE_MEM_ERROR),
@@ -75,18 +75,19 @@ TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_system_errors) {
 }
 
 TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_rename_errors) {
-  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_UNDER_SRC_ERROR), -EINVAL);
+  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_SRC_NOT_FOUND_ERROR), -ENOENT);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_PARENT_NOT_FOUND_ERROR),
-            -EINVAL);
-  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_PARENT_FILE_ERROR), -EINVAL);
-  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_SRC_NOT_FOUND_ERROR), -EINVAL);
+            -ENOENT);
+  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_PARENT_FILE_ERROR),
+            -ENOTDIR);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_EXIST_AS_FILE_ERROR),
-            -EINVAL);
+            -EEXIST);
+  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_EXIST_ERROR), -EEXIST);
+  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_UNDER_SRC_ERROR), -EINVAL);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_SRC_EQ_DST_AS_DIRECTORY_ERROR),
             -EINVAL);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_SRC_EQ_DST_AS_FILE_ERROR),
             -EINVAL);
-  ASSERT_EQ(jdo_error_code_to_posix(JDO_RENAME_DST_EXIST_ERROR), -EINVAL);
 }
 
 TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_permission_errors) {
@@ -104,7 +105,7 @@ TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_permission_errors) {
 }
 
 TEST_F(Ossfs2HdfsErrorCodeMappingTest, verify_error_code_lock_errors) {
-  ASSERT_EQ(jdo_error_code_to_posix(JDO_LEASE_EXPIRED_ERROR), -EAGAIN);
+  ASSERT_EQ(jdo_error_code_to_posix(JDO_LEASE_EXPIRED_ERROR), -EIO);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_CONFLICT_LOCK_ERROR), -EAGAIN);
   ASSERT_EQ(jdo_error_code_to_posix(JDO_SAFE_MODE_ERROR), -EROFS);
 }

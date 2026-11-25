@@ -20,6 +20,7 @@
 #include <string>
 
 #include "cache.h"
+#include "common/compact_etag.h"
 #include "common/filesystem.h"
 #include "file_prefetching.h"
 #include "test/class_declarations.h"
@@ -141,7 +142,7 @@ class OssCachedReader : public OssReader,
   // during refresh_attr_if_needed_and_drop_cache.
   off_t remote_size_ = 0;
   timespec mtime_ = {0, 0};
-  std::string etag_;
+  CompactEtag etag_;
 
  private:
   off_t get_remote_size();
@@ -153,7 +154,7 @@ class OssCachedReader : public OssReader,
 
   // Caller must hold attr_lock_.
   CacheKey cache_key() {
-    return {path_, etag_, mtime_, static_cast<size_t>(remote_size_)};
+    return {path_, &etag_, mtime_, static_cast<size_t>(remote_size_)};
   }
 
   RangeLock *range_lock() {

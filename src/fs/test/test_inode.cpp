@@ -770,7 +770,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
         ASSERT_TRUE(fs_->global_inodes_map_.find(nodeid) !=
                     fs_->global_inodes_map_.end());
         auto inode = static_cast<FileInode *>(fs_->global_inodes_map_[nodeid]);
-        ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
+        ASSERT_EQ(inode->etag.to_string(), add_dquo(meta["Etag"]));
       }
     }
 
@@ -810,18 +810,18 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
       }
 
       // Release lands the data on the cloud and backfills the new etag.
-      std::string etag_before_release = inode->etag;
+      std::string etag_before_release = inode->etag.to_string();
       r = fs_->release(nodeid, get_file_from_handle(handle));
       ASSERT_EQ(r, 0);
       ASSERT_FALSE(inode->etag.empty());
-      ASSERT_NE(inode->etag, etag_before_release);
+      ASSERT_NE(inode->etag.to_string(), etag_before_release);
 
       // etag should be refresh
       r = fs_->getattr(nodeid, &st);
       ASSERT_EQ(r, 0);
 
       auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
-      ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
+      ASSERT_EQ(inode->etag.to_string(), add_dquo(meta["Etag"]));
     }
 
     // 3. test remote update
@@ -874,7 +874,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
                     fs_->global_inodes_map_.end());
         inode = static_cast<FileInode *>(fs_->global_inodes_map_[nodeid]);
         ASSERT_FALSE(inode->etag.empty());
-        old_etag = inode->etag;
+        old_etag = inode->etag.to_string();
       }
 
       r = upload_file(local_file2, join_paths(parent_path, filepath),
@@ -897,8 +897,8 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
       }
 
       auto meta = get_file_meta("test_remote_update", FLAGS_oss_bucket_prefix);
-      ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
-      ASSERT_NE(old_etag, inode->etag);
+      ASSERT_EQ(inode->etag.to_string(), add_dquo(meta["Etag"]));
+      ASSERT_NE(old_etag, inode->etag.to_string());
       ASSERT_TRUE(inode->invalidate_data_cache);
     }
   }
@@ -910,7 +910,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
       100, 200
     };
     FileInode inode(2, "f", 1024, mtime, InodeType::kFile, false, 1, nullptr,
-                    "\"etag-a\"");
+                    CompactEtag("\"etag-a\""));
 
     struct stat stbuf = {};
     stbuf.st_size = 1024;
@@ -918,33 +918,33 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
     stbuf.st_mtim.tv_nsec = 200;
 
     // Both etags present: etag + size decide, mtime drift is ignored.
-    EXPECT_FALSE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, CompactEtag("\"etag-a\"")));
     stbuf.st_mtim.tv_sec = 999;
     stbuf.st_mtim.tv_nsec = 1;
-    EXPECT_FALSE(inode.is_data_changed(&stbuf, "\"etag-a\""))
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, CompactEtag("\"etag-a\"")))
         << "mtime drift must not invalidate when etags match";
-    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-b\""));
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, CompactEtag("\"etag-b\"")));
     stbuf.st_size = 2048;
-    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, CompactEtag("\"etag-a\"")));
     stbuf.st_size = 1024;
     stbuf.st_mtim.tv_sec = 100;
     stbuf.st_mtim.tv_nsec = 200;
 
     // Local etag cleared (HDFS, failed or deferred upload): size + mtime.
     inode.etag.clear();
-    EXPECT_FALSE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, CompactEtag("\"etag-a\"")));
     stbuf.st_mtim.tv_nsec = 201;
-    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, CompactEtag("\"etag-a\"")));
     stbuf.st_mtim.tv_nsec = 200;
     stbuf.st_size = 512;
-    EXPECT_TRUE(inode.is_data_changed(&stbuf, "\"etag-a\""));
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, CompactEtag("\"etag-a\"")));
     stbuf.st_size = 1024;
 
     // Remote without etag (HDFS backend) falls back the same way.
-    inode.etag = "\"etag-a\"";
-    EXPECT_FALSE(inode.is_data_changed(&stbuf, ""));
+    inode.etag.assign("\"etag-a\"");
+    EXPECT_FALSE(inode.is_data_changed(&stbuf, CompactEtag()));
     stbuf.st_mtim.tv_sec = 101;
-    EXPECT_TRUE(inode.is_data_changed(&stbuf, ""));
+    EXPECT_TRUE(inode.is_data_changed(&stbuf, CompactEtag()));
   }
 
   // A flushed write backfills the etag so a reopen keeps the page cache;
@@ -994,12 +994,12 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
       auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
       if (!appendable_mode) {
-        ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
-      } else if (inode->etag != add_dquo(meta["Etag"])) {
+        ASSERT_EQ(inode->etag.to_string(), add_dquo(meta["Etag"]));
+      } else if (!inode->etag.equals(add_dquo(meta["Etag"]))) {
         // AppendObject's response etag may differ from HeadObject's; retention
         // then degrades to per-open invalidation, not a correctness issue.
-        LOG_WARN("appendable etag mismatch, response: `, head: `", inode->etag,
-                 meta["Etag"]);
+        LOG_WARN("appendable etag mismatch, response: `, head: `",
+                 inode->etag.to_string(), meta["Etag"]);
         continue;
       }
 
@@ -1033,7 +1033,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
         std::lock_guard<std::mutex> l(fs_->inodes_map_lck_);
         inode = static_cast<FileInode *>(fs_->global_inodes_map_[nodeid]);
       }
-      std::string old_etag = inode->etag;
+      std::string old_etag = inode->etag.to_string();
       ASSERT_FALSE(old_etag.empty());
 
       std::string local_file = join_paths(test_path_, "pc_external_src");
@@ -1050,8 +1050,8 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
           << "external overwrite must invalidate the page cache";
 
       auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
-      ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
-      ASSERT_NE(inode->etag, old_etag);
+      ASSERT_EQ(inode->etag.to_string(), add_dquo(meta["Etag"]));
+      ASSERT_NE(inode->etag.to_string(), old_etag);
 
       size_t new_size = std::stoull(meta["Content-Length"]);
       std::string got(new_size, '\0');
@@ -1105,7 +1105,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
       ASSERT_EQ(r, 0);
 
       auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
-      ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]))
+      ASSERT_EQ(inode->etag.to_string(), add_dquo(meta["Etag"]))
           << "truncate(0) must backfill the empty object etag";
       ASSERT_TRUE(inode->invalidate_data_cache);
 
@@ -1678,7 +1678,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
         inode = new DirInode(i + 2, name, {0, 0}, 1, root);
       } else {
         inode = new FileInode(i + 2, name, 0, {0, 0}, InodeType::kFile, false,
-                              1, root, etag);
+                              1, root, CompactEtag(etag));
       }
 
       root->add_child_node(inode);
@@ -1686,11 +1686,11 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
       if (enable_staged_inode) {
         if (FLAGS_test_mem_usage_dir) {
-          staged_cache->insert(root->nodeid, name, 0, {0, 0}, "", i + 2,
-                               InodeType::kDir, 0);
+          staged_cache->insert(root->nodeid, name, 0, {0, 0}, CompactEtag{},
+                               i + 2, InodeType::kDir, 0);
         } else {
-          staged_cache->insert(root->nodeid, name, 0, {0, 0}, etag, i + 2,
-                               InodeType::kFile, 0);
+          staged_cache->insert(root->nodeid, name, 0, {0, 0}, CompactEtag(etag),
+                               i + 2, InodeType::kFile, 0);
         }
         root->erase_child_node(name, i + 2);
         glb_map.erase(i + 2);
@@ -1724,9 +1724,9 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     std::vector<Inode *> children;
     for (int i = 0; i < 3; ++i) {
-      FileInode *node =
-          new FileInode(i + 3, "testfile_" + std::to_string(i), 0, {0, 0},
-                        InodeType::kFile, false, 2, dir_inode, "ETAG");
+      FileInode *node = new FileInode(i + 3, "testfile_" + std::to_string(i), 0,
+                                      {0, 0}, InodeType::kFile, false, 2,
+                                      dir_inode, CompactEtag("ETAG"));
       ASSERT_TRUE(node->is_file());
       ASSERT_FALSE(node->is_dirty_file());
       children.push_back(node);
@@ -1746,7 +1746,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     FileInode *node1 =
         new FileInode(6, "testfile_1", 0, {0, 0}, InodeType::kFile, false, 2,
-                      dir_inode, "ETAG");
+                      dir_inode, CompactEtag("ETAG"));
     ASSERT_TRUE(node1->is_file());
     ASSERT_FALSE(node1->is_dirty_file());
     dir_inode->add_child_node(node1);  // cover a stale child node
@@ -1762,7 +1762,7 @@ class Ossfs2InodeTest : public Ossfs2TestSuite {
 
     FileInode *node2 =
         new FileInode(7, "testfile_2", 0, {0, 0}, InodeType::kFile, false, 2,
-                      dir_inode, "ETAG");
+                      dir_inode, CompactEtag("ETAG"));
     ASSERT_TRUE(node2->is_file());
     ASSERT_FALSE(node2->is_dirty_file());
     dir_inode->add_child_node_directly(node2);

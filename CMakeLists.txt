@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 
-project(ossfs2 VERSION 2.0.10)
+project(ossfs2 VERSION 2.0.11)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 include(FindPackageHandleStandardArgs)
@@ -184,6 +184,7 @@ file(GLOB ossfs2_srcs RELATIVE "${PROJECT_SOURCE_DIR}"
   src/*.cpp)
 
 add_executable(ossfs2 ${ossfs2_srcs})
+add_dependencies(ossfs2 CLI11)
 
 # we will install libfuse to /usr/local/lib64/ossfs2, make sure ossfs2 
 # can find it instead of using the system one

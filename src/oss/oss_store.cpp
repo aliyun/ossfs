@@ -447,7 +447,7 @@ int OssStore::list_dir(std::string_view path, ObjectList &results,
     if (params.is_com_prefix) {
       if (name.size() > 0 && name.back() == '/') name.remove_suffix(1);
       if (is_obj_name_valid(name)) {
-        results.emplace_back(name, 0, timespec{}, DT_DIR, "");
+        results.emplace_back(name, 0, timespec{}, DT_DIR, CompactEtag{});
       } else {
         LOG_WARN("skipped dir obj ` in list results under prefix `", params.key,
                  dir_prefix);
@@ -464,7 +464,7 @@ int OssStore::list_dir(std::string_view path, ObjectList &results,
           file_size = symlink_size_with_root_backtrack(file_size, dir_depth);
         }
         results.emplace_back(name, file_size, timespec{params.mtime, 0}, type,
-                             params.etag);
+                             CompactEtag(params.etag));
       } else if (name.size() > 0) {
         LOG_WARN("skipped file obj ` in list results under prefix `",
                  params.key, dir_prefix);

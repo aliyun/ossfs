@@ -333,7 +333,7 @@ class OssRandomWriter : public OssWriter {
 
  private:
   CacheKey cache_key() {
-    return {inode_->rw_ctx->upload_path, inode_->etag, inode_->attr.mtime,
+    return {inode_->rw_ctx->upload_path, &inode_->etag, inode_->attr.mtime,
             inode_->attr.size};
   }
 
@@ -411,7 +411,7 @@ void OssWriter::drop_post_write_caches(bool data_lost, std::string_view path) {
 
   if (inode_->cache) {
     inode_->cache->drop(
-        CacheKey{path, inode_->etag, inode_->attr.mtime, inode_->attr.size});
+        CacheKey{path, &inode_->etag, inode_->attr.mtime, inode_->attr.size});
   }
 
   // After every write op, FUSE kernel will invalidate attr cache(see details
@@ -826,7 +826,7 @@ int OssStreamingWriter::do_complete_multipart() {
     LOG_ERROR("Failed to complete multipart file: `, r: `", inode_->nodeid, r);
     immutable_ = true;
   } else if (!new_etag.empty()) {
-    inode_->etag = new_etag;
+    inode_->etag.assign(new_etag);
   }
 
   upload_context_ = nullptr;
@@ -863,7 +863,7 @@ int OssStreamingWriter::do_upload_empty() {
   }
 
   if (!new_etag.empty()) {
-    inode_->etag = new_etag;
+    inode_->etag.assign(new_etag);
   }
   return 0;
 }
@@ -967,7 +967,7 @@ int OssStreamingWriter::do_upload_buffer() {
       LOG_ERROR("Failed to upload file: `, nodeid: ` r: `", upload_path_,
                 inode_->nodeid, r);
     } else if (!new_etag.empty()) {
-      inode_->etag = new_etag;
+      inode_->etag.assign(new_etag);
     }
   }
 
@@ -1066,7 +1066,7 @@ int OssAppendableWriter::do_upload_buffer() {
   }
 
   if (!new_etag.empty()) {
-    inode_->etag = new_etag;
+    inode_->etag.assign(new_etag);
   }
   return 0;
 }
@@ -1085,7 +1085,7 @@ int OssAppendableWriter::do_upload_empty() {
   }
 
   if (!new_etag.empty()) {
-    inode_->etag = new_etag;
+    inode_->etag.assign(new_etag);
   }
   return 0;
 }
@@ -1206,7 +1206,7 @@ int OssAppendableWriter::do_append_upload(size_t part_number) {
     LOG_ERROR("Failed to do append upload file: `, nodeid: `, r: `",
               upload_path_, inode_->nodeid, r);
   } else if (!new_etag.empty()) {
-    inode_->etag = new_etag;
+    inode_->etag.assign(new_etag);
   }
 
   return r;
@@ -1328,7 +1328,7 @@ int OssAppendableWriter::switch_object_type_normal_to_appendable() {
     valid_buffer_offset = buffer_size_;
     buffer_index_ = inode_->attr.size / part_size;
     if (!new_etag.empty()) {
-      inode_->etag = new_etag;
+      inode_->etag.assign(new_etag);
     }
     return 0;
   });
@@ -1821,7 +1821,7 @@ int OssRandomWriter::flush_no_multipart(uint64_t file_size) {
     LOG_ERROR("flush_no_multipart: failed, nodeid `, size `, r `",
               inode_->nodeid, file_size, r);
   } else if (!new_etag.empty()) {
-    inode_->etag = new_etag;
+    inode_->etag.assign(new_etag);
   }
   return r;
 }
@@ -1893,6 +1893,8 @@ int OssRandomWriter::flush_multipart(uint64_t file_size) {
       uint64_t plen = std::min(part_size, file_size - i * part_size);
       whole_crc = crc64ecma_combine(whole_crc, part_crcs[i], plen);
     }
+    FAULT_INJECTION(FI_RandomWrite_Complete_Crc_Mismatch,
+                    [&]() { whole_crc ^= 1; });
   }
 
   FAULT_INJECTION(FI_RandomWrite_Complete_Multipart_Fail, [&]() { r = -EIO; });
@@ -1902,21 +1904,25 @@ int OssRandomWriter::flush_multipart(uint64_t file_size) {
         has_crc && !crc_incomplete_.load(std::memory_order_acquire) ? &whole_crc
                                                                     : nullptr,
         &new_etag);
+    // Complete consumes the context on every outcome; never reuse it.
+    upload_ctx = nullptr;
   }
   if (r < 0) {
     LOG_ERROR("complete failed, nodeid `, r `", inode_->nodeid, r);
     goto cleanup;
   }
   if (!new_etag.empty()) {
-    inode_->etag = new_etag;
+    inode_->etag.assign(new_etag);
   }
   return 0;
 
 cleanup:
-  int abort_r =
-      PERFORM_BACKGROUND_OBJ_REQUEST(fs_, abort_multipart_upload, upload_ctx);
-  if (abort_r < 0) {
-    LOG_ERROR("abort failed, nodeid `, abort_r `", inode_->nodeid, abort_r);
+  if (upload_ctx != nullptr) {
+    int abort_r =
+        PERFORM_BACKGROUND_OBJ_REQUEST(fs_, abort_multipart_upload, upload_ctx);
+    if (abort_r < 0) {
+      LOG_ERROR("abort failed, nodeid `, abort_r `", inode_->nodeid, abort_r);
+    }
   }
   return r;
 }

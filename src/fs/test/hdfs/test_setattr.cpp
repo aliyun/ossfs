@@ -1343,6 +1343,196 @@ class Ossfs2HdfsSetattrTest : public OssHdfsTestSuite {
     ASSERT_GT(st.st_mtim.tv_sec, mtime_before)
         << "dir mtime was not refreshed from the backend";
   }
+
+  // ftruncate must use the renamed path.
+  void verify_ftruncate_shrink_after_rename() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "trunc_rename_src", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+    auto *file = get_file_from_handle(handle);
+
+    const size_t buf_size = 8192;
+    char *buf = new char[buf_size];
+    DEFER(delete[] buf);
+    memset(buf, 'Z', buf_size);
+    ASSERT_EQ(file->pwrite(buf, buf_size, 0), (ssize_t)buf_size);
+
+    // Avoid reads that could refresh the path first.
+    ASSERT_EQ(
+        fs_->rename(parent, "trunc_rename_src", parent, "trunc_rename_dst", 0),
+        0);
+
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    st.st_size = 1024;
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(handle);
+    ASSERT_EQ(fs_->setattr(nodeid, &st, FUSE_SET_ATTR_SIZE, &fi, 0, 0), 0);
+
+    // A reopened reader must not rebuild again.
+    {
+      g_fault_injector->set_injection(FI_HdfsReaderRebuild_ReopenFail);
+      DEFER(g_fault_injector->clear_injection(FI_HdfsReaderRebuild_ReopenFail));
+      char verify[1024];
+      ASSERT_EQ(file->pread(verify, sizeof(verify), 0),
+                static_cast<ssize_t>(sizeof(verify)));
+    }
+
+    struct stat st2;
+    ASSERT_EQ(fs_->getattr(nodeid, &st2), 0);
+    ASSERT_EQ(st2.st_size, (off_t)1024);
+
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+
+    int64_t backend_size = -1;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(
+                  hdfs_helper_->full_uri(nodeid_to_path(nodeid)), backend_size),
+              0);
+    ASSERT_EQ(backend_size, (int64_t)1024);
+  }
+
+  // Cover path refresh in handle-based setattr.
+  void verify_ftruncate_extend_after_rename() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "trunc_ext_rename_src", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+    auto *file = get_file_from_handle(handle);
+
+    const size_t buf_size = 4096;
+    char *buf = new char[buf_size];
+    DEFER(delete[] buf);
+    memset(buf, 'A', buf_size);
+    ASSERT_EQ(file->pwrite(buf, buf_size, 0), (ssize_t)buf_size);
+    ASSERT_EQ(file->fdatasync(), 0);
+
+    ASSERT_EQ(fs_->rename(parent, "trunc_ext_rename_src", parent,
+                          "trunc_ext_rename_dst", 0),
+              0);
+
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    st.st_size = 8192;
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(handle);
+    ASSERT_EQ(fs_->setattr(nodeid, &st, FUSE_SET_ATTR_SIZE, &fi, 0, 0), 0);
+
+    struct stat st2;
+    ASSERT_EQ(fs_->getattr(nodeid, &st2), 0);
+    ASSERT_EQ(st2.st_size, (off_t)8192);
+
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+
+    const std::string uri = hdfs_helper_->full_uri(nodeid_to_path(nodeid));
+    int64_t backend_size = -1;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(uri, backend_size), 0);
+    ASSERT_EQ(backend_size, (int64_t)8192);
+
+    void *rd_handle = nullptr;
+    bool keep_cache = false;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &rd_handle, &keep_cache), 0);
+    char verify[8192];
+    memset(verify, (char)0xAA, sizeof(verify));
+    ssize_t n =
+        get_file_from_handle(rd_handle)->pread(verify, sizeof(verify), 0);
+    ASSERT_EQ(n, (ssize_t)8192);
+    for (size_t i = 0; i < buf_size; i++) ASSERT_EQ(verify[i], 'A');
+    for (size_t i = buf_size; i < sizeof(verify); i++) ASSERT_EQ(verify[i], 0);
+    ASSERT_EQ(fs_->release(nodeid, get_file_from_handle(rd_handle)), 0);
+  }
+
+  // fallocate must refresh the writer's cached path.
+  void verify_fallocate_extend_after_rename() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(parent, "falloc_rename_src", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+    auto *file = get_file_from_handle(handle);
+
+    const size_t buf_size = 4096;
+    char *buf = new char[buf_size];
+    DEFER(delete[] buf);
+    memset(buf, 'A', buf_size);
+    ASSERT_EQ(file->pwrite(buf, buf_size, 0), (ssize_t)buf_size);
+    ASSERT_EQ(file->fdatasync(), 0);
+
+    ASSERT_EQ(fs_->rename(parent, "falloc_rename_src", parent,
+                          "falloc_rename_dst", 0),
+              0);
+
+    ASSERT_EQ(fs_->fallocate(nodeid, (off_t)buf_size, 4096, handle), 0);
+
+    struct stat st;
+    ASSERT_EQ(fs_->getattr(nodeid, &st), 0);
+    ASSERT_EQ(st.st_size, (off_t)(buf_size + 4096));
+
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+
+    int64_t backend_size = -1;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(
+                  hdfs_helper_->full_uri(nodeid_to_path(nodeid)), backend_size),
+              0);
+    ASSERT_EQ(backend_size, (int64_t)(buf_size + 4096));
+  }
+
+  // An ancestor rename also invalidates the file path.
+  void verify_ftruncate_shrink_after_parent_dir_rename() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    struct stat st;
+    uint64_t dir_id = 0;
+    ASSERT_EQ(fs_->mkdir(parent, "trunc_pdir_src", 0777, 0, 0, 0, &dir_id, &st),
+              0);
+    DEFER(fs_->forget(dir_id, 1));
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_test_file(dir_id, "inner", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+    auto *file = get_file_from_handle(handle);
+
+    const size_t buf_size = 8192;
+    char *buf = new char[buf_size];
+    DEFER(delete[] buf);
+    memset(buf, 'Z', buf_size);
+    ASSERT_EQ(file->pwrite(buf, buf_size, 0), (ssize_t)buf_size);
+
+    ASSERT_EQ(
+        fs_->rename(parent, "trunc_pdir_src", parent, "trunc_pdir_dst", 0), 0);
+
+    struct stat st_sz;
+    memset(&st_sz, 0, sizeof(st_sz));
+    st_sz.st_size = 1024;
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(handle);
+    ASSERT_EQ(fs_->setattr(nodeid, &st_sz, FUSE_SET_ATTR_SIZE, &fi, 0, 0), 0);
+
+    struct stat st2;
+    ASSERT_EQ(fs_->getattr(nodeid, &st2), 0);
+    ASSERT_EQ(st2.st_size, (off_t)1024);
+
+    ASSERT_EQ(fs_->release(nodeid, file), 0);
+
+    int64_t backend_size = -1;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(
+                  hdfs_helper_->full_uri(nodeid_to_path(nodeid)), backend_size),
+              0);
+    ASSERT_EQ(backend_size, (int64_t)1024);
+  }
 };
 
 TEST_F(Ossfs2HdfsSetattrTest, verify_setattr_mode) {
@@ -1648,4 +1838,32 @@ TEST_F(Ossfs2HdfsSetattrTest, verify_dir_mtime_follows_backend) {
   opts.attr_timeout = 1;
   init(opts);
   verify_dir_mtime_follows_backend();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_ftruncate_shrink_after_rename) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_ftruncate_shrink_after_rename();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_ftruncate_extend_after_rename) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_ftruncate_extend_after_rename();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_fallocate_extend_after_rename) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_fallocate_extend_after_rename();
+}
+
+TEST_F(Ossfs2HdfsSetattrTest, verify_ftruncate_shrink_after_parent_dir_rename) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_ftruncate_shrink_after_parent_dir_rename();
 }

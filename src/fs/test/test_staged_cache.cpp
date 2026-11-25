@@ -589,9 +589,9 @@ class Ossfs2StagedInodeCacheTest : public OssOnlyTestSuite {
     uint64_t parent_nodeid = 1;
     for (int j = 0; j < 10; j++) {
       for (uint64_t i = 1; i <= test_num; i++) {
-        fs_->staged_inodes_cache_->insert(parent_nodeid,
-                                          "test_file_" + std::to_string(i), 0,
-                                          {0, 0}, "", i, InodeType::kFile, 0);
+        fs_->staged_inodes_cache_->insert(
+            parent_nodeid, "test_file_" + std::to_string(i), 0, {0, 0},
+            CompactEtag{}, i, InodeType::kFile, 0);
         if (i % 200000 == 0) {
           LOG_DEBUG("inserted ` staged cache nodes", i);
         }

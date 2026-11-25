@@ -170,23 +170,25 @@ class OssHdfsStore : public IObjStore {
   class OssHdfsRawObjHandle : public RawObjHandle {
    public:
     OssHdfsRawObjHandle(JdoStore_t store, JdoIOContext_t io_ctx,
-                        std::string hdfs_path);
+                        std::string uri);
     ~OssHdfsRawObjHandle() override;
 
-    ssize_t read(void *buffer, size_t length) override;
-    ssize_t pread(void *buffer, size_t length, off_t offset) override;
-    ssize_t write(const void *buffer, size_t length) override;
-    int flush() override;
-    int close() override;
-    ssize_t get_length() override;
-    ssize_t tell() override;
-    ssize_t seek(off_t offset) override;
-    int fallocate(off_t offset, off_t length) override;
+    ssize_t read(std::string_view path, void *buffer, size_t length) override;
+    ssize_t pread(std::string_view path, void *buffer, size_t length,
+                  off_t offset) override;
+    ssize_t write(std::string_view path, const void *buffer,
+                  size_t length) override;
+    int flush(std::string_view path) override;
+    int close(std::string_view path) override;
+    ssize_t get_length(std::string_view path) override;
+    ssize_t tell(std::string_view path) override;
+    ssize_t seek(std::string_view path, off_t offset) override;
+    int fallocate(std::string_view path, off_t offset, off_t length) override;
 
    private:
     JdoStore_t store_;
     JdoIOContext_t io_ctx_ = nullptr;
-    std::string path_;
+    std::string uri_;
     bool closed_ = false;
   };
 

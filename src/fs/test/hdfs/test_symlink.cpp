@@ -149,7 +149,7 @@ class Ossfs2HdfsSymlinkTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
 
     // Cleanup: unlink before forgetting creation-time nodeids,
-    // because unlink needs the child in parent's children map.
+    // because unlink needs the child in the parent's child index.
     r = fs_->unlink(parent, "rd_link");
     ASSERT_EQ(r, 0);
     r = fs_->unlink(parent, "rd_target");

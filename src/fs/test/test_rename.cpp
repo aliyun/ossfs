@@ -665,7 +665,11 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
     auto parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
 
-    std::vector<uint64_t> dir_nodeids(4, 0);
+    // Number of base dirs renamed concurrently. Keep it small: heavy
+    // concurrency once slowed a rename copy PUT past the 60s OSS
+    // request timeout.
+    constexpr size_t kConcurrentBaseDirs = 2;
+    std::vector<uint64_t> dir_nodeids(kConcurrentBaseDirs, 0);
     struct stat st;
     for (size_t i = 0; i < dir_nodeids.size(); i++) {
       std::string dir_name = "basedir" + std::to_string(i);

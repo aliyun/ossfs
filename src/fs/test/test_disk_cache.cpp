@@ -224,12 +224,11 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
       auto *h = cache.get(key);
       ASSERT_NE(h, nullptr);
       DEFER(cache.release(h, 0));
-      OssFileSystem::RangeBuffer rb;
-      rb.offset = 0;
-      rb.count = kDataLen;
-      ASSERT_EQ(h->acquire_write_buffer(rb), 0);
-      memcpy(rb.buffer.iovec()[0].iov_base, kData, kDataLen);
-      h->release_write_buffer(rb);
+      auto fill = [&](OssFileSystem::RangeBuffer &rb) -> ssize_t {
+        memcpy(rb.buffer.iovec()[0].iov_base, kData, kDataLen);
+        return kDataLen;
+      };
+      ASSERT_EQ(h->fill_range(0, kDataLen, fill), (ssize_t)kDataLen);
     };
 
     // Reads back through a fresh cache instance: read size on a hit,
@@ -249,17 +248,20 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     };
 
     // 1. Empty etag: size and mtime carry the version.
-    write_through({path, "", mt1, kDataLen});
-    ASSERT_EQ(read_back({path, "", mt1, kDataLen}), (ssize_t)kDataLen);
-    ASSERT_EQ(read_back({path, "", mt2, kDataLen}), (ssize_t)-ENOENT);
-    ASSERT_EQ(read_back({path, "", mt1, kDataLen + 1}), (ssize_t)-ENOENT);
+    CompactEtag etag_empty;
+    CompactEtag etag_x("etag-x");
+    CompactEtag etag_y("etag-y");
+    write_through({path, &etag_empty, mt1, kDataLen});
+    ASSERT_EQ(read_back({path, &etag_empty, mt1, kDataLen}), (ssize_t)kDataLen);
+    ASSERT_EQ(read_back({path, &etag_empty, mt2, kDataLen}), (ssize_t)-ENOENT);
+    ASSERT_EQ(read_back({path, &etag_empty, mt1, kDataLen + 1}),
+              (ssize_t)-ENOENT);
 
     // 2. Non-empty etag: size and mtime are not part of the identity.
-    write_through({path, "etag-x", mt1, kDataLen});
-    ASSERT_EQ(read_back({path, "etag-x", mt2, kDataLen}), (ssize_t)kDataLen);
-    ASSERT_EQ(read_back({path, "etag-x", mt1, kDataLen + 1}),
-              (ssize_t)kDataLen);
-    ASSERT_EQ(read_back({path, "etag-y", mt1, kDataLen}), (ssize_t)-ENOENT);
+    write_through({path, &etag_x, mt1, kDataLen});
+    ASSERT_EQ(read_back({path, &etag_x, mt2, kDataLen}), (ssize_t)kDataLen);
+    ASSERT_EQ(read_back({path, &etag_x, mt1, kDataLen + 1}), (ssize_t)kDataLen);
+    ASSERT_EQ(read_back({path, &etag_y, mt1, kDataLen}), (ssize_t)-ENOENT);
   }
 
   void verify_disk_cache_eviction_when_full() {
@@ -367,10 +369,11 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     LOG_INFO("Physical memory usage: ` KiB.", before_mem_usage);
 
     // Create disk cache files.
+    const CompactEtag no_etag;
     for (uint64_t i = 0; i < file_num; i++) {
       auto name = "test_file" + std::to_string(i);
       auto cache = fs_->create_inode_cache(0);
-      auto h = cache->get({name, ""});
+      auto h = cache->get({name, &no_etag});
       ASSERT_NE(h, nullptr);
       cache->release(h, 0);
       if (i % 100'000 == 0) {
@@ -592,7 +595,7 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
         FaultInjectionId::FI_DiskCache_Key_Collision));
 
     const int kFiles = 10;
-
+    const CompactEtag no_etag;
     // Phase 1: Verify rehash produces valid cache handles.
     // Each file gets its own DiskCache. With collision injection,
     // multiple managers competing for the same base key will be rehashed
@@ -605,7 +608,7 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
         std::string name = "rehash_test_" + std::to_string(i);
         auto mgr = fs_->create_inode_cache(0);
         ASSERT_NE(mgr, nullptr);
-        auto h = mgr->get({name, ""});
+        auto h = mgr->get({name, &no_etag});
         // Core assertion: rehash must succeed for all files.
         // Without rehash, colliding files would get invalid handles
         // (CacheHandle(nullptr, nullptr)); with rehash, each collision is
@@ -836,29 +839,31 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
   void verify_disk_cache_drop_reopens_on_same_key() {
     const std::string object_key = "drop-reopens/file";
     const std::string etag = "etag-v1";
+    const CompactEtag etag_v1(etag);
+    const CompactEtag etag_v2("etag-v2");
     const size_t data_size = 1024 * 1024;
     std::string data = random_string(data_size);
 
     auto cache = fs_->create_inode_cache(0);
     ASSERT_NE(cache, nullptr);
-    auto *h = cache->get({object_key, etag});
+    auto *h = cache->get({object_key, &etag_v1});
     ASSERT_NE(h, nullptr);
     DEFER(cache->release(h, 0));
 
     // Populate the cache file through the write buffer path.
     auto populate = [&]() {
-      RangeBuffer rb;
-      rb.offset = 0;
-      rb.count = data_size;
-      ASSERT_EQ(h->acquire_write_buffer(rb), 0);
-      size_t copied = 0;
-      for (size_t i = 0; i < static_cast<size_t>(rb.buffer.iovcnt()); i++) {
-        memcpy(rb.buffer[i].iov_base, data.data() + copied,
-               rb.buffer[i].iov_len);
-        copied += rb.buffer[i].iov_len;
-      }
-      ASSERT_EQ(copied, data_size);
-      h->release_write_buffer(rb);
+      auto fill = [&](RangeBuffer &rb) -> ssize_t {
+        size_t copied = 0;
+        for (size_t i = 0; i < static_cast<size_t>(rb.buffer.iovcnt()); i++) {
+          memcpy(rb.buffer[i].iov_base, data.data() + copied,
+                 rb.buffer[i].iov_len);
+          copied += rb.buffer[i].iov_len;
+        }
+        EXPECT_EQ(copied, data_size);
+        return copied;
+      };
+      ASSERT_EQ(h->fill_range(0, data_size, fill),
+                static_cast<ssize_t>(data_size));
     };
 
     std::vector<char> buf(data_size);
@@ -868,21 +873,21 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     ASSERT_EQ(memcmp(buf.data(), data.data(), data_size), 0);
 
     // Drop with an unchanged identity still discards the cached data.
-    h->drop({object_key, etag});
+    h->drop({object_key, &etag_v1});
     ASSERT_EQ(h->pread(buf.data(), 0, data_size), -ENOENT);
 
     // Repopulate, then drop with a different identity discards too.
     populate();
     ASSERT_EQ(h->pread(buf.data(), 0, data_size),
               static_cast<ssize_t>(data_size));
-    h->drop({object_key, "etag-v2"});
+    h->drop({object_key, &etag_v2});
     ASSERT_EQ(h->pread(buf.data(), 0, data_size), -ENOENT);
 
     // force=true has no special handling on the disk cache.
     populate();
     ASSERT_EQ(h->pread(buf.data(), 0, data_size),
               static_cast<ssize_t>(data_size));
-    h->drop({object_key, "etag-v2"}, /*force=*/true);
+    h->drop({object_key, &etag_v2}, /*force=*/true);
     ASSERT_EQ(h->pread(buf.data(), 0, data_size), -ENOENT);
   }
 
@@ -1264,12 +1269,12 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
 
   void verify_disk_cache_store_interfaces() {
     const std::string name = "store_iface_file";
-    const std::string etag = "store_iface_etag";
+    const CompactEtag etag("store_iface_etag");
     const size_t kBlockSize = fs_->create_inode_cache(0)->block_size();
 
     auto cache = fs_->create_inode_cache(0);
     ASSERT_NE(cache, nullptr);
-    auto *h = cache->get({name, etag});
+    auto *h = cache->get({name, &etag});
     ASSERT_TRUE(h);
     DEFER(cache->release(h, 0));
 
@@ -1327,8 +1332,8 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
         FaultInjectionId::FI_DiskCache_Init_Failure);
     DEFER(g_fault_injector->clear_injection(
         FaultInjectionId::FI_DiskCache_Init_Failure));
-    h->drop({name, etag});
-    h->drop({name, etag});
+    h->drop({name, &etag});
+    h->drop({name, &etag});
     ASSERT_LT(h->pread(buf, 0, sizeof(buf)), 0);
 
     // Releasing the staged buffer now finds no store: the write must be
@@ -1348,14 +1353,14 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     // serialized through write_mutex_. Concurrent photon writers on the same
     // handle force mutex contention.
     const std::string name = "serialize_write_file";
-    const std::string etag = "serialize_write_etag";
+    const CompactEtag etag("serialize_write_etag");
     const size_t kBlockSize = fs_->create_inode_cache(0)->block_size();
     const int kWriters = 8;
     const int kRounds = 16;
 
     auto cache = fs_->create_inode_cache(0);
     ASSERT_NE(cache, nullptr);
-    auto *h = cache->get({name, etag});
+    auto *h = cache->get({name, &etag});
     ASSERT_TRUE(h);
     DEFER(cache->release(h, 0));
 
@@ -1363,13 +1368,12 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     for (int i = 0; i < kWriters; i++) {
       photon::thread_create11([&]() {
         DEFER(sem.signal(1));
-        for (int r = 0; r < kRounds; r++) {
-          RangeBuffer rb;
-          rb.offset = 0;
-          rb.count = kBlockSize;
-          ASSERT_EQ(h->acquire_write_buffer(rb), 0);
+        auto fill = [&](RangeBuffer &rb) -> ssize_t {
           memset(rb.buffer.iovec()[0].iov_base, 0x5A, rb.buffer.sum());
-          h->release_write_buffer(rb);
+          return kBlockSize;
+        };
+        for (int r = 0; r < kRounds; r++) {
+          ASSERT_EQ(h->fill_range(0, kBlockSize, fill), (ssize_t)kBlockSize);
         }
       });
     }
@@ -1400,6 +1404,7 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     };
 
     const std::string victim = "exhaust_victim";
+    const CompactEtag no_etag;
     auto victim_bucket = bucket_of(victim);
 
     // Find 5 claimers mapping to the same bucket as the victim. Claimed
@@ -1417,7 +1422,7 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     for (auto &name : claimers) {
       auto mgr = fs_->create_inode_cache(0);
       ASSERT_NE(mgr, nullptr);
-      auto *h = mgr->get({name, ""});
+      auto *h = mgr->get({name, &no_etag});
       ASSERT_TRUE(h);
       mgrs.push_back(mgr);
       handles.push_back(h);
@@ -1432,7 +1437,7 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
     // exhausted and get() returns nullptr instead of a broken handle.
     auto victim_mgr = fs_->create_inode_cache(0);
     ASSERT_NE(victim_mgr, nullptr);
-    auto *victim_h = victim_mgr->get({victim, ""});
+    auto *victim_h = victim_mgr->get({victim, &no_etag});
     ASSERT_EQ(victim_h, nullptr);
   }
 
@@ -1540,7 +1545,7 @@ class Ossfs2DiskCacheTest : public Ossfs2TestSuite {
       std::string new_path = nodeid_to_path(nodeid);
       auto probe = fs_->create_inode_cache(0);
       ASSERT_NE(probe, nullptr);
-      CacheKey probe_key{new_path, inode->etag};
+      CacheKey probe_key{new_path, &inode->etag};
       auto *probe_h = probe->get(probe_key);
       ASSERT_NE(probe_h, nullptr);
       DEFER(probe->release(probe_h, 0));

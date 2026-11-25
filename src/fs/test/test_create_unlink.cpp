@@ -199,6 +199,49 @@ class Ossfs2CreateUnlinkTest : public Ossfs2TestSuite {
     r = fs_->rmdir(dir_nodeid, "whatever_dir");
     ASSERT_EQ(r, -ESTALE);
   }
+
+  // The dir is non-empty on the backend but empty in the local children cache
+  // (no readdir/lookup of a child). With rmdir_complete_empty_check on, rmdir
+  // must consult the backend and return ENOTEMPTY.
+  void verify_rmdir_remote_nonempty_no_local_cache() {
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    auto parent_path = nodeid_to_path(parent);
+
+    // Build a non-empty dir directly on the backend, bypassing FUSE.
+    std::string dir_name = "remote_nonempty_dir";
+    std::string dir_path = join_paths(parent_path, dir_name);
+    ASSERT_EQ(create_dir(dir_path, FLAGS_oss_bucket_prefix), 0);
+    DEFER(delete_dir(dir_path, FLAGS_oss_bucket_prefix));
+
+    std::string local_file = join_paths(test_path_, "inner_file.dat");
+    create_random_file(local_file, 1);
+    ASSERT_EQ(upload_file(local_file, join_paths(dir_path, "inner_file"),
+                          FLAGS_oss_bucket_prefix),
+              0);
+
+    // lookup creates the dir inode but does NOT populate its children.
+    uint64_t dir_nodeid = 0;
+    ASSERT_EQ(fs_->lookup(parent, dir_name.c_str(), &dir_nodeid, &st), 0);
+    DEFER(fs_->forget(dir_nodeid, 1));
+
+    // rmdir must consult the backend and fail with ENOTEMPTY.
+    ASSERT_EQ(fs_->rmdir(parent, dir_name.c_str()), -ENOTEMPTY);
+
+    // A readdir syncs the local children cache; removing the file via FUSE
+    // marks it stale locally and deletes it remotely. Both sides then agree
+    // the dir is empty, so rmdir succeeds.
+    std::vector<TestInode> childs;
+    ASSERT_EQ(read_dir_without_dots(dir_nodeid, childs), 0);
+    ASSERT_SIZE_EQ(childs.size(), 1);
+    ASSERT_EQ(childs[0].name, "inner_file");
+
+    ASSERT_EQ(fs_->unlink(dir_nodeid, "inner_file"), 0);
+    fs_->forget(childs[0].nodeid, 1);
+
+    ASSERT_EQ(fs_->rmdir(parent, dir_name.c_str()), 0);
+  }
 };
 
 TEST_F(Ossfs2CreateUnlinkTest, verify_basic_create_unlink_files) {
@@ -224,4 +267,14 @@ TEST_F(Ossfs2CreateUnlinkTest, verify_unlink_rmdir) {
   SET_TEST_MODE(kTestOss | kTestHdfs);
   init(opts);
   verify_unlink_rmdir();
+}
+
+TEST_F(Ossfs2CreateUnlinkTest, verify_rmdir_remote_nonempty_no_local_cache) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  // The remote emptiness check is opt-in; enable it for this case.
+  opts.rmdir_complete_empty_check = true;
+  SET_TEST_MODE(kTestOss | kTestHdfs);
+  init(opts);
+  verify_rmdir_remote_nonempty_no_local_cache();
 }

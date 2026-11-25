@@ -77,8 +77,8 @@ static int try_get_path(Inode *parent, std::string_view name, std::string *path,
   if (path) nodes.reserve(10);
   if (!name.empty()) {
     RELEASE_ASSERT(inode->is_dir());
-    // Find the child inode. It's safe here as the child map is also protected
-    // by global inode map lock.
+    // Find the child inode. It's safe here as the child index is also
+    // protected by global inode map lock.
     last = static_cast<DirInode *>(inode)->find_child_node(name);
     if (last && !last->is_stale) {
       if (last->pathlock != 0) {

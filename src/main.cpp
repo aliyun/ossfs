@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <photon/common/executor/executor.h>
 #include <photon/io/signal.h>
+#include <photon/thread/stack-allocator.h>
 #include <pwd.h>
 #include <signal.h>
 #include <sys/resource.h>
@@ -53,6 +54,7 @@ static OssFileSystem::BackgroundVCpuEnv g_bg_vcpu_env;
 static std::string g_mountpoint;
 static bool g_log_to_stdout = false;
 static bool g_log_to_syslog = false;
+static bool g_use_default_permissions = false;
 
 std::tuple<std::string, std::string> get_oss_credentials() {
   // Use env vars if they are not specified in the command line or the config
@@ -139,6 +141,18 @@ int create_background_obj_stores() {
   options.user_agent = kUserAgentPrefix + MACRO_STR(OSSFS_VERSION_ID);
   options.region = FLAGS_oss_region;
   options.request_timeout_us = FLAGS_oss_request_timeout_ms * 1000;
+  if (FLAGS_oss_max_idle_timeout_ms > 0) {
+    options.connection_idle_expiration_us =
+        FLAGS_oss_max_idle_timeout_ms * 1000;
+  }
+  options.retry_times = FLAGS_oss_request_max_retries;
+  if (!parse_oss_additional_headers(FLAGS_oss_additional_headers,
+                                    &options.custom_headers)) {
+    LOG_ERROR("Invalid oss_additional_headers");
+    return -EINVAL;
+  }
+  options.qps_limit_total_retry_time_us =
+      FLAGS_oss_qps_limit_retry_timeout_ms * 1000;
   options.endpoint = endpoint;
   options.bucket = bucket;
   // TODO: validate all ip addresses that can access OSS.
@@ -154,6 +168,11 @@ int create_background_obj_stores() {
   options.enable_symlink = FLAGS_enable_symlink;
   options.auto_create_bucket = FLAGS_auto_create_bucket;
   options.agentic_bucket = FLAGS_agentic_bucket;
+  if (FLAGS_skip_check_bucket && FLAGS_auto_create_bucket) {
+    LOG_ERROR(
+        "skip_check_bucket and auto_create_bucket are mutually exclusive");
+    return -EINVAL;
+  }
 
   // Fallback to OSSFS_PROXY env var when --http_proxy is not explicitly set.
   if (gflags::GetCommandLineFlagInfoOrDie("http_proxy").is_default) {
@@ -457,6 +476,7 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->allow_rename_dir = FLAGS_allow_rename_dir;
   fs_options->rename_dir_concurrency = FLAGS_rename_dir_concurrency;
   fs_options->rename_dir_limit = FLAGS_rename_dir_limit;
+  fs_options->rmdir_complete_empty_check = FLAGS_rmdir_complete_empty_check;
 
   fs_options->enable_crc64 = FLAGS_enable_crc64;
   fs_options->enable_transmission_control = FLAGS_enable_transmission_control;
@@ -497,8 +517,8 @@ static int init_fs_options(OssFileSystem::OssFsOptions *fs_options) {
   fs_options->credential_process = FLAGS_credential_process;
   fs_options->credential_refresh_interval = FLAGS_credential_refresh_interval;
   fs_options->credential_refresh_backoff = FLAGS_credential_refresh_backoff;
+  fs_options->skip_check_bucket = FLAGS_skip_check_bucket;
 
-  mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
   fs_options->cache_refill_unit = fs_options->cache_block_size;
   fs_options->min_reserved_buffer_size_per_file =
       FLAGS_min_reserved_buffer_size_per_file;
@@ -649,16 +669,36 @@ static void dump_mount_options() {
   }
 }
 
+static bool is_flag_explicit(std::string_view name) {
+  return !gflags::GetCommandLineFlagInfoOrDie(std::string(name).c_str())
+              .is_default;
+}
+
+// Keyed on path value: explicit --log_dir=/tmp/ossfs2 is still the default dir.
+static bool is_default_log_dir_path(const std::string &log_dir) {
+  const auto info = gflags::GetCommandLineFlagInfoOrDie("log_dir");
+  return normalize_path(log_dir) == normalize_path(info.default_value);
+}
+
 static void warn_inapplicable_options(bool is_hdfs) {
-  auto is_explicitly_set = [](std::string_view name) {
-    return !gflags::GetCommandLineFlagInfoOrDie(std::string(name).c_str())
-                .is_default;
-  };
   for (const auto &name :
-       OptionsRegistry::get_inapplicable_options(is_hdfs, is_explicitly_set)) {
+       OptionsRegistry::get_inapplicable_options(is_hdfs, is_flag_explicit)) {
     LOG_WARN("option --` only applies to ` mode, ignored in ` mode", name,
              is_hdfs ? "OSS" : "HDFS", is_hdfs ? "HDFS" : "OSS");
   }
+}
+
+// OSS objects carry no POSIX metadata, so kernel permission checks only break
+// owner-only ops for everyone but the mounter. Enforce them in OSS mode only
+// when a permission policy was actually configured.
+static bool resolve_default_permissions(bool is_hdfs) {
+  if (is_hdfs || is_flag_explicit("default_permissions")) {
+    return FLAGS_default_permissions;
+  }
+  for (const char *name : {"uid", "gid", "file_mode", "dir_mode"}) {
+    if (is_flag_explicit(name)) return true;
+  }
+  return false;
 }
 
 static void trim_mount_options() {
@@ -675,7 +715,8 @@ static void trim_mount_options() {
   }
 }
 
-static void init_logger() {
+// File logging is mandatory: an unsafe log dir fails the mount.
+static int init_logger() {
   int log_level = FLAGS_log_level == "debug" ? ALOG_DEBUG : ALOG_INFO;
 
   if (g_log_to_syslog) {
@@ -686,27 +727,33 @@ static void init_logger() {
     log_output_level = ALOG_ERROR;
     set_ossfs_log_to_syslog(log_level);
     set_default_logger_output_to_syslog(ALOG_ERROR);
-    return;
+    return 0;
   }
 
   if (!g_log_to_stdout) {
-    std::string base = FLAGS_log_dir;
-    base = get_log_file_base_dir(base);
-    auto r = access(base.c_str(), R_OK | W_OK | X_OK);
-    if (r != 0) r = mkdir(base.c_str(), 0755);
-    if (r == 0) {
-      // TODO: use filelock to avoid log files being overwritten by multiple
-      // instances
-      base = join_paths(base, LOG_FILE_PREFIX);
-      if (FLAGS_enable_photon_logs) {
-        log_output_file(base.c_str(), FLAGS_log_file_max_size,
-                        FLAGS_log_file_max_count);
-        log_output_level = log_level;
-      } else {
-        set_ossfs_log_setting(base.c_str(), FLAGS_log_file_max_size,
-                              FLAGS_log_file_max_count, -1UL, log_level);
-        set_default_logger_output_to_ossfs_log_file(ALOG_ERROR);
+    // The log dirs were validated in main() before daemonize.
+    // TODO: use filelock to avoid log files being overwritten by multiple
+    // instances
+    std::string base =
+        join_paths(get_log_file_base_dir(FLAGS_log_dir), LOG_FILE_PREFIX);
+    if (FLAGS_enable_photon_logs) {
+      if (log_output_file(base.c_str(), FLAGS_log_file_max_size,
+                          FLAGS_log_file_max_count) != 0) {
+        fprintf(stderr, "ERROR: failed to open log file %s: %s\n", base.c_str(),
+                strerror(errno));
+        return -1;
       }
+      log_output_level = log_level;
+    } else {
+      // Cache is_default so runtime recreate reuses the mount-time policy.
+      if (set_ossfs_log_setting(base.c_str(), FLAGS_log_file_max_size,
+                                FLAGS_log_file_max_count, -1UL, log_level,
+                                is_default_log_dir_path(FLAGS_log_dir)) != 0) {
+        fprintf(stderr, "ERROR: failed to open log file %s: %s\n", base.c_str(),
+                strerror(errno));
+        return -1;
+      }
+      set_default_logger_output_to_ossfs_log_file(ALOG_ERROR);
     }
   } else {
     if (FLAGS_enable_photon_logs) {
@@ -716,6 +763,7 @@ static void init_logger() {
       set_ossfs_log_to_stdout(log_level);
     }
   }
+  return 0;
 }
 
 static void test_handler(int sig) {
@@ -746,7 +794,7 @@ static int set_one_signal_handler(int sig, void (*handler)(int)) {
 static int create_ossfs_and_run_fuse(struct fuse_args &args,
                                      struct fuse_cmdline_opts &fuse_opts,
                                      int pipefd) {
-  init_logger();
+  if (init_logger() != 0) return -1;
 
   LOG_INFO("Ossfs2 version: `(`)", MACRO_STR(OSSFS_VERSION_ID),
            std::string_view(MACRO_STR(OSSFS_COMMIT_ID)).substr(0, 8));
@@ -787,6 +835,9 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
   warn_inapplicable_options(
       OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint));
   dump_mount_options();
+  // dump_mount_options() logs the raw flag; log the resolved value here.
+  LOG_INFO("kernel permission checks (default_permissions): `",
+           g_use_default_permissions ? "enabled" : "disabled");
   err = init_fs_options(&fs_options);
   if (err != 0) {
     goto exit;
@@ -1044,6 +1095,12 @@ static void do_show_mount_help() {
 }
 
 int main(int argc, char *argv[]) {
+  mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+  mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
+
+  photon::use_pooled_stack_allocator();
+  photon::pooled_stack_trim_threshold(64UL * 1024 * 1024);
+
   int r = 0;
   bool stats_continue = false;
   std::string mount_config, mountpoint, mountpoint_param, metrics_filter;
@@ -1165,6 +1222,11 @@ int main(int argc, char *argv[]) {
     g_log_to_stdout =
         FLAGS_log_dir == DEV_STDOUT ||
         (gflags::GetCommandLineFlagInfoOrDie("log_dir").is_default && FLAGS_f);
+    // An empty --log_dir would bypass hardening with a CWD-relative path.
+    if (!g_log_to_stdout && !g_log_to_syslog && FLAGS_log_dir.empty()) {
+      fprintf(stderr, "ERROR: --log_dir must not be empty\n");
+      return -1;
+    }
     if (g_log_to_stdout || g_log_to_syslog) FLAGS_log_dir.clear();
 
     if (FLAGS_fuse_device_fd < 0) {
@@ -1228,8 +1290,14 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // Ensure log directory has 0777 permission for log rotation tools.
-    if (!FLAGS_log_dir.empty()) ::chmod(FLAGS_log_dir.c_str(), 0777);
+    // Secure log dirs before daemonize and before the HDFS SDK uses them.
+    if (!FLAGS_log_dir.empty()) {
+      if (!secure_shared_log_dir(FLAGS_log_dir,
+                                 is_default_log_dir_path(FLAGS_log_dir)))
+        return -1;
+      const std::string log_base = get_log_file_base_dir(FLAGS_log_dir);
+      if (!secure_private_log_dir(log_base)) return -1;
+    }
 
     const std::string &dir = FLAGS_disk_data_cache_dir;
     if (!dir.empty()) {
@@ -1267,14 +1335,9 @@ int main(int argc, char *argv[]) {
       fuse_opt_add_arg(&args, "-oallow_other");
     }
 
-    // Handle default_permissions: OSS mode forces true, HDFS mode configurable.
-    bool use_default_permissions;
-    if (OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint)) {
-      use_default_permissions = FLAGS_default_permissions;
-    } else {
-      use_default_permissions = true;
-    }
-    if (use_default_permissions) {
+    g_use_default_permissions = resolve_default_permissions(
+        OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint));
+    if (g_use_default_permissions) {
       fuse_opt_add_arg(&args, "-odefault_permissions");
     }
     fuse_opt_add_arg(&args, "-osubtype=ossfs2");

@@ -511,7 +511,7 @@ class Ossfs2OpenCloseTest : public Ossfs2TestSuite {
     ASSERT_EQ(r, 0);
 
     auto meta = get_file_meta(filename, FLAGS_oss_bucket_prefix);
-    ASSERT_EQ(inode->etag, add_dquo(meta["Etag"]));
+    ASSERT_EQ(inode->etag.to_string(), add_dquo(meta["Etag"]));
     ASSERT_FALSE(inode->invalidate_data_cache)
         << "open must clear the flag after consuming it";
 

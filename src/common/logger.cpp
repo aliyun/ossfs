@@ -34,6 +34,8 @@
 #include <mutex>
 #include <thread>
 
+#include "common/utils.h"
+
 using namespace std;
 
 ALogLogger *ossfs_logger_ptr = &default_logger;
@@ -82,6 +84,7 @@ class LogOutputFile final : public BaseLogOutput {
   char *log_file_name = nullptr;
   atomic<uint64_t> log_file_size{0};
   unsigned int log_file_max_cnt = 10;
+  bool is_default_log_dir = false;
 
   void destruct() override {
     log_output_file_close();
@@ -90,7 +93,17 @@ class LogOutputFile final : public BaseLogOutput {
 
   int fopen(const char *fn) {
     auto mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-    return open(fn, O_CREAT | O_WRONLY | O_APPEND, mode);
+    // Reject symlinked/foreign files; O_NONBLOCK avoids reader-less FIFO hangs.
+    int fd =
+        open(fn, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK, mode);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
+      close(fd);
+      errno = EACCES;
+      return -1;
+    }
+    return fd;
   }
 
   void write(int, const char *begin, const char *end) override {
@@ -134,7 +147,7 @@ class LogOutputFile final : public BaseLogOutput {
   }
 
   int log_output_file_setting(const char *fn, uint64_t rotate_limit,
-                              int max_log_files) {
+                              int max_log_files, bool is_default) {
     int fd = fopen(fn);
     if (fd < 0) return -1;
 
@@ -142,14 +155,17 @@ class LogOutputFile final : public BaseLogOutput {
     free(log_file_name);
     log_file_name = strdup(fn);
     log_file_size_limit = max(rotate_limit, (uint64_t)(1024 * 1024));
+    is_default_log_dir = is_default;
     return 0;
   }
 
-  // open(O_CREAT) cannot create parent directories
-  static void recreate_log_dir(const char *fn) {
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(fn).parent_path(),
-                                        ec);
+  // Rebuild via the secure helpers; shared first sets policy, private's
+  // ancestor pass only re-vets it read-only (a deleted dir can't be swapped).
+  void recreate_log_dir(const char *fn) {
+    std::filesystem::path parent = std::filesystem::path(fn).parent_path();
+    std::string shared = parent.parent_path().string();
+    if (!secure_shared_log_dir(shared, is_default_log_dir)) return;
+    secure_private_log_dir(parent.string());
   }
 
   void reopen_log_output_file() {
@@ -276,9 +292,10 @@ ALogLogger ossfs_logger{ossfs_log_output_stdout, ALOG_DEBUG};
 static LogOutputFile ossfs_log_output_file;
 
 int set_ossfs_log_setting(const char *fn, uint64_t rotate_limit,
-                          int max_log_files, uint64_t throttle, int log_level) {
-  int ret = ossfs_log_output_file.log_output_file_setting(fn, rotate_limit,
-                                                          max_log_files);
+                          int max_log_files, uint64_t throttle, int log_level,
+                          bool is_default_log_dir) {
+  int ret = ossfs_log_output_file.log_output_file_setting(
+      fn, rotate_limit, max_log_files, is_default_log_dir);
   if (ret < 0) LOG_ERROR_RETURN(0, -1, "Fail to open log file ", fn);
   ossfs_log_output_file.set_throttle(throttle);
   ossfs_logger.log_output = &ossfs_log_output_file;
@@ -289,6 +306,7 @@ int set_ossfs_log_setting(const char *fn, uint64_t rotate_limit,
 }
 
 void set_ossfs_log_to_stdout(int log_level) {
+  ossfs_logger.log_output = ossfs_log_output_stdout;
   ossfs_logger.log_level = log_level;
   ossfs_logger_ptr = &ossfs_logger;
 }

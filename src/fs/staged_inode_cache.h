@@ -22,6 +22,7 @@
 
 #include <string>
 
+#include "common/compact_etag.h"
 #include "common/lru_map.h"
 #include "inode.h"
 
@@ -34,7 +35,7 @@ class StagedInodeCache {
   struct CacheEntry {
     uint64_t size;
     struct timespec mtime;
-    std::string etag;
+    CompactEtag etag;
     // The original inode's nodeid should be cached. Consider this case:
     // There is a non-empty dir: dir/. All of them are forgotten, and inserted
     // to the lru cache. The next time we want to lookup them, the dir's inode
@@ -45,7 +46,7 @@ class StagedInodeCache {
     InodeType type;
     time_t attr_time;
 
-    CacheEntry(uint64_t size, struct timespec mtime, std::string_view etag,
+    CacheEntry(uint64_t size, struct timespec mtime, const CompactEtag &etag,
                uint64_t nodeid, InodeType type, time_t attr_time)
         : size(size),
           mtime(mtime),
@@ -76,7 +77,7 @@ class StagedInodeCache {
   }
 
   void insert(uint64_t parent_nodeid, std::string_view name, uint64_t size,
-              struct timespec mtime, std::string_view etag, uint64_t nodeid,
+              struct timespec mtime, const CompactEtag &etag, uint64_t nodeid,
               InodeType type, time_t attr_time) {
     auto entry = std::make_unique<CacheEntry>(size, mtime, etag, nodeid, type,
                                               attr_time);

@@ -24,6 +24,7 @@
 
 #include "async_task.h"
 #include "bg_vcpu_env.h"
+#include "common/compact_etag.h"
 #include "common/fault_injector.h"
 #include "common/filesystem.h"
 #include "common/logger.h"
@@ -85,6 +86,8 @@
   } while (0)
 
 namespace OssFileSystem {
+
+class HdfsFileHandle;
 
 enum class CacheType : uint8_t {
   // kFhCache mode binds memory cache data to file handles.
@@ -149,6 +152,8 @@ struct OssFsOptions {
   int32_t rename_dir_concurrency = 128;
   bool set_mime_for_rename_dst = false;
 
+  bool rmdir_complete_empty_check = false;
+
   bool enable_crc64 = true;
   bool enable_transmission_control = false;
   uint64_t tc_max_latency_threshold_us = 2000000;
@@ -174,6 +179,11 @@ struct OssFsOptions {
   uint64_t credential_refresh_interval =
       0;  // 0 means use default expiration-based strategy.
   bool credential_refresh_backoff = false;
+
+  // Skip the mount-time bucket existence validation. This only bypasses the
+  // initial mount check; periodic credential revalidation still probes the
+  // backend, so refreshed credentials are never accepted unverified.
+  bool skip_check_bucket = false;
 
   bool enable_admin_server = true;
   bool enable_symlink = false;
@@ -385,20 +395,25 @@ class OssFs : public IFileSystemFuseLL {
                                   const std::string &full_path,
                                   struct stat *stbuf,
                                   struct Attribute *old_attr = nullptr,
-                                  std::string *old_etag = nullptr);
+                                  CompactEtag *old_etag = nullptr);
+  // Unified OSS stat boundary: the raw etag text returned by the backend is
+  // parsed into CompactEtag exactly once here. Pass etag == nullptr when the
+  // caller does not need the etag.
+  int stat_remote(std::string_view path, struct stat *stbuf, CompactEtag *etag);
+
   int lookup_get_remote_attr(DirInode *parent_inode, std::string_view name,
                              const std::string &full_path, struct stat *stbuf,
-                             std::string *remote_etag, time_t *attr_time);
+                             CompactEtag *remote_etag, time_t *attr_time);
   int lookup_update_local_cache(DirInode *parent_inode, std::string_view name,
                                 bool acquire_write_path_lock,
                                 Inode *wlocked_inode,
                                 const std::string &full_path,
                                 const struct Attribute &old_attr,
-                                const std::string &old_etag, int req_status,
+                                const CompactEtag &old_etag, int req_status,
                                 struct stat *stbuf,
-                                const std::string &remote_etag);
+                                const CompactEtag &remote_etag);
   void lookup_create_new_inode(DirInode *parent_inode, std::string_view name,
-                               const std::string &etag,
+                               const CompactEtag &etag,
                                const uint64_t allocated_nodeid,
                                struct stat *stbuf, time_t *attr_time);
   int lookup_with_inode_ref(DirInode *parent_inode, std::string_view name,
@@ -442,9 +457,7 @@ class OssFs : public IFileSystemFuseLL {
                    void *filler_ctx);
 
   void try_update_inode_attr_from_list(Inode *inode, struct stat *stbuf,
-                                       std::string_view remote_etag,
-                                       mode_t perm = 0, uid_t uid = 0,
-                                       gid_t gid = 0);
+                                       const CompactEtag &remote_etag);
 
   std::shared_ptr<ICache> create_inode_cache(uint64_t file_size);
   void evict_inode_cache(FileInode *inode, std::string_view path);
@@ -462,8 +475,9 @@ class OssFs : public IFileSystemFuseLL {
 
   Inode *create_new_inode(uint64_t file_nodeid, std::string_view file_name,
                           uint64_t file_size, struct timespec file_mtime,
-                          InodeType type, bool is_dirty, uint64_t parent_nodeid,
-                          Inode *parent_node, std::string_view remote_etag,
+                          struct timespec file_atime, InodeType type,
+                          bool is_dirty, uint64_t parent_nodeid,
+                          Inode *parent_node, const CompactEtag &remote_etag,
                           mode_t perm = 0, uid_t uid = 0, gid_t gid = 0);
 
   // Staged cache related
@@ -481,7 +495,7 @@ class OssFs : public IFileSystemFuseLL {
   bool lookup_from_staged_cache_if_enabled(uint64_t parent_nodeid,
                                            std::string_view name,
                                            struct stat *stbuf = nullptr,
-                                           std::string *remote_etag = nullptr,
+                                           CompactEtag *remote_etag = nullptr,
                                            time_t *attr_time = nullptr);
   bool exists_in_staged_cache(uint64_t parent_nodeid, std::string_view name);
 
@@ -543,14 +557,28 @@ class OssFs : public IFileSystemFuseLL {
   }
 
   void refresh_inode_etag(Inode *inode, const struct stat *stbuf,
-                          std::string_view remote_etag) {
+                          const CompactEtag &remote_etag) {
     if (!inode->is_file()) return;
     static_cast<FileInode *>(inode)->refresh_etag(stbuf, remote_etag);
   }
 
-  std::string_view get_inode_etag(Inode *inode) {
-    if (!inode->is_file()) return {};
-    return static_cast<FileInode *>(inode)->etag;
+  // Adopt a fresh remote stat; stbuf is its only carrier, so callers whose
+  // probe reports permission or owner separately must fold them in first.
+  // refresh_inode_etag() must run before update_attr() overwrites the size.
+  void apply_remote_stat(Inode *inode, const struct stat *stbuf,
+                         const CompactEtag &remote_etag) {
+    refresh_inode_etag(inode, stbuf, remote_etag);
+    inode->set_mode(stbuf->st_mode);
+    inode->set_uid(stbuf->st_uid);
+    inode->set_gid(stbuf->st_gid);
+    inode->update_attr(stbuf->st_size, stbuf->st_mtim, stbuf->st_atim);
+    resync_randwrite_remote_size(inode);
+  }
+
+  const CompactEtag &get_inode_etag(const Inode *inode) {
+    static const CompactEtag kEmptyEtag;
+    if (!inode->is_file()) return kEmptyEtag;
+    return static_cast<const FileInode *>(inode)->etag;
   }
 
   void run_health_check();
@@ -566,10 +594,12 @@ class OssFs : public IFileSystemFuseLL {
   int force_refresh_creds(uint64_t observed_gen);
   void register_creds_refresh_handler();
   uint64_t refresh_creds();
-  std::pair<int, uint64_t> do_refresh_creds(bool allow_auto_create = false);
+  std::pair<int, uint64_t> do_refresh_creds(bool allow_auto_create = false,
+                                            bool skip_validation = false);
   void update_creds(const ObjCredentials &creds, const CredsMeta &meta);
   int validate_creds(const ObjCredentials &creds,
-                     bool allow_auto_create = false);
+                     bool allow_auto_create = false,
+                     bool skip_validation = false);
 
   void init_hdfs_root_inode();
 
@@ -588,9 +618,15 @@ class OssFs : public IFileSystemFuseLL {
   int do_hdfs_setattr_size(uint64_t nodeid, Inode *inode,
                            std::string_view full_path, off_t target_size,
                            uid_t caller_uid, gid_t caller_gid);
-  int do_hdfs_ftruncate(uint64_t nodeid, Inode *inode, off_t target_size,
+  int do_hdfs_ftruncate(uint64_t nodeid, Inode *inode,
+                        std::string_view cur_path, off_t target_size,
                         struct fuse_file_info *fi, uid_t caller_uid,
                         gid_t caller_gid);
+  int refresh_attr_if_expired(Inode *inode, std::string_view full_path);
+
+  // HDFS-mode only: centralize the fuse fh -> HdfsFileHandle downcast so the
+  // cast flavor and the mode precondition are audited in one place.
+  HdfsFileHandle *as_hdfs_handle(void *fh);
 
   void staging_disk_usage_update(int64_t old_bytes, int64_t new_bytes) {
     if (old_bytes < 0 || new_bytes < 0 || old_bytes == new_bytes) return;

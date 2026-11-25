@@ -36,34 +36,36 @@ class BlockCacheTest : public ::testing::Test {
   }
 
   std::string etag_of(CacheHandle *h) {
-    return store_of(h)->current_etag_;
+    return store_of(h)->current_etag_.to_string();
   }
 };
 
 TEST_F(BlockCacheTest, verify_get_initializes_identity_only_once) {
   auto pool = std::make_shared<FixedBlockMemoryPool>(kBlockSize, 50, 5, 0);
   BlockCache manager(pool);
+  CompactEtag etag_a("etagA");
+  CompactEtag etag_b("etagB");
 
   // The first get() creates the store and initializes its identity.
-  auto h1 = manager.get(CacheKey{"obj", "etagA"});
+  auto h1 = manager.get(CacheKey{"obj", &etag_a});
   ASSERT_TRUE(h1);
   ASSERT_EQ(etag_of(h1), "etagA");
   uint64_t gen = generation_of(h1);
 
   // A later get() carrying a different etag must not relabel the existing
   // store: the identity stays "etagA" and nothing is invalidated.
-  auto h2 = manager.get(CacheKey{"obj", "etagB"});
+  auto h2 = manager.get(CacheKey{"obj", &etag_b});
   ASSERT_TRUE(h2);
   ASSERT_TRUE(share_cache_store(h1, h2));
   ASSERT_EQ(etag_of(h1), "etagA");
   ASSERT_EQ(generation_of(h1), gen);
 
   // Identity is subsequently maintained by drop(): same etag is a no-op...
-  store_of(h1)->drop({"obj", "etagA"}, /*force=*/false);
+  store_of(h1)->drop({"obj", &etag_a}, /*force=*/false);
   ASSERT_EQ(generation_of(h1), gen);
 
   // ...while a different etag bumps the generation and re-states it.
-  store_of(h1)->drop({"obj", "etagB"}, kBlockSize);
+  store_of(h1)->drop({"obj", &etag_b}, kBlockSize);
   ASSERT_EQ(generation_of(h1), gen + 1);
   ASSERT_EQ(etag_of(h1), "etagB");
 
