@@ -16,6 +16,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <photon/net/utils.h>
 #include <unistd.h>
 
 #include <filesystem>
@@ -399,6 +400,66 @@ TEST(CommonUtilsTest, split_string) {
   ASSERT_EQ(result.size(), 2ULL);
   EXPECT_EQ(result[0], "a");
   EXPECT_EQ(result[1], "b;c:d");
+}
+
+TEST(CommonUtilsTest, parse_oss_additional_headers) {
+  std::vector<std::pair<std::string, std::string>> headers = {{"old", "value"}};
+  ASSERT_TRUE(parse_oss_additional_headers("", &headers));
+  EXPECT_TRUE(headers.empty());
+  ASSERT_TRUE(parse_oss_additional_headers(" \t ", &headers));
+  EXPECT_TRUE(headers.empty());
+  ASSERT_TRUE(parse_oss_additional_headers("a=Yg==; c=ZA==; e=Zg==", &headers));
+  const std::vector<std::pair<std::string, std::string>> basic = {
+      {"a", "b"}, {"c", "d"}, {"e", "f"}};
+  EXPECT_EQ(headers, basic);
+
+  ASSERT_TRUE(parse_oss_additional_headers(
+      "X-Oss-User-Hint-Traffic-Class=Y29wcGVy;x-myapp_value.name="
+      "YSxiOmM9ZDtcXyUyRis/;x-empty=",
+      &headers));
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {"x-oss-user-hint-traffic-class", "copper"},
+      {"x-myapp_value.name", R"(a,b:c=d;\_%2F+?)"},
+      {"x-empty", ""}};
+  EXPECT_EQ(headers, expected);
+  ASSERT_TRUE(parse_oss_additional_headers(
+      " \tx-myapp-text = IAnkuK3mlocJdmFsdWUgCQ== \t", &headers));
+  EXPECT_EQ(headers[0].second, " \t中文\tvalue \t");
+  ASSERT_TRUE(parse_oss_additional_headers("x-myapp-value=gA==", &headers));
+  EXPECT_EQ(headers[0].second, "\x80");
+  ASSERT_TRUE(parse_oss_additional_headers("x-myapp-value=+/8=", &headers));
+  EXPECT_EQ(headers[0].second, "\xfb\xff");
+  ASSERT_TRUE(parse_oss_additional_headers(
+      "x-myapp-id=Zmlyc3Q=;X-Myapp-Id=c2Vjb25k", &headers));
+  const std::vector<std::pair<std::string, std::string>> duplicates = {
+      {"x-myapp-id", "first"}, {"x-myapp-id", "second"}};
+  EXPECT_EQ(headers, duplicates);
+
+  for (const auto &input :
+       {"x",       "=YQ==",    "x:a=YQ==",       "x a=YQ==",       "x\ta=YQ==",
+        "x=YQ==;", ";x=YQ==",  "x=YQ==;;y=Yg==", "missing;x=YQ==", "x=copper",
+        "x=YQ",    "x=YQ===",  "x=Y===",         "x=YW$h",         "x=____",
+        "x=Y Q==", "x=YQ==\r", "x=YQ==\n",       "x=YQ1i",         "x=YQpi",
+        "x=YQBi"}) {
+    auto previous = headers;
+    EXPECT_FALSE(parse_oss_additional_headers(input, &headers)) << input;
+    EXPECT_EQ(headers, previous);
+  }
+  EXPECT_FALSE(
+      parse_oss_additional_headers(std::string("x=YQ==\0", 7), &headers));
+  for (const auto &name : {"Host", "Authorization", "Range", "x-myapp-id",
+                           "X-Oss-Date", "X-Oss-Copy-Source"}) {
+    ASSERT_TRUE(
+        parse_oss_additional_headers(std::string(name) + "=dmFsdWU=", &headers))
+        << name;
+    EXPECT_EQ(headers[0].second, "value");
+  }
+  std::string value(16 * 1024, 'a');
+  std::string encoded;
+  photon::net::Base64Encode(value, encoded);
+  ASSERT_TRUE(
+      parse_oss_additional_headers("x-myapp-value=" + encoded, &headers));
+  EXPECT_EQ(headers[0].second, value);
 }
 
 TEST(CommonUtilsTest, path) {

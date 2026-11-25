@@ -6,7 +6,7 @@
 
 OSSFS2 is a high-performance file client for mounting an [Alibaba Cloud OSS (Object Storage Service)](https://www.alibabacloud.com/en/product/object-storage-service) bucket as a local filesystem. It has excellent sequential read and write throughput that fully leverage the high bandwidth advantages of OSS.
 
-It is optimized for applications with high storage performance requirements, such as AI training, inference, big data processing, autonomous driving, and other new compute-intensive workloads. These workloads primarily involve sequential and random reads, sequential (append-only) write operations, and do not require full POSIX semantics.
+It is optimized for applications with high storage performance requirements, such as AI training, inference, big data processing, autonomous driving, and other new compute-intensive workloads. These workloads primarily involve sequential and random reads, sequential (append-only) writes, and random writes (via `--temp_dir` local staging). Most use cases do not require full POSIX semantics.
 
 OSSFS2 delivers **significant performance gains with very low CPU and memory overhead**, via the following key optimizations:
 * **Redesigned filesystem engine based on the [libfuse3](https://github.com/libfuse/libfuse) Low-Level API**, avoiding the additional performance and memory overhead of the High-Level API.
@@ -14,6 +14,8 @@ OSSFS2 delivers **significant performance gains with very low CPU and memory ove
 * **Fine-grained resource control through coroutines, memory pools, and elimination of unnecessary memory copies**, significantly lowering client-side CPU and memory consumption.
 * **Efficient cross-platform CRC64 checksumming on writes**, ensuring data integrity with very low overhead.
 * **Pipelined prefetching with sliding windows**, maximizing throughput and minimizing latency for sequential reads.
+* **Multi-level data caching (memory + disk)**, reducing redundant OSS requests and accelerating repeated reads.
+* **Random write support via local temp staging** (`--temp_dir`), enabling full POSIX write semantics when needed.
 
 > [!NOTE] 
 > The [`main`](https://github.com/aliyun/ossfs/tree/main) branch now defaults to OSSFS2. For OSSFS1, please refer to [`main-v1`](https://github.com/aliyun/ossfs/tree/main-v1) branch, which will continue to receive updates and maintenance.
@@ -42,8 +44,10 @@ We provide packages for common Linux distributions:
 * Alibaba Cloud Linux 2 (x86_64)
 * Alibaba Cloud Linux 3 (x86_64 and aarch64)
 * CentOS 7 and 8 (x86_64)
+* Rocky Linux 9.0 or later (x86_64)
 * Ubuntu 14.04 or later (x86_64)
 * Debian 11 or later (x86_64)
+* SLES 15 or later (x86_64)
 
 Please select the corresponding package for download and installation from the [Releases Page](https://github.com/aliyun/ossfs/releases).
 
@@ -122,7 +126,7 @@ git clone https://github.com/aliyun/ossfs.git
 cd ossfs
 mkdir build && cd build
 cmake ..
-make -j4
+make -j$(nproc)
 make install
 ```
 

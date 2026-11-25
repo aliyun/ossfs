@@ -42,6 +42,13 @@ class HdfsFileHandle : public IFileHandleFuseLL {
   int ftruncate(off_t target_size) override;
   int fallocate(off_t offset, off_t length) override;
 
+  // HDFS-specific variants taking the caller-resolved fresh path; used by
+  // callers that already hold an InodeRef (setattr/fallocate/release).
+  int ftruncate_with_path(std::string_view cur_path, off_t target_size);
+  int fallocate_with_path(std::string_view cur_path, off_t offset,
+                          off_t length);
+  int close_with_path(std::string_view cur_path);
+
   ssize_t pread(void *buf, size_t count, off_t offset) override;
   ssize_t pwrite(const void *buf, size_t count, off_t offset) override;
 
@@ -52,10 +59,6 @@ class HdfsFileHandle : public IFileHandleFuseLL {
 
   void *get_inode() override {
     return inode_;
-  }
-
-  std::string get_path() {
-    return path_;
   }
 
   // flock state tracking for release-on-close.
@@ -75,14 +78,14 @@ class HdfsFileHandle : public IFileHandleFuseLL {
   }
 
  private:
-  int open_with_flags(int flags);
+  int open_with_flags(std::string_view cur_path, int flags);
 
   // Close backend streams only, keeping the flock state intact.
-  int close_streams();
+  int close_streams(std::string_view cur_path);
 
-  void release_flock();
+  void release_flock(std::string_view cur_path);
 
-  int seek_writer_to_offset(off_t offset);
+  int seek_writer_to_offset(std::string_view path, off_t offset);
 
   // Close the stale reader stream and reopen it at the post-rename path.
   int rebuild_reader_after_rename(std::string_view new_path);
@@ -93,7 +96,10 @@ class HdfsFileHandle : public IFileHandleFuseLL {
 
   OssFs *fs_ = nullptr;
   FileInode *inode_ = nullptr;
-  std::string path_;
+  // Path the reader stream is currently opened at. Used ONLY to detect rename
+  // staleness in pread; never pass it to a path-resolving backend op -- fresh
+  // paths come from the caller's InodeRef via the *_with_path methods.
+  std::string reader_path_;
   int flags_ = 0;
   mode_t mode_ = 0777;
 
@@ -108,6 +114,8 @@ class HdfsFileHandle : public IFileHandleFuseLL {
 
   off_t read_offset_ = 0;
   off_t write_offset_ = 0;
+  // High-water mark of bytes written; write_offset_ retreats on random writes.
+  off_t max_write_end_ = 0;
 
   DECLARE_TEST_FRIENDS_CLASSES;
 };

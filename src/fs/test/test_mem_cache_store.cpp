@@ -295,40 +295,43 @@ class BlockCacheStoreTest : public ::testing::Test {
     };
 
     // Establish identity "etagA" (bumps the generation once).
+    CompactEtag etag_a("etagA");
+    CompactEtag etag_b("etagB");
+    CompactEtag etag_empty;
     refill();
-    cache_->drop({"obj", "etagA"}, block_size_);
+    cache_->drop({"obj", &etag_a}, block_size_);
     ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
 
     // Same etag after a rename-like re-key: blocks must survive (no bump).
     refill();
-    cache_->drop({"renamed/obj", "etagA"}, /*force=*/false);
+    cache_->drop({"renamed/obj", &etag_a}, /*force=*/false);
     ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), full_block);
 
     // Different etag: invalidate.
-    cache_->drop({"obj", "etagB"}, block_size_);
+    cache_->drop({"obj", &etag_b}, block_size_);
     ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
 
     // Empty etag: conservative invalidation.
     refill();
-    cache_->drop({"obj", ""}, block_size_);
+    cache_->drop({"obj", &etag_empty}, block_size_);
     ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
 
     // A repeated empty-etag drop still invalidates: an empty identity
     // never short-circuits, so the drop-on-open in streaming/appendable
     // modes never serves stale blocks across reopens.
     refill();
-    cache_->drop({"obj", ""}, block_size_);
+    cache_->drop({"obj", &etag_empty}, block_size_);
     ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
 
     // drop with force=true: skips the same-identity shortcut but still
     // records the passed identity.
     refill();
-    cache_->drop({"obj", "etagA"}, /*force=*/true);
+    cache_->drop({"obj", &etag_a}, /*force=*/true);
     ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), -ENOENT);
 
     // Same etag after a forced drop: no-op again.
     refill();
-    cache_->drop({"obj", "etagA"}, /*force=*/false);
+    cache_->drop({"obj", &etag_a}, /*force=*/false);
     ASSERT_EQ(cache_->pread(nullptr, 0, block_size_), full_block);
   };
 

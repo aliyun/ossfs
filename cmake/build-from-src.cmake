@@ -32,15 +32,24 @@ function(build_from_src [dep])
 
   elseif (dep STREQUAL "openssl")
     set(BINARY_DIR ${PROJECT_BINARY_DIR}/openssl-build)
+    # Only libssl.a/libcrypto.a and the public headers are consumed by the
+    # project (statically linked, no openssl app/engines). Trim the build so we
+    # skip compiling/linking the test, apps and fuzz programs, and skip the
+    # manpage/HTML install that dominates `make install`. Fully reproducible.
+    set(install_cmd
+            "${CMAKE_COMMAND} -E copy_directory include/openssl ${BINARY_DIR}/include/openssl &&
+             ${CMAKE_COMMAND} -E make_directory ${BINARY_DIR}/lib &&
+             ${CMAKE_COMMAND} -E copy libcrypto.a ${BINARY_DIR}/lib/libcrypto.a &&
+             ${CMAKE_COMMAND} -E copy libssl.a ${BINARY_DIR}/lib/libssl.a")
     ExternalProject_Add(
             openssl
             URL ${OPENSSL_SOURCE}
             URL_MD5 3f76825f195e52d4b10c70040681a275
             UPDATE_DISCONNECTED ON
             BUILD_IN_SOURCE ON
-            CONFIGURE_COMMAND ./config -fPIC --prefix=${BINARY_DIR} --openssldir=${BINARY_DIR} no-shared
-            BUILD_COMMAND $(MAKE)
-            INSTALL_COMMAND $(MAKE) install
+            CONFIGURE_COMMAND ./config -fPIC --prefix=${BINARY_DIR} --openssldir=${BINARY_DIR} no-shared no-tests
+            BUILD_COMMAND $(MAKE) build_libs
+            INSTALL_COMMAND sh -c "${install_cmd}"
             LOG_CONFIGURE ON
             LOG_BUILD ON
             LOG_INSTALL ON

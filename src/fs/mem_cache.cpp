@@ -592,11 +592,16 @@ void BlockCacheStore::update_retention_range(BlockCacheHandle *h, off_t offset,
 void BlockCacheStore::drop(const CacheKey &key, bool force) {
   SCOPED_LOCK(meta_store_->lock_);
   // Same identity keeps the blocks; force skips this shortcut.
-  if (!force && !key.etag.empty() && key.etag == current_etag_) {
+  if (!force && key.etag != nullptr && !key.etag->empty() &&
+      key.etag->equals(current_etag_)) {
     return;
   }
   meta_store_->generation_++;
-  current_etag_.assign(key.etag);
+  if (key.etag != nullptr) {
+    current_etag_ = *key.etag;
+  } else {
+    current_etag_.clear();
+  }
 }
 
 std::pair<off_t, size_t> BlockCacheStore::query_refill_range(off_t offset,

@@ -23,6 +23,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 std::string join_paths(const std::string &first, const std::string &second);
@@ -59,6 +60,10 @@ bool is_valid_fd(int fd);
 std::vector<std::string_view> split_string(std::string_view str,
                                            std::string_view delimiter);
 
+bool parse_oss_additional_headers(
+    std::string_view str,
+    std::vector<std::pair<std::string, std::string>> *headers);
+
 std::string cityhash128_base64url(std::string_view data);
 
 // Normalize a path to an absolute form with trailing slash stripped.
@@ -67,7 +72,15 @@ std::string normalize_path(std::string_view path);
 // Normalize a directory flag in place; rejects relative paths.
 bool normalize_dir_flag(std::string &dir);
 
-// Validate directory parameters and create them if absent.
+// Prepare the shared log parent dir: default becomes 1777 (root takes over a
+// foreign owner), custom keeps its mode and refuses a foreign owner.
+bool secure_shared_log_dir(const std::string &dir, bool is_default_path);
+
+// Prepare the per-user log dir: real dir owned by euid, 0755 (readable by all,
+// writable only by owner); a foreign owner or symlink is fatal.
+bool secure_private_log_dir(const std::string &dir);
+
+// Validate dir params; cache/temp are created here, log dir by secure helpers.
 bool validate_dir_params(std::string_view log_dir, std::string_view cache_dir,
                          std::string_view temp_dir,
                          std::string_view mountpoint);

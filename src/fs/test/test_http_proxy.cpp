@@ -18,7 +18,10 @@
 #include <photon/net/http/server.h>
 #include <photon/net/socket.h>
 
+#include <ctime>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 #include "test_suite.h"
 
@@ -69,6 +72,19 @@ static constexpr int kSlowResponseSec = 3;
 // Reverse proxy director - forwards requests to backend server
 static int proxy_director(void *arg, Request &src, Request &dst) {
   g_proxy_request_count.fetch_add(1);
+
+  if (arg) {
+    auto *headers =
+        static_cast<const std::vector<std::pair<std::string, std::string>> *>(
+            arg);
+    for (const auto &kv : *headers) {
+      auto it = src.headers.find(kv.first);
+      EXPECT_NE(it, src.headers.end()) << kv.first;
+      if (it != src.headers.end()) {
+        EXPECT_EQ(it.second(), kv.second);
+      }
+    }
+  }
 
   LOG_DEBUG("[ReverseProxy] Forwarding: `", src.target());
 
@@ -132,7 +148,8 @@ struct ReverseProxyResources {
  * @return Pair of proxy URL and resources, or empty string on failure
  */
 static std::pair<std::string, ReverseProxyResources> start_reverse_proxy(
-    const std::string &backend_url) {
+    const std::string &backend_url,
+    std::vector<std::pair<std::string, std::string>> *headers = nullptr) {
   ReverseProxyResources resources;
 
   // Create TCP server
@@ -167,7 +184,7 @@ static std::pair<std::string, ReverseProxyResources> start_reverse_proxy(
   resources.client->timeout(30000UL * 1000);
 
   // Create proxy handler
-  resources.handler.reset(new_proxy_handler({nullptr, &proxy_director},
+  resources.handler.reset(new_proxy_handler({headers, &proxy_director},
                                             {nullptr, &proxy_modifier},
                                             resources.client.get()));
 
@@ -541,6 +558,140 @@ TEST_F(Ossfs2HttpProxyTest, verify_compare_direct_vs_proxy) {
   verify_compare_direct_vs_proxy();
 }
 
+TEST_F(Ossfs2HttpProxyTest, verify_additional_headers) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  gflags::FlagSaver flag_saver;
+  FLAGS_oss_additional_headers =
+      "x-oss-user-hint-traffic-class=Y29wcGVy"
+      ";x-myapp_source=dHJhaW5pbmc="
+      ";x-oss-example=YTti"
+      ";x-oss-path=QzpcdG1w"
+      ";x-oss-query=ImEsYj1jJmQ9JTJGIg==";
+  std::vector<std::pair<std::string, std::string>> headers = {
+      {"x-oss-user-hint-traffic-class", "copper"},
+      {"x-myapp_source", "training"},
+      {"x-oss-example", "a;b"},
+      {"x-oss-path", R"(C:\tmp)"},
+      {"x-oss-query", R"("a,b=c&d=%2F")"}};
+  auto url = get_oss_url();
+  if (url.find("https://") == 0) url.replace(0, 8, "http://");
+  FLAGS_oss_endpoint = url;
+  auto [proxy_url, proxy_resources] = start_reverse_proxy(url, &headers);
+  ASSERT_FALSE(proxy_url.empty());
+  FLAGS_http_proxy = proxy_url;
+  OssFsOptions opts;
+  opts.enable_appendable_object = false;
+  opts.upload_buffer_size = 5 * 1024 * 1024;
+  ASSERT_NO_FATAL_FAILURE(init(opts));
+  verify_filesystem_through_proxy();
+
+  uint64_t parent = get_test_dir_parent();
+  DEFER(fs_->forget(parent, 1));
+  uint64_t nodeid = 0;
+  auto crc64 = create_file_in_folder(parent, "data", 10, nodeid);
+  ASSERT_NE(nodeid, 0ULL);
+  DEFER(fs_->forget(nodeid, 1));
+  uint64_t read_crc64 = 0;
+  EXPECT_EQ(read_file_in_folder(parent, "data", &read_crc64), 10 * 1024 * 1024);
+  EXPECT_EQ(read_crc64, crc64);
+  EXPECT_EQ(fs_->unlink(parent, "data"), 0);
+  EXPECT_GT(g_proxy_request_count.load(), 0);
+}
+
+TEST_F(Ossfs2HttpProxyTest, verify_additional_headers_failure) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  {
+    gflags::FlagSaver flag_saver;
+    FLAGS_oss_additional_headers = "x-custom source=dHJhaW5pbmc=";
+    ASSERT_EQ(do_init(opts), -EINVAL);
+    ASSERT_EQ(fs_, nullptr);
+    ASSERT_EQ(bg_vcpu_env_.bg_obj_store_env, nullptr);
+    ASSERT_EQ(bg_vcpu_env_.bg_disk_cache_env, nullptr);
+  }
+  ASSERT_NO_FATAL_FAILURE(init(opts));
+  uint64_t parent = get_test_dir_parent();
+  DEFER(fs_->forget(parent, 1));
+  uint64_t nodeid = 0;
+  create_file_in_folder(parent, "data", 1, nodeid);
+  ASSERT_NE(nodeid, 0ULL);
+  DEFER(fs_->forget(nodeid, 1));
+  DEFER(fs_->unlink(parent, "data"));
+
+  auto url = get_oss_url();
+  if (url.find("https://") == 0) url.replace(0, 8, "http://");
+  std::vector<std::pair<std::string, std::string>> headers = {
+      {"Range", "bytes=0-0"},
+      {"x-oss-range-behavior", "standard"},
+      {"x-myapp-id", "first"}};
+  auto [proxy_url, proxy_resources] = start_reverse_proxy(url, &headers);
+  ASSERT_FALSE(proxy_url.empty());
+  ObjStoreOptions options = oss_options_;
+  options.endpoint = url;
+  options.proxy = proxy_url;
+  options.custom_headers = {{"x-oversized", std::string(16 * 1024, 'z')}};
+  ScopedBlockAllSignal block_signals;
+  photon::Executor executor(OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {},
+                            EXECUTOR_QUEUE_OPTION);
+  std::string log_path = join_paths(test_path_, "headers.log");
+  auto *output = new_log_output_file(log_path.c_str());
+  ASSERT_NE(output, nullptr);
+  DEFER(output->destruct());
+  ASSERT_GE(output->get_log_file_fd(), 0);
+  ALogLogger logger{output, ALOG_ERROR};
+  auto *previous_logger = ossfs_logger_ptr;
+  ossfs_logger_ptr = &logger;
+  DEFER(ossfs_logger_ptr = previous_logger);
+
+  auto adapter = executor.perform(
+      [&]() { return new_oss_store("invalid-ak", "invalid-sk", options); });
+  DEFER(executor.perform([&]() { delete adapter; }));
+  char buf;
+  iovec iov{&buf, 1};
+  auto ret = executor.perform([&]() {
+    adapter->set_credentials(
+        {FLAGS_oss_access_key_id, FLAGS_oss_access_key_secret, ""}, {});
+    return adapter->get_object_range("/" + gtest_base_dir + "/data", &iov, 1,
+                                     0);
+  });
+  EXPECT_EQ(ret, -ENOBUFS);
+  EXPECT_EQ(g_proxy_request_count.load(), 0);
+  ret = executor.perform([&]() {
+    return adapter->delete_objects_under_dir("/" + gtest_base_dir + "/",
+                                             {"data"});
+  });
+  EXPECT_EQ(ret, -ENOBUFS);
+  EXPECT_EQ(g_proxy_request_count.load(), 0);
+
+  std::ifstream log(log_path);
+  std::string text((std::istreambuf_iterator<char>(log)),
+                   std::istreambuf_iterator<char>());
+  EXPECT_NE(text.find("OSS header insert failed x-oversized"),
+            std::string::npos);
+  EXPECT_EQ(text.find(std::string(32, 'z')), std::string::npos);
+
+  options.custom_headers = {{"Host", "unused.invalid"},
+                            {"Range", "bytes=1-1"},
+                            {"x-oss-range-behavior", "invalid"},
+                            {"x-myapp-id", "first"},
+                            {"X-Myapp-Id", "second"},
+                            {"Authorization", "invalid"},
+                            {"Date", "invalid"}};
+  auto existing_adapter = executor.perform([&]() {
+    return new_oss_store(FLAGS_oss_access_key_id.c_str(),
+                         FLAGS_oss_access_key_secret.c_str(), options);
+  });
+  DEFER(executor.perform([&]() { delete existing_adapter; }));
+  ret = executor.perform([&]() {
+    return existing_adapter->get_object_range("/" + gtest_base_dir + "/data",
+                                              &iov, 1, 0);
+  });
+  EXPECT_EQ(ret, 1);
+  EXPECT_GT(g_proxy_request_count.load(), 0);
+}
+
 TEST_F(Ossfs2HttpProxyTest, verify_filesystem_through_proxy) {
   SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
@@ -553,4 +704,210 @@ TEST_F(Ossfs2HttpProxyTest, verify_filesystem_through_proxy) {
   OssFsOptions opts;
   init(opts);
   verify_filesystem_through_proxy();
+}
+
+// QPS-limit retry rebuilds the request headers to re-sign. Host must stay
+// at physical offset 0, otherwise a later 307 redirect corrupts the whole
+// header block via reset_host(). Probe: 503 QpsLimitExceeded -> 307 to the
+// same URL -> 200 list response.
+struct ResignProbeRecord {
+  std::string host;
+  int host_count = 0;
+  std::string auth;
+  std::string sign_date;
+};
+
+static std::mutex g_resign_probe_mtx;
+static std::vector<ResignProbeRecord> g_resign_probe_records;
+static std::atomic<int> g_resign_probe_count{0};
+static std::string g_resign_probe_location;
+
+static int resign_probe_handler(void *, Request &req, Response &resp,
+                                std::string_view) {
+  int n = g_resign_probe_count.fetch_add(1) + 1;
+  ResignProbeRecord rec;
+  for (auto kv : req.headers) {
+    if (kv.first == "Host") {
+      rec.host.assign(kv.second.data(), kv.second.size());
+      rec.host_count++;
+    } else if (kv.first == "Authorization") {
+      rec.auth.assign(kv.second.data(), kv.second.size());
+    } else if (kv.first == "x-oss-date" || kv.first == "Date") {
+      rec.sign_date.assign(kv.second.data(), kv.second.size());
+    }
+  }
+  LOG_INFO("[ResignProbe] request ` host=` auth_empty=`", n, rec.host.c_str(),
+           rec.auth.empty());
+  {
+    std::lock_guard<std::mutex> lock(g_resign_probe_mtx);
+    g_resign_probe_records.push_back(std::move(rec));
+  }
+  std::string body;
+  if (n == 1) {
+    resp.set_result(503);
+    body =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Error><Code>TotalQpsLimitExceeded</Code>"
+        "<Message>mock</Message><RequestId>mock</RequestId>"
+        "<EC>0000-00000000</EC></Error>";
+  } else if (n == 2) {
+    resp.set_result(307);
+    resp.headers.insert("Location", g_resign_probe_location);
+  } else {
+    resp.set_result(200);
+    body =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult><Name>mockbucket</Name><Prefix></Prefix>"
+        "<KeyCount>0</KeyCount><MaxKeys>1</MaxKeys>"
+        "<IsTruncated>false</IsTruncated></ListBucketResult>";
+  }
+  resp.headers.content_length(body.size());
+  if (!body.empty()) resp.write(body.data(), body.size());
+  return 0;
+}
+
+TEST_F(Ossfs2HttpProxyTest, verify_qps_resign_keeps_host_layout) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+
+  g_resign_probe_records.clear();
+  g_resign_probe_count.store(0);
+
+  SocketServerPtr server(photon::net::new_tcp_socket_server());
+  ASSERT_NE(server, nullptr);
+  server->timeout(10000UL * 1000);
+  ASSERT_EQ(server->bind_v4localhost(), 0);
+  ASSERT_EQ(server->listen(), 0);
+  HTTPServerPtr http_server(new_http_server());
+  http_server->add_handler({nullptr, &resign_probe_handler});
+  server->set_handler(http_server->get_connection_handler());
+  server->start_loop();
+  std::string url = get_server_url(server.get());
+  LOG_INFO("[ResignProbe] server at `", url);
+  std::string hostport = url.substr(strlen("http://"));
+  hostport.pop_back();
+  g_resign_probe_location = url + "mockbucket/?list-type=2&max-keys=1&prefix=";
+
+  ObjStoreOptions options;
+  // Keep the http:// scheme: a bare host:port endpoint defaults to HTTPS.
+  options.endpoint = url.substr(0, url.size() - 1);
+  options.bucket = "mockbucket";
+  options.path_style = true;
+  options.region = "cn-hangzhou";
+  options.request_timeout_us = 60ULL * 1000 * 1000;
+  options.qps_limit_total_retry_time_us = 3ULL * 1000 * 1000;
+  options.user_agent = "Ossfs2ResignProbe/1.0";
+  auto client =
+      new_oss_client(options, new_basic_oss_authenticator({"ak", "sk"}));
+  ASSERT_NE(client, nullptr);
+  DEFER(delete client);
+
+  auto list_cb = [](const ListObjectsCBParameters &) { return 0; };
+  int r = client->list_objects("", list_cb);
+  ASSERT_EQ(r, 0);
+  ASSERT_EQ(g_resign_probe_count.load(), 3);
+
+  std::lock_guard<std::mutex> lock(g_resign_probe_mtx);
+  ASSERT_EQ(g_resign_probe_records.size(), 3u);
+  for (const auto &rec : g_resign_probe_records) {
+    EXPECT_EQ(rec.host_count, 1);
+    EXPECT_EQ(rec.host, hostport);
+    EXPECT_FALSE(rec.auth.empty());
+    EXPECT_FALSE(rec.sign_date.empty());
+  }
+  // The QPS retry re-signed with a refreshed signature date.
+  EXPECT_NE(g_resign_probe_records[0].sign_date,
+            g_resign_probe_records[1].sign_date);
+}
+
+// Compressed-time mock of the OSS 15-minute signature validity window:
+// the probe rejects any retried request whose x-oss-date is >= 2s old.
+// With a 3s QPS budget (sleeps 1s + 2s, three attempts) the retry loop
+// must re-sign to keep every attempt inside the window.
+static std::atomic<int> g_skew_probe_count{0};
+static std::atomic<int> g_skew_probe_rejects{0};
+
+static int skew_probe_handler(void *, Request &req, Response &resp,
+                              std::string_view) {
+  int n = g_skew_probe_count.fetch_add(1) + 1;
+  std::string sign_date;
+  for (auto kv : req.headers) {
+    if (kv.first == "x-oss-date")
+      sign_date.assign(kv.second.data(), kv.second.size());
+  }
+  struct tm tm {};
+  bool stale = true;
+  if (strptime(sign_date.c_str(), "%Y%m%dT%H%M%SZ", &tm) != nullptr) {
+    stale = difftime(time(nullptr), timegm(&tm)) >= 2;
+  }
+  std::string body;
+  if (stale && n > 1) {
+    g_skew_probe_rejects.fetch_add(1);
+    resp.set_result(403);
+    body =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Error><Code>RequestTimeTooSkewed</Code>"
+        "<Message>mock skew</Message><RequestId>mock</RequestId>"
+        "<EC>0000-00000000</EC></Error>";
+  } else if (n < 3) {
+    resp.set_result(503);
+    body =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Error><Code>TotalQpsLimitExceeded</Code>"
+        "<Message>mock</Message><RequestId>mock</RequestId>"
+        "<EC>0000-00000000</EC></Error>";
+  } else {
+    resp.set_result(200);
+    body =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult><Name>mockbucket</Name><Prefix></Prefix>"
+        "<KeyCount>0</KeyCount><MaxKeys>1</MaxKeys>"
+        "<IsTruncated>false</IsTruncated></ListBucketResult>";
+  }
+  resp.headers.content_length(body.size());
+  if (!body.empty()) resp.write(body.data(), body.size());
+  return 0;
+}
+
+TEST_F(Ossfs2HttpProxyTest, verify_qps_resign_beats_skew_window) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+
+  g_skew_probe_count.store(0);
+  g_skew_probe_rejects.store(0);
+
+  SocketServerPtr server(photon::net::new_tcp_socket_server());
+  ASSERT_NE(server, nullptr);
+  server->timeout(10000UL * 1000);
+  ASSERT_EQ(server->bind_v4localhost(), 0);
+  ASSERT_EQ(server->listen(), 0);
+  HTTPServerPtr http_server(new_http_server());
+  http_server->add_handler({nullptr, &skew_probe_handler});
+  server->set_handler(http_server->get_connection_handler());
+  server->start_loop();
+  std::string url = get_server_url(server.get());
+
+  ObjStoreOptions options;
+  // Keep the http:// scheme: a bare host:port endpoint defaults to HTTPS.
+  options.endpoint = url.substr(0, url.size() - 1);
+  options.bucket = "mockbucket";
+  options.path_style = true;
+  options.region = "cn-hangzhou";
+  options.request_timeout_us = 60ULL * 1000 * 1000;
+  options.qps_limit_total_retry_time_us = 3ULL * 1000 * 1000;
+  options.user_agent = "Ossfs2SkewProbe/1.0";
+  auto client =
+      new_oss_client(options, new_basic_oss_authenticator({"ak", "sk"}));
+  ASSERT_NE(client, nullptr);
+  DEFER(delete client);
+
+  auto list_cb = [](const ListObjectsCBParameters &) { return 0; };
+  int r = client->list_objects("", list_cb);
+  ASSERT_EQ(r, 0);
+  EXPECT_EQ(g_skew_probe_count.load(), 3);
+  EXPECT_EQ(g_skew_probe_rejects.load(), 0);
 }

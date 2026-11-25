@@ -1324,9 +1324,9 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
     if (iter == fs_->global_inodes_map_.end()) return;
     auto *dir = static_cast<DirInode *>(iter->second);
     std::vector<std::pair<uint64_t, uint64_t>> child_ids;
-    for (auto &kv : dir->children) {
-      child_ids.emplace_back(kv.second->nodeid, kv.second->lookup_cnt);
-    }
+    dir->children.for_each([&](Inode *child) {
+      child_ids.emplace_back(child->nodeid, child->lookup_cnt);
+    });
     for (auto &p : child_ids) {
       if (p.second > 0) fs_->forget(p.first, p.second);
     }
@@ -1334,7 +1334,7 @@ class Ossfs2ReaddirTest : public Ossfs2TestSuite {
 
   // Drop the whole lookup_cnt of a known nodeid. Deleted children keep
   // their create/fill references but may be unreachable via the parent's
-  // children map after unlink/rmdir/release, so clean them up explicitly.
+  // child index after unlink/rmdir/release, so clean them up explicitly.
   void forget_inode_full(uint64_t nodeid) {
     auto iter = fs_->global_inodes_map_.find(nodeid);
     if (iter == fs_->global_inodes_map_.end()) return;

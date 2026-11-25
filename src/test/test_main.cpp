@@ -16,8 +16,11 @@
 
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include <malloc.h>
+#include <photon/thread/stack-allocator.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -55,6 +58,19 @@ std::string extract_config_file(int argc, char **argv) {
 }  // namespace
 
 int main(int argc, char **arg) {
+  // Keep the same process-level settings as main.cpp.
+  mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+  mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
+
+  photon::use_pooled_stack_allocator();
+  photon::pooled_stack_trim_threshold(64UL * 1024 * 1024);
+
+  static const rlim_t kNofileLimit = 1048576;
+  rlimit nofile_limit{.rlim_cur = kNofileLimit, .rlim_max = kNofileLimit};
+  if (setrlimit(RLIMIT_NOFILE, &nofile_limit) != 0) {
+    LOG_WARN("Failed to set open file limit to 1048576, errno `", errno);
+  }
+
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = SIG_IGN;

@@ -4315,6 +4315,57 @@ class Ossfs2RandomWriteTest : public OssOnlyTestSuite {
     assert_remote_matches_local(filename, local_fd);
   }
 
+  void verify_complete_multipart_failure_no_double_abort() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    std::string filename = "rw_complete_multipart_fail";
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    struct stat st;
+    int r = create_and_flush(parent, filename.c_str(), CREATE_BASE_FLAGS, 0777,
+                             0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    int local_fd = open_fresh_mirror(filename);
+    DEFER(::close(local_fd));
+
+    r = fsync_file_handle(handle, /*datasync=*/true);
+    ASSERT_EQ(r, 0);
+
+    const size_t kSize = 1536 * 1024;
+    ASSERT_GT(kSize, fs_->random_write_base_part_size());
+    std::string data = random_string(kSize);
+    auto w = pwrite_mirror(handle, local_fd, data.data(), kSize, 0);
+    ASSERT_EQ(w, (ssize_t)kSize);
+
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_RandomWrite_Complete_Crc_Mismatch,
+        FaultInjection(/*run_count=*/1, /*skip_count=*/0));
+    DEFER(g_fault_injector->clear_injection(
+        FaultInjectionId::FI_RandomWrite_Complete_Crc_Mismatch));
+
+    r = fsync_file_handle(handle, /*datasync=*/true);
+    ASSERT_EQ(r, -EIO);
+    ASSERT_FALSE(g_fault_injector->is_injection_enabled(
+        FaultInjectionId::FI_RandomWrite_Complete_Crc_Mismatch));
+
+    auto inode =
+        static_cast<FileInode *>(get_file_from_handle(handle)->get_inode());
+    ASSERT_TRUE(inode->is_dirty);
+    ASSERT_NE(inode->rw_ctx, nullptr);
+    ASSERT_GT(inode->rw_ctx->chunks.dirty_chunk_count(), 0u);
+
+    r = fsync_file_handle(handle, /*datasync=*/true);
+    ASSERT_EQ(r, 0);
+    ASSERT_FALSE(inode->is_dirty);
+
+    r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+    assert_remote_matches_local(filename, local_fd);
+  }
+
   // Bogus-offset appends must land at EOF, also after in-place writes.
   void verify_o_append_offsets_to_eof() {
     uint64_t parent = get_test_dir_parent();
@@ -6689,6 +6740,19 @@ TEST_F(Ossfs2RandomWriteTest,
   opts.random_write_chunk_size = 1 * 1024 * 1024;
   init(opts);
   verify_complete_multipart_fail_aborts_and_retries();
+}
+
+TEST_F(Ossfs2RandomWriteTest,
+       verify_complete_multipart_failure_no_double_abort) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.temp_dir = test_path_;
+  opts.upload_buffer_size = 1 * 1024 * 1024;
+  // Pin chunk_size so base_part_size stays 1 MiB (align_up would otherwise
+  // raise it to the 2 MiB default chunk and reroute the flush to PutObject).
+  opts.random_write_chunk_size = 1 * 1024 * 1024;
+  init(opts);
+  verify_complete_multipart_failure_no_double_abort();
 }
 
 TEST_F(Ossfs2RandomWriteTest, verify_o_append_offsets_to_eof) {

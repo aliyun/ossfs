@@ -29,12 +29,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 
 #include "cache.h"
+#include "common/compact_etag.h"
 #include "common/logger.h"
 #include "common/macros.h"
 #include "random_write_context.h"
@@ -158,6 +161,9 @@ struct Inode {
   uint64_t parent_nodeid = 0;
   Inode *parent = nullptr;
 
+  // Sibling link in the parent's DirChildren index; never touched elsewhere.
+  Inode *child_next = nullptr;
+
   std::shared_mutex inode_lock;
 
   std::unique_ptr<PosixExtAttr> posix_ext;
@@ -261,19 +267,19 @@ struct FileInode final : public Inode {
     RandomWriteContext *rw_ctx;
   };
 
-  std::string etag;
+  CompactEtag etag;
 
   std::shared_ptr<ICache> cache;
 
   FileInode(uint64_t file_ino, std::string_view file_name, uint64_t file_size,
             struct timespec file_mtime, InodeType type, bool is_dirty,
-            uint64_t parent_id, Inode *parent_node, std::string_view etag)
+            uint64_t parent_id, Inode *parent_node, CompactEtag etag)
       : Inode(file_ino, file_name, file_size, file_mtime, type, parent_id,
               parent_node),
         is_dirty(is_dirty),
         invalidate_data_cache(false),
         dirty_fh(nullptr),
-        etag(etag) {}
+        etag(std::move(etag)) {}
 
   bool is_attr_valid(uint64_t timeout) const override {
     if (is_dirty) return true;
@@ -283,18 +289,105 @@ struct FileInode final : public Inode {
 
   // Compare against the remote stat, mark the page cache for invalidation if
   // data changed, then adopt the remote etag.
-  void refresh_etag(const struct stat *stbuf, std::string_view remote_etag);
+  void refresh_etag(const struct stat *stbuf, const CompactEtag &remote_etag);
 
   bool is_dirty_file() const {
     return is_dirty;
   }
 
   bool is_data_changed(const struct stat *stbuf,
-                       std::string_view remote_etag) const;
+                       const CompactEtag &remote_etag) const;
 };  // FileInode
 
+// Per-directory child index. Non-owning: inodes live in the global map, this
+// only references them. Names are read live via Inode::name, so a caller must
+// erase a child before renaming it.
+class DirChildren {
+ public:
+  DirChildren() = default;
+  ~DirChildren();
+
+  DirChildren(const DirChildren &) = delete;
+  DirChildren &operator=(const DirChildren &) = delete;
+
+  bool empty() const {
+    return count_ == 0;
+  }
+  size_t size() const {
+    return count_;
+  }
+
+  Inode *find(std::string_view name) const;
+
+  void insert_replace(Inode *inode);
+  void insert_unique(Inode *inode);
+
+  void erase(std::string_view name, uint64_t nodeid);
+
+  // Order is unspecified. fn must not insert or erase mid-walk: that rewrites
+  // child_next and can reallocate buckets_ under the iteration.
+  template <class Fn>
+  void for_each(Fn &&fn) const {
+    for (size_t i = 0; i < chain_count(); i++) {
+      for (Inode *e = chain_head(i); e != nullptr; e = e->child_next) {
+        fn(e);
+      }
+    }
+  }
+
+  // Same walk contract as for_each.
+  template <class Pred>
+  Inode *find_if(Pred &&pred) const {
+    for (size_t i = 0; i < chain_count(); i++) {
+      for (Inode *e = chain_head(i); e != nullptr; e = e->child_next) {
+        if (pred(e)) return e;
+      }
+    }
+    return nullptr;
+  }
+
+ private:
+  // The gap between the two watermarks is hysteresis, so a dir hovering near
+  // either boundary never thrashes the array. kMinBuckets keeps the first
+  // bucketed dir at load <= 1.0.
+  static constexpr size_t kBucketizeAbove = 8;
+  static constexpr size_t kFlattenBelow = kBucketizeAbove / 2;
+  static constexpr size_t kMinBuckets = 2 * kBucketizeAbove;
+
+  static size_t hash_name(std::string_view name);
+  static size_t bucket_of(size_t hash, size_t nbuckets);
+
+  bool bucketed() const {
+    return nbuckets_ != 0;
+  }
+
+  // Chains to visit for a full iteration: every bucket, or the single list.
+  size_t chain_count() const {
+    return bucketed() ? nbuckets_ : 1;
+  }
+  Inode *chain_head(size_t i) const {
+    return bucketed() ? buckets_[i] : head_;
+  }
+
+  Inode **find_slot(std::string_view name);
+  void attach(Inode **slot, Inode *inode);
+  void detach(Inode **slot);
+  void build_buckets();
+  void shrink_after_erase();
+  void flatten_to_list();
+  void grow_buckets();
+  void merge_buckets();
+
+  Inode *head_ = nullptr;
+  // Raw calloc/realloc, not a vector: std::allocator cannot grow in place, and
+  // realloc lets glibc extend an mmap'd array by remapping pages instead.
+  Inode **buckets_ = nullptr;
+  size_t nbuckets_ = 0;
+  size_t count_ = 0;
+};  // class DirChildren
+
 struct DirInode final : public Inode {
-  std::unordered_map<std::string_view, Inode *> children;
+  DirChildren children;
   std::chrono::steady_clock::time_point kernel_readdir_cache_time = {};
 
   DirInode(uint64_t file_ino, std::string_view file_name,

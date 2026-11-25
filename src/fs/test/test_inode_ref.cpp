@@ -573,8 +573,8 @@ class Ossfs2InodeRefTest : public Ossfs2TestSuite {
       namestr.append("-").append(std::to_string(cur_index));
       InodeType type = is_dir ? InodeType::kDir : InodeType::kFile;
       Inode *child_inode =
-          fs_->create_new_inode(next_id++, namestr, 0, now, type, false,
-                                parent_inode->nodeid, nullptr, "");
+          fs_->create_new_inode(next_id++, namestr, 0, now, now, type, false,
+                                parent_inode->nodeid, nullptr, CompactEtag{});
       fs_->add_new_inode_to_global_map(child_inode);
       static_cast<DirInode *>(parent_inode)->add_child_node(child_inode);
       return child_inode;

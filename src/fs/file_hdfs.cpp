@@ -30,7 +30,7 @@ namespace OssFileSystem {
 
 HdfsFileHandle::HdfsFileHandle(OssFs *fs, std::string_view path,
                                FileInode *inode, int flags, mode_t mode)
-    : fs_(fs), inode_(inode), path_(path), flags_(flags), mode_(mode) {}
+    : fs_(fs), inode_(inode), reader_path_(path), flags_(flags), mode_(mode) {}
 
 HdfsFileHandle::~HdfsFileHandle() {
   if (reader_) {
@@ -44,10 +44,10 @@ HdfsFileHandle::~HdfsFileHandle() {
 }
 
 int HdfsFileHandle::open() {
-  return open_with_flags(flags_);
+  return open_with_flags(reader_path_, flags_);
 }
 
-int HdfsFileHandle::open_with_flags(int flags) {
+int HdfsFileHandle::open_with_flags(std::string_view cur_path, int flags) {
   closed_ = false;
 
   if (reader_ || writer_) {
@@ -90,21 +90,30 @@ int HdfsFileHandle::open_with_flags(int flags) {
     if (fi_err) return -EIO;
 
     RawObjHandle *raw_handle = nullptr;
-    int ret = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, open_object, path_,
+    int ret = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, open_object, cur_path,
                                              writer_flags, mode_, &raw_handle);
     if (ret < 0) {
-      LOG_ERROR("Failed to open HDFS WRITER: `, flags: `, ret: `", path_,
+      LOG_ERROR("Failed to open HDFS WRITER: `, flags: `, ret: `", cur_path,
                 writer_flags, ret);
       return ret;
     }
     writer_ = raw_handle;
     write_offset_ = 0;
+
+    // jdo_open with OVERWRITE synchronously truncates the backend file to 0.
+    // Reset the cached size so getattr / ftruncate see the real size.
+    if (flags & O_TRUNC) {
+      inode_->attr.size = 0;
+      inode_->invalidate_data_cache = true;
+    }
+
     if (flags & O_APPEND) {
-      ssize_t pos = writer_->tell();
+      ssize_t pos = writer_->tell(cur_path);
       if (pos >= 0) {
         write_offset_ = pos;
       }
     }
+    max_write_end_ = write_offset_;
   }
 
   if (need_reader) {
@@ -119,10 +128,10 @@ int HdfsFileHandle::open_with_flags(int flags) {
     }
 
     RawObjHandle *raw_handle = nullptr;
-    int ret = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, open_object, path_, O_RDONLY,
-                                             mode_, &raw_handle);
+    int ret = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, open_object, cur_path,
+                                             O_RDONLY, mode_, &raw_handle);
     if (ret < 0) {
-      LOG_ERROR("Failed to open HDFS READER: `, ret: `", path_, ret);
+      LOG_ERROR("Failed to open HDFS READER: `, ret: `", cur_path, ret);
       if (writer_) {
         delete writer_;
         writer_ = nullptr;
@@ -131,13 +140,14 @@ int HdfsFileHandle::open_with_flags(int flags) {
     }
     reader_ = raw_handle;
     read_offset_ = 0;
+    reader_path_.assign(cur_path.data(), cur_path.size());
   }
 
   return 0;
 }
 
 // Close backend streams only, keeping the flock state intact.
-int HdfsFileHandle::close_streams() {
+int HdfsFileHandle::close_streams(std::string_view cur_path) {
   if (closed_) {
     return 0;
   }
@@ -146,7 +156,7 @@ int HdfsFileHandle::close_streams() {
 
   if (writer_) {
     if (is_writing_) {
-      ret = writer_->close();
+      ret = writer_->close(cur_path);
       if (ret == 0) {
         commit_written_size();
       }
@@ -155,11 +165,11 @@ int HdfsFileHandle::close_streams() {
         // File was deleted while open — ignore close error, same as
         // OSS mode's complete_upload returning 0 for stale inodes.
         if (inode_->is_stale) {
-          LOG_INFO("ignore close error for deleted HDFS file: `, ret: `", path_,
-                   ret);
+          LOG_INFO("ignore close error for deleted HDFS file: `, ret: `",
+                   cur_path, ret);
           ret = 0;
         } else {
-          LOG_ERROR("Failed to close HDFS writer: `, ret: `", path_, ret);
+          LOG_ERROR("Failed to close HDFS writer: `, ret: `", cur_path, ret);
         }
       }
       is_writing_ = false;
@@ -170,10 +180,10 @@ int HdfsFileHandle::close_streams() {
       inode_->invalidate_data_cache = true;
       inode_->attr_time = 0;
     } else {
-      int r = writer_->close();
+      int r = writer_->close(cur_path);
       FAULT_INJECTION(FI_HdfsClose_IdleWriterFail, [&] { r = -EIO; });
       if (r < 0) {
-        LOG_WARN("Failed to close idle HDFS writer: `, ret: `", path_, r);
+        LOG_WARN("Failed to close idle HDFS writer: `, ret: `", cur_path, r);
       }
     }
     delete writer_;
@@ -181,10 +191,10 @@ int HdfsFileHandle::close_streams() {
   }
 
   if (reader_) {
-    int r = reader_->close();
+    int r = reader_->close(cur_path);
     FAULT_INJECTION(FI_HdfsClose_ReaderFail, [&] { r = -EIO; });
     if (r < 0) {
-      LOG_WARN("Failed to close HDFS reader: `, ret: `", path_, r);
+      LOG_WARN("Failed to close HDFS reader: `, ret: `", cur_path, r);
     }
     delete reader_;
     reader_ = nullptr;
@@ -194,32 +204,49 @@ int HdfsFileHandle::close_streams() {
   return ret;
 }
 
-void HdfsFileHandle::release_flock() {
+void HdfsFileHandle::release_flock(std::string_view cur_path) {
   if (!holds_flock_) {
     return;
   }
+  // Empty path = stale inode (external delete; local unlink keeps a hidden
+  // inode). The lock is gone with the object, so skip rather than resolve ""
+  // against the bucket root.
+  if (cur_path.empty()) {
+    LOG_WARN(
+        "skip flock release on empty path (stale inode), nodeid: `, owner: `",
+        inode_->nodeid, flock_owner_);
+    holds_flock_ = false;
+    flock_owner_ = 0;
+    return;
+  }
   int lr = PERFORM_BACKGROUND_OBJ_REQUEST(
-      fs_, set_lock, path_, static_cast<int64_t>(0), static_cast<int64_t>(0),
+      fs_, set_lock, cur_path, static_cast<int64_t>(0), static_cast<int64_t>(0),
       static_cast<int16_t>(LockType::UnLock), static_cast<int64_t>(getpid()),
       flock_owner_);
   if (lr < 0) {
-    LOG_WARN("Failed to release flock on close: `, owner: `, ret: `", path_,
+    LOG_WARN("Failed to release flock on close: `, owner: `, ret: `", cur_path,
              flock_owner_, lr);
   }
   holds_flock_ = false;
   flock_owner_ = 0;
 }
 
-int HdfsFileHandle::close() {
-  int ret = close_streams();
+int HdfsFileHandle::close_with_path(std::string_view cur_path) {
+  int ret = close_streams(cur_path);
 
   // BSD semantics: flock is bound to the fd, not the backend streams, so
   // release it here unconditionally. The lock is released either by an
   // explicit LOCK_UN or when all duplicate fds are closed.
   // See: https://man7.org/linux/man-pages/man2/flock.2.html.
-  release_flock();
+  release_flock(cur_path);
 
   return ret;
+}
+
+int HdfsFileHandle::close() {
+  // No-arg override only satisfies the base interface; HDFS callers go through
+  // close_with_path() (see OssFs::release). Fall back to reader_path_.
+  return close_with_path(reader_path_);
 }
 
 void HdfsFileHandle::release() {
@@ -235,9 +262,9 @@ int HdfsFileHandle::fdatasync() {
     return 0;
   }
 
-  // File was deleted while open — skip flush.
+  // A stale inode may not resolve a path; skip the flush in that case.
   if (inode_->is_stale) {
-    LOG_INFO("skip flush for deleted HDFS file: `", path_);
+    LOG_INFO("skip flush for deleted HDFS file, nodeid: `", inode_->nodeid);
     return 0;
   }
 
@@ -250,30 +277,37 @@ int HdfsFileHandle::fdatasync() {
     return 0;
   }
 
-  int ret = writer_->flush();
+  int ret = writer_->flush(ref.inode_path);
   FAULT_INJECTION(FI_HdfsFdatasync_FlushFail, [&] { ret = -EIO; });
   if (ret < 0) {
-    LOG_ERROR("Failed to fdatasync HDFS file: `, ret: `", path_, ret);
+    LOG_ERROR("Failed to fdatasync HDFS file: `, ret: `", ref.inode_path, ret);
   } else {
     commit_written_size();
   }
   return ret;
 }
 
-// Caller must hold inode_lock (write lock).
-int HdfsFileHandle::ftruncate(off_t target_size) {
+int HdfsFileHandle::ftruncate(off_t) {
+  // Unreachable in HDFS mode: OssFs routes through ftruncate_with_path().
+  RELEASE_ASSERT(false);
+  return -ENOTSUP;
+}
+
+// Caller must hold inode_lock (write lock) and pass the fresh inode path.
+int HdfsFileHandle::ftruncate_with_path(std::string_view cur_path,
+                                        off_t target_size) {
   off_t current_size =
-      std::max(static_cast<off_t>(inode_->attr.size), write_offset_);
+      std::max(static_cast<off_t>(inode_->attr.size), max_write_end_);
 
   if (current_size > target_size) {
     // Shrink path: close -> truncate -> reopen. The fd stays open, so only
     // streams are closed and the flock survives. If truncate_object fails,
     // writer_/reader_ remain null and the handle is broken; subsequent I/O
     // must check them and return -EBADF.
-    int r = close_streams();
+    int r = close_streams(cur_path);
     if (r < 0) return r;
 
-    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, truncate_object, path_,
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(fs_, truncate_object, cur_path,
                                        target_size);
     if (r < 0) return r;
 
@@ -281,7 +315,7 @@ int HdfsFileHandle::ftruncate(off_t target_size) {
 
     // Strip one-shot flags: replaying O_TRUNC would destroy the just
     // truncated file.
-    r = open_with_flags(flags_ & ~(O_TRUNC | O_CREAT));
+    r = open_with_flags(cur_path, flags_ & ~(O_TRUNC | O_CREAT));
     if (r < 0) return r;
   } else if (current_size < target_size) {
     if (!writer_) {
@@ -289,7 +323,7 @@ int HdfsFileHandle::ftruncate(off_t target_size) {
     }
 
     off_t extend_len = target_size - current_size;
-    int r = writer_->fallocate(current_size, extend_len);
+    int r = writer_->fallocate(cur_path, current_size, extend_len);
     if (r < 0) return r;
 
     inode_->attr.size = target_size;
@@ -298,9 +332,16 @@ int HdfsFileHandle::ftruncate(off_t target_size) {
   return 0;
 }
 
-int HdfsFileHandle::fallocate(off_t offset, off_t length) {
+int HdfsFileHandle::fallocate(off_t, off_t) {
+  // Unreachable in HDFS mode: OssFs routes through fallocate_with_path().
+  RELEASE_ASSERT(false);
+  return -ENOTSUP;
+}
+
+int HdfsFileHandle::fallocate_with_path(std::string_view cur_path, off_t offset,
+                                        off_t length) {
   off_t current_size =
-      std::max(static_cast<off_t>(inode_->attr.size), write_offset_);
+      std::max(static_cast<off_t>(inode_->attr.size), max_write_end_);
   off_t new_end = offset + length;
 
   if (new_end > current_size) {
@@ -308,9 +349,11 @@ int HdfsFileHandle::fallocate(off_t offset, off_t length) {
       return -EBADF;
     }
     off_t extend_len = new_end - current_size;
-    int r = writer_->fallocate(current_size, extend_len);
+    int r = writer_->fallocate(cur_path, current_size, extend_len);
     if (r < 0) return r;
     inode_->attr.size = new_end;
+    inode_->invalidate_data_cache = true;
+    inode_->attr_time = 0;
   }
 
   return 0;
@@ -324,14 +367,11 @@ ssize_t HdfsFileHandle::pread(void *buf, size_t count, off_t offset) {
   std::shared_lock<std::shared_mutex> guard(inode_->inode_lock);
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // Rebuild the reader on the new path if the file was renamed after open:
-  // the SDK stream re-resolves its open path and would fail with ENOENT.
-  // The path lock held via ref blocks local renames for this whole call. A
-  // failed rebuild leaves path_ stale, so the next pread retries it.
+  // The SDK reader stream is bound to the path it was opened at; after a rename
+  // that path is stale, so rebuild the reader at the fresh inode path.
   if ((flags_ & O_ACCMODE) != O_WRONLY && ref.inode &&
-      ref.inode_path != path_) {
-    LOG_WARN("HDFS reader path stale after rename: ` to `", path_,
-             ref.inode_path);
+      ref.inode_path != reader_path_) {
+    LOG_WARN("HDFS reader needs rebuild after rename: `", ref.inode_path);
     int rr = rebuild_reader_after_rename(ref.inode_path);
     if (rr < 0) return rr;
   }
@@ -339,39 +379,42 @@ ssize_t HdfsFileHandle::pread(void *buf, size_t count, off_t offset) {
   if (!reader_) return -EBADF;
 
   if (offset != read_offset_) {
-    int ret = reader_->seek(offset);
+    int ret = reader_->seek(ref.inode_path, offset);
     FAULT_INJECTION(FI_HdfsPread_SeekFail, [&] { ret = -EIO; });
     if (ret < 0) {
-      LOG_ERROR("Failed to seek HDFS file: `, offset: `, ret: `", path_, offset,
-                ret);
+      LOG_ERROR("Failed to seek HDFS file: `, offset: `, ret: `",
+                ref.inode_path, offset, ret);
       return ret;
     }
     read_offset_ = offset;
   }
 
-  // Use read() instead of pread() to enable SDK sequential read prefetch
+  // Use read() instead of pread() to enable SDK sequential read prefetch.
   size_t total_read = 0;
   while (total_read < count) {
-    ssize_t ret = reader_->read((char *)buf + total_read, count - total_read);
-    FAULT_INJECTION(FI_HdfsPread_ReadFail, [&] { ret = -EIO; });
+    bool fi_err = false;
+    FAULT_INJECTION(FI_HdfsPread_ReadFail, [&] { fi_err = true; });
+    if (fi_err) return -EIO;
+    ssize_t ret = reader_->read(ref.inode_path, (char *)buf + total_read,
+                                count - total_read);
     if (ret < 0) {
       LOG_ERROR("Failed to read HDFS file: `, offset: `, count: `, ret: `",
-                path_, offset, count, ret);
+                ref.inode_path, offset, count, ret);
       return ret;
     }
     if (ret == 0) break;
+    read_offset_ += ret;
     total_read += ret;
   }
 
-  read_offset_ += total_read;
   return total_read;
 }
 
 int HdfsFileHandle::rebuild_reader_after_rename(std::string_view new_path) {
   if (reader_) {
-    int r = reader_->close();
+    int r = reader_->close(reader_path_);
     if (r < 0) {
-      LOG_WARN("Failed to close stale HDFS reader: `, ret: `", path_, r);
+      LOG_WARN("Failed to close stale HDFS reader: `, ret: `", reader_path_, r);
     }
     delete reader_;
     reader_ = nullptr;
@@ -391,20 +434,20 @@ int HdfsFileHandle::rebuild_reader_after_rename(std::string_view new_path) {
   }
 
   reader_ = raw_handle;
-  path_ = new_path;
+  reader_path_.assign(new_path.data(), new_path.size());
   read_offset_ = 0;
-  LOG_INFO("Rebuilt HDFS reader after rename: `", path_);
+  LOG_INFO("Rebuilt HDFS reader after rename: `", reader_path_);
   return 0;
 }
 
-int HdfsFileHandle::seek_writer_to_offset(off_t offset) {
+int HdfsFileHandle::seek_writer_to_offset(std::string_view path, off_t offset) {
   if ((flags_ & O_APPEND) || write_offset_ == offset) {
     return 0;
   }
-  ssize_t r = writer_->seek(offset);
+  ssize_t r = writer_->seek(path, offset);
   FAULT_INJECTION(FI_HdfsWrite_SeekFail, [&] { r = -EIO; });
   if (r < 0) {
-    LOG_ERROR("Failed to seek HDFS file: `, offset: `, ret: `", path_, offset,
+    LOG_ERROR("Failed to seek HDFS file: `, offset: `, ret: `", path, offset,
               r);
     return r;
   }
@@ -414,6 +457,10 @@ int HdfsFileHandle::seek_writer_to_offset(off_t offset) {
 
 void HdfsFileHandle::finalize_write(ssize_t total_written) {
   write_offset_ += total_written;
+  // Track the high-water mark; the cursor retreats on random writes.
+  if (write_offset_ > max_write_end_) {
+    max_write_end_ = write_offset_;
+  }
   if (!is_writing_) {
     is_writing_ = true;
     inode_->hdfs_dirty_count++;
@@ -424,8 +471,8 @@ void HdfsFileHandle::finalize_write(ssize_t total_written) {
 }
 
 void HdfsFileHandle::commit_written_size() {
-  if (write_offset_ > static_cast<off_t>(inode_->attr.size)) {
-    inode_->attr.size = write_offset_;
+  if (max_write_end_ > static_cast<off_t>(inode_->attr.size)) {
+    inode_->attr.size = max_write_end_;
   }
 }
 
@@ -439,14 +486,23 @@ ssize_t HdfsFileHandle::pwrite(const void *buf, size_t count, off_t offset) {
 
   if (count == 0) return 0;
 
-  int seek_ret = seek_writer_to_offset(offset);
+  int seek_ret = seek_writer_to_offset(ref.inode_path, offset);
   if (seek_ret < 0) return seek_ret;
 
-  ssize_t written = writer_->write(buf, count);
+  ssize_t written = writer_->write(ref.inode_path, buf, count);
+  FAULT_INJECTION(FI_HdfsWrite_ShortWrite, [&] {
+    if (written > 0) written = count - 1;
+  });
   if (written < 0) return written;
-  if (static_cast<size_t>(written) < count) return -EIO;
 
+  // Advance the cached offset by whatever actually entered the stream, keeping
+  // it in lockstep with the stream cursor even on a short write.
   finalize_write(written);
+  if (static_cast<size_t>(written) < count) {
+    LOG_ERROR("HDFS short write: count=` written=`, data loss! path: `", count,
+              written, ref.inode_path);
+    return -EIO;
+  }
   return written;
 }
 
@@ -457,12 +513,9 @@ ssize_t HdfsFileHandle::pin(off_t offset, size_t count, void **buf) {
 void HdfsFileHandle::unpin(off_t offset) {}
 
 ssize_t HdfsFileHandle::write_buf(struct fuse_bufvec *bufv, off_t offset) {
-  // Design note: write_buf uses all-or-nothing semantics.
-  // If any chunk fails, we return error immediately without updating
-  // write_offset_ to reflect partial progress. This keeps the state
-  // consistent with the caller's view (either full success or full failure).
-  // Subsequent writes may fail due to stream misalignment, but this is
-  // acceptable since the file is likely in an error state anyway.
+  // Each chunk that enters the stream advances the cached write offset right
+  // away (finalize_write), keeping it in lockstep with the stream cursor; a
+  // chunk error therefore needs no cursor fix-up on the failure path.
   InodeRef ref = fs_->get_inode_ref(inode_->nodeid,
                                     OssFs::InodeRefPathType::kPathTypeRead);
   DEFER(fs_->return_inode_ref(ref));
@@ -473,7 +526,7 @@ ssize_t HdfsFileHandle::write_buf(struct fuse_bufvec *bufv, off_t offset) {
   size_t total = fuse_bufv_size(bufv);
   if (total == 0) return 0;
 
-  int seek_ret = seek_writer_to_offset(offset);
+  int seek_ret = seek_writer_to_offset(ref.inode_path, offset);
   if (seek_ret < 0) return seek_ret;
 
   RELEASE_ASSERT(fs_->data_buffers_ != nullptr);
@@ -495,11 +548,12 @@ ssize_t HdfsFileHandle::write_buf(struct fuse_bufvec *bufv, off_t offset) {
     FAULT_INJECTION(FI_HdfsWriteBuf_ReadError, [&] { fi_err = true; });
     if (fi_err) return -EIO;
 
-    ssize_t written = writer_->write(tmp, copied);
+    ssize_t written = writer_->write(ref.inode_path, tmp, copied);
     if (written < 0) return written;
+    finalize_write(written);
     if (written < copied) {
       LOG_ERROR("HDFS short write: copied=` written=`, data loss! path: `",
-                copied, written, path_);
+                copied, written, ref.inode_path);
       return -EIO;
     }
 
@@ -507,7 +561,6 @@ ssize_t HdfsFileHandle::write_buf(struct fuse_bufvec *bufv, off_t offset) {
     remaining -= copied;
   }
 
-  finalize_write(total_written);
   return total_written;
 }
 

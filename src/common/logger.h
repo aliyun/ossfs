@@ -203,7 +203,8 @@ inline void __ossfs_log__(int level, ILogOutput *output,
 
 int set_ossfs_log_setting(const char *fn, uint64_t rotate_limit = UINT64_MAX,
                           int max_log_files = 10, uint64_t throttle = -1UL,
-                          int log_level = ALOG_INFO);
+                          int log_level = ALOG_INFO,
+                          bool is_default_log_dir = false);
 
 void set_ossfs_log_to_stdout(int log_level);
 void set_ossfs_log_to_syslog(int log_level);

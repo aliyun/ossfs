@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "cache.h"
+#include "common/compact_etag.h"
 #include "mem_pool.h"
 
 class BlockCacheStoreTest;
@@ -95,7 +96,8 @@ class BlockCacheStore : public ICacheStore {
   // The identity is copied from the etag component of key; the block cache
   // only tracks the etag.
   BlockCacheStore(uint64_t block_size, const CacheKey &key)
-      : block_size_(block_size), current_etag_(key.etag) {
+      : block_size_(block_size) {
+    if (key.etag != nullptr) current_etag_ = *key.etag;
     meta_store_ = std::make_unique<MetaStore>(this);
   }
 
@@ -236,7 +238,7 @@ class BlockCacheStore : public ICacheStore {
 
   // Etag of the source whose data is currently cached. Guarded by
   // meta_store_->lock_ (the same lock protecting generation_).
-  std::string current_etag_;
+  CompactEtag current_etag_;
 
   friend class BlockCacheHandle;
   friend class ::BlockCacheStoreTest;

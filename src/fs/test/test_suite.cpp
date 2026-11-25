@@ -595,6 +595,13 @@ void Ossfs2TestSuite::init(OssFsOptions fs_opts, int max_list_ret,
 int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
                              std::string bind_ips, bool preserve_input_options,
                              int disk_cache_io_engine) {
+  std::vector<std::pair<std::string, std::string>> custom_headers;
+  if (!parse_oss_additional_headers(FLAGS_oss_additional_headers,
+                                    &custom_headers)) {
+    LOG_ERROR("Invalid oss_additional_headers");
+    return -EINVAL;
+  }
+
   std::string endpoint = FLAGS_oss_endpoint;
   std::string bucket = FLAGS_oss_bucket;
   std::string prefix = FLAGS_oss_bucket_prefix;
@@ -655,6 +662,14 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
       options.path_style = FLAGS_path_style;
       options.ip_version = OssFileSystem::ip_version_for(FLAGS_enable_ipv6);
       options.request_timeout_us = timeout_ms * 1000;
+      if (FLAGS_oss_max_idle_timeout_ms > 0) {
+        options.connection_idle_expiration_us =
+            FLAGS_oss_max_idle_timeout_ms * 1000;
+      }
+      options.retry_times = FLAGS_oss_request_max_retries;
+      options.custom_headers = custom_headers;
+      options.qps_limit_total_retry_time_us =
+          FLAGS_oss_qps_limit_retry_timeout_ms * 1000;
       options.endpoint = endpoint;
       options.bucket = bucket;
       options.prefix = prefix;
@@ -664,6 +679,12 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
       options.proxy = FLAGS_http_proxy;
       if (!hdfs_client_options_.empty()) {
         options.hdfs_client_options = hdfs_client_options_;
+      }
+      if (is_hdfs_test_mode()) {
+        // Same as main.cpp: sync random write at attr_timeout interval.
+        options.append_hdfs_client_option(
+            kHdfsSdkOptRandomWriteSyncInterval,
+            std::to_string(fs_opts.attr_timeout * 1000));
       }
       oss_options_ = options;
       return OssFileSystem::new_obj_store(

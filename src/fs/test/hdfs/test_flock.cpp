@@ -385,6 +385,64 @@ class Ossfs2HdfsFlockTest : public OssHdfsTestSuite {
   }
 
   // F_SETLK + F_WRLCK: write lock via fcntl interface.
+
+  // Closing after rename must release the lock via the new path.
+  void verify_flock_release_after_rename() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = create_and_flush(parent, "flock_rename_src", CREATE_BASE_FLAGS,
+                             0777, 0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+    if (handle) {
+      r = fs_->flush(nodeid, handle);
+      ASSERT_EQ(r, 0);
+      r = fs_->release(nodeid, get_file_from_handle(handle));
+      ASSERT_EQ(r, 0);
+    }
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_RDWR, &handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    auto *hfile = static_cast<HdfsFileHandle *>(get_file_from_handle(handle));
+
+    r = fs_->flock(nodeid, handle, LOCK_EX | LOCK_NB, 1);
+    ASSERT_EQ(r, 0);
+    ASSERT_TRUE(hfile->holds_flock());
+
+    r = fs_->rename(parent, "flock_rename_src", parent, "flock_rename_dst", 0);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->release(nodeid, hfile);
+    ASSERT_EQ(r, 0);
+
+    // HDFS unlock is asynchronous; retry for up to 60s.
+    void *handle2 = nullptr;
+    r = fs_->open(nodeid, O_RDWR, &handle2, &keep_cache);
+    ASSERT_EQ(r, 0);
+
+    bool acquired = false;
+    for (int attempt = 0; attempt < 30; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+      r = fs_->flock(nodeid, handle2, LOCK_EX | LOCK_NB, 2);
+      if (r == 0) {
+        acquired = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(acquired)
+        << "flock not released on renamed file after close-path release";
+
+    r = fs_->flock(nodeid, handle2, LOCK_UN, 2);
+    ASSERT_EQ(r, 0);
+    r = fs_->flush(nodeid, handle2);
+    ASSERT_EQ(r, 0);
+    r = fs_->release(nodeid, get_file_from_handle(handle2));
+    ASSERT_EQ(r, 0);
+  }
 };
 
 TEST_F(Ossfs2HdfsFlockTest, verify_flock_exclusive) {
@@ -434,4 +492,11 @@ TEST_F(Ossfs2HdfsFlockTest, verify_flock_survives_ftruncate_failure) {
   OssFsOptions opts;
   init(opts);
   verify_flock_survives_ftruncate_failure();
+}
+
+TEST_F(Ossfs2HdfsFlockTest, verify_flock_release_after_rename) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_flock_release_after_rename();
 }

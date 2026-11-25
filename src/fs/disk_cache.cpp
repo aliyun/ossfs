@@ -43,12 +43,17 @@ namespace OssFileSystem {
 // verbatim in the trusted.ossfs2.source_key xattr.
 static std::string make_source_key(const CacheKey &key) {
   // Fallback version signal for backends without ETag (e.g. OSS-HDFS).
-  if (key.etag.empty()) {
+  if (key.etag == nullptr || key.etag->empty()) {
     return std::string(key.object_key) + "/" + std::to_string(key.size) + "@" +
            std::to_string(key.mtime.tv_sec) + "." +
            std::to_string(key.mtime.tv_nsec);
   }
-  return std::string(key.object_key) + "/" + std::string(key.etag);
+  std::string result;
+  result.reserve(key.object_key.size() + 1 + key.etag->size());
+  result.append(key.object_key.data(), key.object_key.size());
+  result.push_back('/');
+  key.etag->append_to(&result);
+  return result;
 }
 
 class DiskCacheStore : public ICacheStore {

@@ -220,14 +220,49 @@ class Ossfs2HdfsRenameTest : public OssHdfsTestSuite {
       }
     }
 
-    // File should still be readable after all renames.
+    // write_file_intervally returns the CRC64 of everything it wrote and always
+    // writes the full total_size (the timing only paces the writes), so the
+    // final content is fully determined no matter how the renames interleaved.
+    // Capture that CRC64 and prove the data survived all concurrent renames.
+    const uint64_t total_size = file_size_in_mb * 1024 * 1024;
+    uint64_t expected_crc = future.get();
+    ASSERT_NE(expected_crc, 0ULL);
+
+    // Release the create handle so the file reaches a clean, fully-flushed
+    // state.
     r = fs_->release(nodeid, get_file_from_handle(handle));
     ASSERT_EQ(r, 0);
 
     struct stat st;
     r = fs_->getattr(nodeid, &st);
     ASSERT_EQ(r, 0);
-    ASSERT_GT(st.st_size, 0);
+    ASSERT_EQ(st.st_size, (off_t)total_size);
+
+    // The original name must be gone after the renames.
+    uint64_t gone_id = 0;
+    ASSERT_EQ(fs_->lookup(parent, "write_file", &gone_id, &st), -ENOENT);
+
+    // Read the whole file back through the fs_ connection (reliable for HDFS;
+    // an independent SDK stat is not) and compare its CRC64 with what was
+    // written. A matching CRC64 plus the exact size proves no chunk was lost,
+    // duplicated, or misplaced across the concurrent renames.
+    void *rhandle = nullptr;
+    bool keep_cache = false;
+    ASSERT_EQ(fs_->open(nodeid, O_RDONLY, &rhandle, &keep_cache), 0);
+    auto *rdr = get_file_from_handle(rhandle);
+    DEFER(fs_->release(nodeid, rdr));
+
+    const size_t kBuf = 1 << 20;
+    std::vector<char> buf(kBuf);
+    uint64_t got_crc = 0;
+    for (off_t off = 0; off < (off_t)total_size;) {
+      size_t n = std::min(kBuf, (size_t)(total_size - off));
+      ssize_t rd = rdr->pread(buf.data(), n, off);
+      ASSERT_EQ(rd, (ssize_t)n) << "offset " << off;
+      got_crc = cal_crc64(got_crc, buf.data(), n);
+      off += rd;
+    }
+    ASSERT_EQ(got_crc, expected_crc);
   }
 
   // Rename a parent directory while children files are being written.
@@ -671,9 +706,73 @@ class Ossfs2HdfsRenameTest : public OssHdfsTestSuite {
     ASSERT_EQ(fs_->release(dst_id, dst_reader), 0);
   }
 
-  // If the rebuild reopen fails, the pread must error out, and the next
-  // pread must retry the rebuild (the recorded path stays stale until a
-  // rebuild succeeds).
+  void verify_read_after_rename_path_refresh(bool use_fallocate) {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+
+    const size_t kChunk = 1 << 20;
+    const off_t file_size = 16 * kChunk;
+    uint64_t nodeid = 0;
+    create_file_in_folder(parent, "reader_refresh_src", 16, nodeid);
+    DEFER(fs_->forget(nodeid, 1));
+
+    bool keep_cache = false;
+    void *handle = nullptr;
+    ASSERT_EQ(fs_->open(nodeid, O_RDWR, &handle, &keep_cache), 0);
+    auto *file = get_file_from_handle(handle);
+    DEFER(fs_->release(nodeid, file));
+
+    ASSERT_EQ(fs_->rename(parent, "reader_refresh_src", parent,
+                          "reader_refresh_dst", 0),
+              0);
+
+    auto parent_uri = hdfs_helper_->full_uri(nodeid_to_path(parent));
+    auto source_uri = join_paths(parent_uri, "reader_refresh_src");
+    auto target_uri = join_paths(parent_uri, "reader_refresh_dst");
+    ASSERT_EQ(hdfs_helper_->stat_file(source_uri), -ENOENT);
+    int64_t backend_size = 0;
+    ASSERT_EQ(hdfs_helper_->stat_file_size(target_uri, backend_size), 0);
+    ASSERT_EQ(backend_size, file_size);
+
+    g_fault_injector->set_injection(FI_HdfsReaderRebuild_ReopenFail);
+    DEFER(g_fault_injector->clear_injection(FI_HdfsReaderRebuild_ReopenFail));
+
+    if (use_fallocate) {
+      ASSERT_EQ(fs_->fallocate(nodeid, kChunk, kChunk, handle), 0);
+    } else {
+      struct stat attr = {};
+      attr.st_size = file_size;
+      struct fuse_file_info fi = {};
+      fi.fh = reinterpret_cast<uint64_t>(handle);
+      ASSERT_EQ(fs_->setattr(nodeid, &attr, FUSE_SET_ATTR_SIZE, &fi, 0, 0), 0);
+      ASSERT_EQ(attr.st_size, file_size);
+    }
+
+    std::ifstream lf(join_paths(test_path_, "reader_refresh_src"),
+                     std::ios::binary);
+    ASSERT_TRUE(lf.good());
+    std::vector<char> buf(kChunk);
+    std::vector<char> expected(kChunk);
+    ASSERT_EQ(file->pread(buf.data(), kChunk, 0), -EIO);
+    g_fault_injector->clear_injection(FI_HdfsReaderRebuild_ReopenFail);
+    for (off_t offset = 0; offset < file_size; offset += kChunk) {
+      ASSERT_EQ(file->pread(buf.data(), kChunk, offset), (ssize_t)kChunk)
+          << "offset " << offset;
+      lf.read(expected.data(), kChunk);
+      ASSERT_EQ(lf.gcount(), (std::streamsize)kChunk);
+      ASSERT_EQ(memcmp(buf.data(), expected.data(), kChunk), 0)
+          << "offset " << offset;
+      if (offset == 0) {
+        g_fault_injector->set_injection(FI_HdfsReaderRebuild_ReopenFail);
+      }
+    }
+    ASSERT_EQ(file->pread(buf.data(), kChunk, file_size), 0);
+
+    ASSERT_EQ(hdfs_helper_->stat_file_size(target_uri, backend_size), 0);
+    ASSERT_EQ(backend_size, file_size);
+  }
+
+  // A failed rebuild must be retried on the next pread.
   void verify_read_rebuild_reopen_fail_retries() {
     uint64_t parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
@@ -699,14 +798,18 @@ class Ossfs2HdfsRenameTest : public OssHdfsTestSuite {
     DEFER(g_fault_injector->clear_injection(FI_HdfsReaderRebuild_ReopenFail));
     ASSERT_EQ(reader->pread(buf.data(), kChunk, 0), -EIO);
 
-    // Injection cleared; the next pread retries the rebuild and succeeds.
     g_fault_injector->clear_injection(FI_HdfsReaderRebuild_ReopenFail);
     ASSERT_EQ(reader->pread(buf.data(), kChunk, 0), (ssize_t)kChunk);
   }
 
-  // A writer opened before rename must keep accepting writes afterwards:
-  // the SDK writer stream binds to the inode, not the path.
-  void verify_write_open_file_after_rename() {
+  // The writer stream must stay inode-bound across rename, for both HDFS open
+  // flows: RANDOM_WRITE (O_RDWR, positional writes) and APPEND (O_APPEND, every
+  // write lands at the stream end). The file is renamed repeatedly WHILE it is
+  // being written, so every chunk must land at its correct offset in the FINAL
+  // target and all intermediate names must disappear. Each chunk carries
+  // distinct content: identical chunks would mask a write landing at the wrong
+  // offset or a duplicated/lost chunk after a rename.
+  void verify_write_open_file_after_rename(bool append_mode) {
     uint64_t parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
     struct stat st;
@@ -721,33 +824,58 @@ class Ossfs2HdfsRenameTest : public OssHdfsTestSuite {
 
     handle = nullptr;
     bool keep_cache = false;
-    ASSERT_EQ(fs_->open(nodeid, O_RDWR, &handle, &keep_cache), 0);
+    int open_flags = append_mode ? (O_RDWR | O_APPEND) : O_RDWR;
+    ASSERT_EQ(fs_->open(nodeid, open_flags, &handle, &keep_cache), 0);
     DEFER(fs_->release(nodeid, get_file_from_handle(handle)));
 
-    ASSERT_EQ(fs_->rename(parent, "rename_wr_src", parent, "rename_wr_dst", 0),
-              0);
-
-    // Writes through the pre-rename handle must land in the renamed file.
     const size_t kChunk = 1 << 20;
-    std::vector<char> data(kChunk);
-    for (size_t i = 0; i < kChunk; i++) data[i] = (char)(i * 7 + 13);
-    for (uint64_t off = 0; off < 4; off++) {
-      ASSERT_EQ(write_to_file_handle(handle, data.data(), kChunk, off * kChunk),
-                (ssize_t)kChunk)
-          << "chunk " << off;
+    const uint64_t kNumChunks = 4;
+    std::vector<std::vector<char>> chunks(kNumChunks);
+    for (uint64_t c = 0; c < kNumChunks; c++) {
+      chunks[c].resize(kChunk);
+      for (size_t i = 0; i < kChunk; i++) {
+        chunks[c][i] = (char)(c * 31 + i * 7 + 13);
+      }
     }
 
-    // Flush so the written data is visible to a freshly opened reader.
+    // Interleave writes and renames on the SAME open handle: rename the file
+    // again after every chunk except the last, so the writer must follow the
+    // target across multiple renames. Under O_APPEND the offset is ignored and
+    // each write appends at the end; the sequential offsets below coincide with
+    // those append positions, so both modes produce the same layout.
+    std::string cur_name = "rename_wr_src";
+    std::vector<std::string> stale_names;
+    for (uint64_t c = 0; c < kNumChunks; c++) {
+      ASSERT_EQ(
+          write_to_file_handle(handle, chunks[c].data(), kChunk, c * kChunk),
+          (ssize_t)kChunk)
+          << "chunk " << c;
+      if (c + 1 < kNumChunks) {
+        std::string next_name = "rename_wr_step" + std::to_string(c);
+        ASSERT_EQ(
+            fs_->rename(parent, cur_name.c_str(), parent, next_name.c_str(), 0),
+            0)
+            << "rename " << c;
+        stale_names.push_back(cur_name);
+        cur_name = next_name;
+      }
+    }
+    const std::string final_name = cur_name;
+
     ASSERT_EQ(fsync_file_handle(handle, true), 0);
 
-    // Old path gone, new path serves the exact written content.
-    uint64_t gone_id = 0;
-    ASSERT_EQ(fs_->lookup(parent, "rename_wr_src", &gone_id, &st), -ENOENT);
+    // Every name the file had before the final one must be gone.
+    for (const auto &name : stale_names) {
+      uint64_t gone_id = 0;
+      ASSERT_EQ(fs_->lookup(parent, name.c_str(), &gone_id, &st), -ENOENT)
+          << name;
+    }
 
+    // The final target must hold all chunks, each at its correct offset.
     uint64_t dst_id = 0;
-    ASSERT_EQ(fs_->lookup(parent, "rename_wr_dst", &dst_id, &st), 0);
+    ASSERT_EQ(fs_->lookup(parent, final_name.c_str(), &dst_id, &st), 0);
     DEFER(fs_->forget(dst_id, 1));
-    ASSERT_EQ(st.st_size, (off_t)(4 * kChunk));
+    ASSERT_EQ(st.st_size, (off_t)(kNumChunks * kChunk));
 
     void *dst_handle = nullptr;
     ASSERT_EQ(fs_->open(dst_id, O_RDONLY, &dst_handle, &keep_cache), 0);
@@ -755,13 +883,14 @@ class Ossfs2HdfsRenameTest : public OssHdfsTestSuite {
     DEFER(fs_->release(dst_id, dst_reader));
 
     std::vector<char> buf(kChunk);
-    for (uint64_t off = 0; off < 4; off++) {
-      ASSERT_EQ(dst_reader->pread(buf.data(), kChunk, off * kChunk),
+    for (uint64_t c = 0; c < kNumChunks; c++) {
+      ASSERT_EQ(dst_reader->pread(buf.data(), kChunk, c * kChunk),
                 (ssize_t)kChunk)
-          << "chunk " << off;
-      ASSERT_EQ(memcmp(buf.data(), data.data(), kChunk), 0) << "chunk " << off;
+          << "chunk " << c;
+      ASSERT_EQ(memcmp(buf.data(), chunks[c].data(), kChunk), 0)
+          << "chunk " << c;
     }
-    ASSERT_EQ(dst_reader->pread(buf.data(), kChunk, 4 * kChunk), 0);
+    ASSERT_EQ(dst_reader->pread(buf.data(), kChunk, kNumChunks * kChunk), 0);
   }
 };
 
@@ -888,6 +1017,20 @@ TEST_F(Ossfs2HdfsRenameTest, verify_read_open_file_after_rename) {
   verify_read_open_file_after_rename();
 }
 
+TEST_F(Ossfs2HdfsRenameTest, verify_read_after_rename_ftruncate_rebuild_retry) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_read_after_rename_path_refresh(false);
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_read_after_rename_fallocate_rebuild_retry) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_read_after_rename_path_refresh(true);
+}
+
 TEST_F(Ossfs2HdfsRenameTest, verify_read_rebuild_reopen_fail_retries) {
   INIT_PHOTON();
   OssFsOptions opts;
@@ -895,10 +1038,18 @@ TEST_F(Ossfs2HdfsRenameTest, verify_read_rebuild_reopen_fail_retries) {
   verify_read_rebuild_reopen_fail_retries();
 }
 
-TEST_F(Ossfs2HdfsRenameTest, verify_write_open_file_after_rename) {
+TEST_F(Ossfs2HdfsRenameTest, verify_write_open_file_after_rename_random_write) {
   INIT_PHOTON();
   OssFsOptions opts;
   FLAGS_write_with_fuse_bufvec = false;
   init(opts);
-  verify_write_open_file_after_rename();
+  verify_write_open_file_after_rename(false);
+}
+
+TEST_F(Ossfs2HdfsRenameTest, verify_write_open_file_after_rename_append) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  FLAGS_write_with_fuse_bufvec = false;
+  init(opts);
+  verify_write_open_file_after_rename(true);
 }

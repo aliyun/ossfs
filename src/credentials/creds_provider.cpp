@@ -30,6 +30,10 @@ namespace OssFileSystem {
 
 int CredentialsParser::from_json(const std::string &body, Result &out) {
   if (body.empty()) return -EINVAL;
+  // parse_copy() copies via strndup(), which stops at an embedded NUL yet
+  // still passes the original length to the parser, causing a heap
+  // out-of-bounds read (CWE-125). Reject such bodies before parsing.
+  if (body.find('\0') != std::string::npos) return -EINVAL;
   auto root = photon::SimpleDOM::parse_copy(body.c_str(), body.size(),
                                             photon::SimpleDOM::DOC_JSON);
   if (!root[kAccessKeyId] || !root[kAccessKeySecret]) {

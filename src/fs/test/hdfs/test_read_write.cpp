@@ -829,6 +829,55 @@ class Ossfs2HdfsReadWriteTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
   }
 
+  // Extending a closed file needs a temporary writer; bare fallocate returns
+  // EAGAIN.
+  void verify_truncate_extend_after_close() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = create_and_flush(parent, "trunc_ext_closed", CREATE_BASE_FLAGS,
+                             0777, 0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto file = get_file_from_handle(handle);
+    const char *data = "01234";
+    ssize_t w = file->pwrite(data, strlen(data), 0);
+    ASSERT_EQ(w, (ssize_t)strlen(data));
+
+    r = fs_->fsync(nodeid, handle, false);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+
+    struct stat new_st;
+    memset(&new_st, 0, sizeof(new_st));
+    new_st.st_size = 10;
+    r = fs_->setattr(nodeid, &new_st, FUSE_SET_ATTR_SIZE);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->getattr(nodeid, &st);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(st.st_size, (off_t)10);
+
+    void *rd_handle = nullptr;
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_RDONLY, &rd_handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    char verify[10];
+    memset(verify, (char)0xAA, sizeof(verify));
+    ssize_t n = get_file_from_handle(rd_handle)->pread(verify, 10, 0);
+    ASSERT_EQ(n, (ssize_t)10);
+    ASSERT_EQ(memcmp(verify, "01234", 5), 0);
+    for (int i = 5; i < 10; i++) ASSERT_EQ(verify[i], 0);
+    r = fs_->release(nodeid, get_file_from_handle(rd_handle));
+    ASSERT_EQ(r, 0);
+  }
+
   // ftruncate: no-op when size unchanged.
   void verify_ftruncate_no_change() {
     uint64_t parent = get_test_dir_parent();
@@ -850,6 +899,94 @@ class Ossfs2HdfsReadWriteTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
 
     r = fs_->release(nodeid, get_file_from_handle(handle));
+    ASSERT_EQ(r, 0);
+  }
+
+  // O_TRUNC must reset cached attr.size to 0 so that subsequent getattr,
+  // ftruncate and fallocate use the real post-truncation size.
+  // Regression test for H4: without the fix, the inode keeps the stale size
+  // from the previous write, causing ftruncate-extend to be misidentified as
+  // a shrink.
+  void verify_open_trunc_resets_cached_size() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    struct stat st;
+
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    int r = create_and_flush(parent, "trunc_size_reset", CREATE_BASE_FLAGS,
+                             0777, 0, 0, 0, &nodeid, &st, &handle);
+    ASSERT_EQ(r, 0);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto file = get_file_from_handle(handle);
+    char buf[4096];
+    memset(buf, 'A', sizeof(buf));
+    ssize_t w = file->pwrite(buf, sizeof(buf), 0);
+    ASSERT_EQ(w, (ssize_t)sizeof(buf));
+    r = fs_->fsync(nodeid, handle, false);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->getattr(nodeid, &st);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(st.st_size, (off_t)4096);
+
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+
+    // Reopen with O_WRONLY|O_TRUNC — backend is now 0 bytes.
+    void *trunc_handle = nullptr;
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_WRONLY | O_TRUNC, &trunc_handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    auto tfile = get_file_from_handle(trunc_handle);
+
+    // Cached size must be 0 immediately after O_TRUNC open.
+    r = fs_->getattr(nodeid, &st);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(st.st_size, (off_t)0)
+        << "O_TRUNC open must reset cached attr.size to 0";
+
+    // Write 10 bytes; size must reflect only the new write.
+    memset(buf, 'B', 10);
+    w = tfile->pwrite(buf, 10, 0);
+    ASSERT_EQ(w, 10);
+    r = fs_->fsync(nodeid, trunc_handle, false);
+    ASSERT_EQ(r, 0);
+
+    r = fs_->getattr(nodeid, &st);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(st.st_size, (off_t)10);
+
+    // ftruncate to 50: this is an extend (10 → 50).
+    // Without the fix, stale size=4096 makes this look like a shrink.
+    struct stat new_stat;
+    memset(&new_stat, 0, sizeof(new_stat));
+    new_stat.st_size = 50;
+    struct fuse_file_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.fh = reinterpret_cast<uint64_t>(trunc_handle);
+    r = fs_->setattr(nodeid, &new_stat, FUSE_SET_ATTR_SIZE, &fi, 0, 0);
+    ASSERT_EQ(r, 0) << "ftruncate(50) on a 10-byte file must succeed as extend";
+
+    r = fs_->getattr(nodeid, &st);
+    ASSERT_EQ(r, 0);
+    ASSERT_EQ(st.st_size, (off_t)50);
+
+    r = fs_->release(nodeid, tfile);
+    ASSERT_EQ(r, 0);
+
+    // Verify via a fresh read handle.
+    void *rd_handle = nullptr;
+    r = fs_->open(nodeid, O_RDONLY, &rd_handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    char verify[50];
+    memset(verify, 0, sizeof(verify));
+    ssize_t n = get_file_from_handle(rd_handle)->pread(verify, 50, 0);
+    ASSERT_EQ(n, (ssize_t)50);
+    ASSERT_EQ(verify[0], 'B');
+    ASSERT_EQ(verify[9], 'B');
+    r = fs_->release(nodeid, get_file_from_handle(rd_handle));
     ASSERT_EQ(r, 0);
   }
 
@@ -1499,6 +1636,133 @@ class Ossfs2HdfsReadWriteTest : public OssHdfsTestSuite {
     ASSERT_EQ(r, 0);
   }
 
+  // After a read failure the SDK consumed 0 bytes (atomic), so read_offset_
+  // still mirrors the stream cursor; a same-offset retry must return the
+  // correct bytes without any fix-up.
+  void verify_pread_retry_after_read_fail_is_aligned() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_fi_test_file(parent, "pread_retry", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto file = get_file_from_handle(handle);
+    const char *data = "ABCDEFGHIJKLMNOP";
+    ssize_t w = file->pwrite(data, strlen(data), 0);
+    ASSERT_EQ(w, (ssize_t)strlen(data));
+    int r = fs_->fsync(nodeid, handle, false);
+    ASSERT_EQ(r, 0);
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+
+    void *read_handle = nullptr;
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_RDONLY, &read_handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    auto reader = get_file_from_handle(read_handle);
+
+    g_fault_injector->set_injection(FI_HdfsPread_ReadFail,
+                                    FaultInjection(/*run_count=*/1));
+    DEFER(g_fault_injector->clear_injection(FI_HdfsPread_ReadFail));
+    char buf[16] = {};
+    ssize_t n = reader->pread(buf, 8, 0);
+    ASSERT_EQ(n, -EIO);
+
+    // Retry the same offset: must land at byte 0, not at the advanced cursor.
+    memset(buf, 0, sizeof(buf));
+    n = reader->pread(buf, 8, 0);
+    ASSERT_EQ(n, 8);
+    ASSERT_EQ(std::string(buf, n), std::string("ABCDEFGH"))
+        << "retry after read failure must re-seek to the requested offset";
+
+    r = fs_->release(nodeid, reader);
+    ASSERT_EQ(r, 0);
+  }
+
+  // After a short write the stream advanced but write_offset_ stayed at the
+  // requested offset; a same-offset retry must re-seek and overwrite in place.
+  void verify_pwrite_retry_after_short_write_is_aligned() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_fi_test_file(parent, "pw_short", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto file = get_file_from_handle(handle);
+
+    g_fault_injector->set_injection(FI_HdfsWrite_ShortWrite,
+                                    FaultInjection(/*run_count=*/1));
+    DEFER(g_fault_injector->clear_injection(FI_HdfsWrite_ShortWrite));
+    ssize_t w = file->pwrite("AAAA", 4, 0);
+    ASSERT_EQ(w, -EIO);
+
+    // Retry the same offset: must overwrite [0,4) in place.
+    w = file->pwrite("BBBB", 4, 0);
+    ASSERT_EQ(w, 4);
+
+    int r = fs_->fsync(nodeid, handle, false);
+    ASSERT_EQ(r, 0);
+    r = fs_->release(nodeid, file);
+    ASSERT_EQ(r, 0);
+
+    void *read_handle = nullptr;
+    bool keep_cache = false;
+    r = fs_->open(nodeid, O_RDONLY, &read_handle, &keep_cache);
+    ASSERT_EQ(r, 0);
+    auto reader = get_file_from_handle(read_handle);
+    char buf[8] = {};
+    ssize_t n = reader->pread(buf, 4, 0);
+    ASSERT_EQ(n, 4);
+    ASSERT_EQ(std::string(buf, n), std::string("BBBB"))
+        << "retry after short write must overwrite at the requested offset";
+
+    r = fs_->release(nodeid, reader);
+    ASSERT_EQ(r, 0);
+  }
+
+  // A failed append must not corrupt write_offset_: O_APPEND never re-seeks,
+  // so a write error raised before any byte reaches the stream must leave the
+  // cached offset intact instead of resetting it to the -1 sentinel.
+  void verify_append_failure_preserves_write_offset() {
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    uint64_t nodeid = 0;
+    void *handle = nullptr;
+    create_fi_test_file(parent, "append_fail", nodeid, handle);
+    DEFER(fs_->forget(nodeid, 1));
+
+    auto *hfile = static_cast<HdfsFileHandle *>(get_file_from_handle(handle));
+    ASSERT_EQ(hfile->pwrite("HHHH", 4, 0), 4);
+    ASSERT_EQ(fs_->fsync(nodeid, handle, false), 0);
+    ASSERT_EQ(fs_->release(nodeid, hfile), 0);
+
+    void *append_handle = nullptr;
+    bool keep_cache = false;
+    ASSERT_EQ(
+        fs_->open(nodeid, O_WRONLY | O_APPEND, &append_handle, &keep_cache), 0);
+    auto *afile =
+        static_cast<HdfsFileHandle *>(get_file_from_handle(append_handle));
+    const off_t start = afile->write_offset_;  // cached EOF on open
+
+    // Fail one append before any byte reaches the stream.
+    g_fault_injector->set_injection(FI_HdfsWriteBuf_ReadError,
+                                    FaultInjection(/*run_count=*/1));
+    DEFER(g_fault_injector->clear_injection(FI_HdfsWriteBuf_ReadError));
+    char payload[4] = {'A', 'A', 'A', 'A'};
+    struct fuse_bufvec vec = {};
+    vec.count = 1;
+    vec.buf[0].mem = payload;  // memory buffer (flags left 0)
+    vec.buf[0].size = sizeof(payload);
+    ASSERT_EQ(fs_->write_buf(nodeid, append_handle, &vec, start), -EIO);
+
+    ASSERT_EQ(afile->write_offset_, start)
+        << "a failed append must not corrupt write_offset_ under O_APPEND";
+
+    ASSERT_EQ(fs_->release(nodeid, afile), 0);
+  }
+
   // Hidden inode fdatasync: unlink while open hides the file; fsync flushes
   // normally and returns 0, and the hidden object is deleted on release.
   void verify_fdatasync_hidden_inode_succeeds() {
@@ -1712,6 +1976,13 @@ TEST_F(Ossfs2HdfsReadWriteTest, verify_ftruncate_extend_via_fallocate) {
   verify_ftruncate_extend_via_fallocate();
 }
 
+TEST_F(Ossfs2HdfsReadWriteTest, verify_truncate_extend_after_close) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_truncate_extend_after_close();
+}
+
 TEST_F(Ossfs2HdfsReadWriteTest, verify_ftruncate_no_change) {
   INIT_PHOTON();
   OssFsOptions opts;
@@ -1903,4 +2174,33 @@ TEST_F(Ossfs2HdfsReadWriteTest, verify_fallocate_call_fail) {
   int r = fs_->fallocate(nodeid, 0, 1024, handle);
   ASSERT_EQ(r, -EIO);
   fs_->release(nodeid, get_file_from_handle(handle));
+}
+
+TEST_F(Ossfs2HdfsReadWriteTest, verify_pread_retry_after_read_fail_is_aligned) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_pread_retry_after_read_fail_is_aligned();
+}
+
+TEST_F(Ossfs2HdfsReadWriteTest,
+       verify_pwrite_retry_after_short_write_is_aligned) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_pwrite_retry_after_short_write_is_aligned();
+}
+
+TEST_F(Ossfs2HdfsReadWriteTest, verify_append_failure_preserves_write_offset) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_append_failure_preserves_write_offset();
+}
+
+TEST_F(Ossfs2HdfsReadWriteTest, verify_open_trunc_resets_cached_size) {
+  INIT_PHOTON();
+  OssFsOptions opts;
+  init(opts);
+  verify_open_trunc_resets_cached_size();
 }

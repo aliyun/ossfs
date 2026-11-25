@@ -67,6 +67,7 @@ typedef enum {
   FI_HdfsPread_SeekFail,
   FI_HdfsPread_ReadFail,
   FI_HdfsWrite_SeekFail,
+  FI_HdfsWrite_ShortWrite,
   FI_HdfsWriteBuf_ReadError,
   FI_Check_Bucket_List_Not_Found,
   FI_HdfsSymlink_BadTarget,
@@ -83,6 +84,7 @@ typedef enum {
   FI_RandomWrite_Complete_Multipart_Fail,
   FI_RandomWrite_Copy_Part_No_Crc,
   FI_Upload_BodyWriter_Partial_Fail,
+  FI_RandomWrite_Complete_Crc_Mismatch,
   FI_Count,
 } FaultInjectionId;
 
@@ -136,6 +138,7 @@ static const std::string_view FaultInjectionName[] = {
     "FI_HdfsPread_SeekFail",
     "FI_HdfsPread_ReadFail",
     "FI_HdfsWrite_SeekFail",
+    "FI_HdfsWrite_ShortWrite",
     "FI_HdfsWriteBuf_ReadError",
     "FI_Check_Bucket_List_Not_Found",
     "FI_HdfsSymlink_BadTarget",
@@ -152,6 +155,7 @@ static const std::string_view FaultInjectionName[] = {
     "FI_RandomWrite_Complete_Multipart_Fail",
     "FI_RandomWrite_Copy_Part_No_Crc",
     "FI_Upload_BodyWriter_Partial_Fail",
+    "FI_RandomWrite_Complete_Crc_Mismatch",
 };
 
 static_assert(sizeof(FaultInjectionName) / sizeof(std::string_view) == FI_Count,

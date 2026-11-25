@@ -85,6 +85,15 @@ class Ossfs2CredentialsTest : public Ossfs2TestSuite {
     LOG_INFO("Test `", credentials_response2);
     r = CredentialsParser::from_json(credentials_response2, result);
     EXPECT_EQ(r, -EINVAL);
+
+    // An embedded NUL must be rejected up front: parse_copy() truncates the
+    // buffer at the NUL while still parsing with the full length, reading past
+    // the allocation (heap out-of-bounds read, CWE-125).
+    std::string nul_body("{\"AccessKeyId\":");
+    nul_body.push_back('\0');
+    nul_body.append("\"ak\"}");
+    r = CredentialsParser::from_json(nul_body, result);
+    EXPECT_EQ(r, -EINVAL);
   }
 
   static void write_creds_file(const std::string &path,
@@ -126,6 +135,43 @@ class Ossfs2CredentialsTest : public Ossfs2TestSuite {
   void plant_expired_creds() {
     fs_->update_creds(ObjCredentials{"bad_ak", "bad_sk", ""},
                       {time(nullptr) - 10, fs_->creds_provider_->generation()});
+  }
+
+  void verify_validate_creds_qps_budget_isolation() {
+    // Business budget 60s, request timeout 2s: credential validation must use
+    // the short fallback, not the long business budget, because it runs under
+    // creds_refresh_mutex_ and would otherwise block rotation and force
+    // refresh.
+    auto orig_budget = FLAGS_oss_qps_limit_retry_timeout_ms;
+    auto orig_timeout = FLAGS_oss_request_timeout_ms;
+    DEFER(FLAGS_oss_qps_limit_retry_timeout_ms = orig_budget);
+    DEFER(FLAGS_oss_request_timeout_ms = orig_timeout);
+    FLAGS_oss_qps_limit_retry_timeout_ms = 60000;
+    FLAGS_oss_request_timeout_ms = 2000;
+    OssFsOptions opts;
+    init(opts);
+    ASSERT_EQ(oss_options_.qps_limit_total_retry_time_us, 60000ULL * 1000);
+
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_5xx);
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Qps_Limited);
+    // Bypass the real HTTP call so wall time is pure backoff, independent of
+    // network latency (the socket timeout is per-read, not a whole-request
+    // deadline). Failed_Without_Call skips op.call; 5xx lifts the status into
+    // the QPS branch. The initial transport retries add a fixed ~300ms.
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_OssError_Failed_Without_Call);
+    DEFER(g_fault_injector->clear_all_injections());
+    ObjCredentials creds{FLAGS_oss_access_key_id, FLAGS_oss_access_key_secret,
+                         ""};
+    auto before = std::chrono::steady_clock::now();
+    int r = fs_->validate_creds(creds);
+    auto cost = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - before);
+    ASSERT_NE(r, 0);
+    // ~2s QPS backoff (1s + 1s) + ~300ms transport retries. The unisolated
+    // business budget would back off >= 60s, far above this bound.
+    ASSERT_GE(cost.count(), 2000000);
+    ASSERT_LT(cost.count(), 3000000);
   }
 };
 
@@ -718,4 +764,9 @@ TEST_F(Ossfs2CredentialsTest, verify_force_refresh_reaches_every_bg_vcpu) {
               -ENOENT);
   }
   EXPECT_EQ(count_lines(count_path), 2);
+}
+
+TEST_F(Ossfs2CredentialsTest, verify_validate_creds_qps_budget_isolation) {
+  INIT_PHOTON();
+  verify_validate_creds_qps_budget_isolation();
 }

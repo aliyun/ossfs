@@ -18,6 +18,7 @@
 
 #include <city.h>
 #include <fcntl.h>
+#include <photon/common/utility.h>
 #include <photon/net/utils.h>
 #include <signal.h>
 #include <sys/dir.h>
@@ -481,6 +482,43 @@ std::vector<std::string_view> split_string(std::string_view str,
   return parts;
 }
 
+bool parse_oss_additional_headers(
+    std::string_view str,
+    std::vector<std::pair<std::string, std::string>> *headers) {
+  std::vector<std::pair<std::string, std::string>> result;
+  auto is_space = [](char c) { return c == ' ' || c == '\t'; };
+  for (char c : str) {
+    if (c == '\r' || c == '\n' || c == '\0') return false;
+  }
+  if (trim_string_view(str, is_space).empty()) {
+    headers->clear();
+    return true;
+  }
+  for (auto item : split_string(str, ";")) {
+    auto eq = item.find('=');
+    if (eq == std::string_view::npos) return false;
+    auto key = trim_string_view(item.substr(0, eq), is_space);
+    if (key.empty() || key.find_first_of(" \t:") != std::string_view::npos) {
+      return false;
+    }
+    std::string name(key);
+    for (char &c : name) {
+      if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    }
+    auto encoded = trim_string_view(item.substr(eq + 1), is_space);
+    std::string value;
+    if (!encoded.empty() && !photon::net::Base64Decode(encoded, value)) {
+      return false;
+    }
+    for (char c : value) {
+      if (c == '\r' || c == '\n' || c == '\0') return false;
+    }
+    result.emplace_back(std::move(name), std::move(value));
+  }
+  *headers = std::move(result);
+  return true;
+}
+
 std::string cityhash128_base64url(std::string_view data) {
   std::string ret;
   unsigned char hash[16];
@@ -524,6 +562,143 @@ bool normalize_dir_flag(std::string &dir) {
   dir = normalized;
   return true;
 }
+
+// Fail to stderr (logger not up yet) and return false.
+#define LOG_DIR_FAIL(...)         \
+  do {                            \
+    fprintf(stderr, __VA_ARGS__); \
+    return false;                 \
+  } while (0)
+
+// lstat + type-check dir, mkdir(mode) if missing; re-stat after EEXIST race.
+static bool stat_or_mkdir(const std::string &dir, mode_t mode,
+                          struct stat *st) {
+  if (lstat(dir.c_str(), st) != 0) {
+    if (errno != ENOENT)
+      LOG_DIR_FAIL("ERROR: cannot stat log dir %s: %s\n", dir.c_str(),
+                   strerror(errno));
+    if (mkdir(dir.c_str(), mode) != 0 && errno != EEXIST)
+      LOG_DIR_FAIL("ERROR: cannot create log dir %s: %s\n", dir.c_str(),
+                   strerror(errno));
+    if (lstat(dir.c_str(), st) != 0)
+      LOG_DIR_FAIL("ERROR: cannot stat log dir %s: %s\n", dir.c_str(),
+                   strerror(errno));
+  }
+  if (S_ISLNK(st->st_mode) || !S_ISDIR(st->st_mode))
+    LOG_DIR_FAIL("ERROR: log dir %s must be a real directory, not a %s\n",
+                 dir.c_str(), S_ISLNK(st->st_mode) ? "symlink" : "file");
+  return true;
+}
+
+// Pin, re-check, fchmod if changed; take_over also fchowns to root.
+static bool set_log_dir_mode(const std::string &dir, mode_t want,
+                             bool take_over) {
+  int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (fd < 0)
+    LOG_DIR_FAIL("ERROR: cannot open log dir %s for hardening: %s\n",
+                 dir.c_str(), strerror(errno));
+  // Deferred close runs after strerror(), preserving errno.
+  DEFER(close(fd));
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+      (!take_over && st.st_uid != geteuid()))
+    LOG_DIR_FAIL("ERROR: log dir %s changed under us during hardening\n",
+                 dir.c_str());
+  if (take_over && fchown(fd, 0, (gid_t)-1) != 0)
+    LOG_DIR_FAIL("ERROR: cannot take over log dir %s: %s\n", dir.c_str(),
+                 strerror(errno));
+  if (want != (st.st_mode & 07777) && fchmod(fd, want) != 0)
+    LOG_DIR_FAIL("ERROR: cannot chmod log dir %s to %04o: %s\n", dir.c_str(),
+                 (unsigned)want, strerror(errno));
+  return true;
+}
+
+static bool writable_without_sticky(const struct stat &st) {
+  return (st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX);
+}
+
+// lstat every ancestor of dir (excluding dir itself), creating missing ones.
+static bool secure_log_dir_ancestors(const std::string &dir) {
+  const bool root = geteuid() == 0;
+  std::string path;
+  size_t pos = 0;
+  while ((pos = dir.find('/', pos + 1)) != std::string::npos) {
+    path = dir.substr(0, pos);
+    struct stat st;
+    if (!stat_or_mkdir(path, 0755, &st)) return false;
+    if (root && st.st_uid != 0 && (st.st_mode & (S_IWGRP | S_IWOTH)))
+      LOG_DIR_FAIL(
+          "ERROR: %s is owned by uid %d and writable by others, "
+          "refusing to use it as log dir\n",
+          path.c_str(), (int)st.st_uid);
+    // No sticky on a g/o-writable ancestor allows symlink swaps.
+    if (root && writable_without_sticky(st))
+      LOG_DIR_FAIL(
+          "ERROR: %s is writable by group/others without the sticky bit, "
+          "refusing to use it as log dir\n",
+          path.c_str());
+    if (!root && ::access(path.c_str(), X_OK) != 0)
+      LOG_DIR_FAIL("ERROR: %s is not accessible: %s\n", path.c_str(),
+                   strerror(errno));
+  }
+  return true;
+}
+
+bool secure_shared_log_dir(const std::string &dir, bool is_default_path) {
+  if (dir.empty()) return true;
+  // Vet/create ancestors first so symlinks can't redirect the mkdir/chmod.
+  if (!secure_log_dir_ancestors(dir)) return false;
+  const bool root = geteuid() == 0;
+
+  struct stat st;
+  if (!stat_or_mkdir(dir, is_default_path ? 01777 : 0755, &st)) return false;
+
+  bool take_over = false;
+  if (st.st_uid != geteuid()) {
+    if (!root) {
+      // Multi-user layout: warn only when truly unwritable.
+      if (::access(dir.c_str(), W_OK) != 0)
+        fprintf(stderr,
+                "WARN: log dir %s is owned by uid %d and not writable by the "
+                "current user, file logging may be unavailable\n",
+                dir.c_str(), (int)st.st_uid);
+      return true;
+    }
+    if (!is_default_path)
+      LOG_DIR_FAIL(
+          "ERROR: log dir %s is owned by uid %d, please chown it to root\n",
+          dir.c_str(), (int)st.st_uid);
+    // Root takes over the default dir; per-user entries are vetted below.
+    take_over = true;
+  }
+
+  // Default is a multi-user drop dir (1777 like /tmp); custom keeps its mode.
+  mode_t want = st.st_mode & 07777;
+  if (is_default_path) {
+    want = 01777;
+  } else if (want & (S_IWGRP | S_IWOTH)) {
+    want |= S_ISVTX;
+  }
+  return set_log_dir_mode(dir, want, take_over);
+}
+
+bool secure_private_log_dir(const std::string &dir) {
+  if (dir.empty()) return true;
+  if (!secure_log_dir_ancestors(dir)) return false;
+
+  struct stat st;
+  if (!stat_or_mkdir(dir, 0755, &st)) return false;
+  if (st.st_uid != geteuid())
+    LOG_DIR_FAIL(
+        "ERROR: log dir %s is owned by uid %d instead of the current "
+        "user; it may have been pre-created by another user, refusing "
+        "to use it (remove it manually if this is a false alarm)\n",
+        dir.c_str(), (int)st.st_uid);
+  // 0755: logs readable by all, writable only by the owner.
+  return set_log_dir_mode(dir, 0755, false);
+}
+
+#undef LOG_DIR_FAIL
 
 // Check that a directory exists (creating it if absent) and is accessible.
 static bool ensure_dir(const std::string &dir) {
@@ -594,8 +769,7 @@ bool validate_dir_params(std::string_view log_dir, std::string_view cache_dir,
   // log_dir and cache_dir must not be the same or nested.
   if (dir_conflict(log, cache)) return false;
 
-  // Ensure each directory exists and is accessible.
-  if (!log.empty() && !ensure_dir(log)) return false;
+  // Create cache/temp dirs; the log dir is handled by the secure helpers.
   if (!cache.empty() && !ensure_dir(cache)) return false;
   if (!temp.empty() && !ensure_dir(temp)) return false;
 

@@ -1,11 +1,9 @@
 diff --git a/ecosystem/oss.cpp b/ecosystem/oss_patched.cpp
-similarity index 98%
 rename from ecosystem/oss.cpp
 rename to ecosystem/oss_patched.cpp
-index 1b8bf0c..1e290e7 100644
 --- a/ecosystem/oss.cpp
 +++ b/ecosystem/oss_patched.cpp
-@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
+@@ -14,7 +14,7 @@
  limitations under the License.
  */
  
@@ -13,8 +11,8 @@ index 1b8bf0c..1e290e7 100644
 +#include "oss_patched.h"
  
  #include <netinet/in.h>
- #include <photon/common/alog-stdstring.h>
-@@ -34,8 +34,11 @@ limitations under the License.
+ #include <strings.h>
+@@ -35,8 +35,11 @@
  #include <string>
  #include <unordered_map>
  
@@ -27,9 +25,54 @@ index 1b8bf0c..1e290e7 100644
  
  // unused constants will trigger compile error in photon,
  // unless they are defined in a header file
-@@ -203,6 +206,13 @@ static int error_http_status_to_errno(int status_code) {
+@@ -225,16 +228,69 @@
+     trace.retry_after_ms = estring_view(it.second()).to_uint64() * 1000;
+ }
+ 
++// Signature headers that must be refreshed when re-signing a retried request.
++static const std::string_view kSignatureHeaders[] = {
++    "Authorization", "x-oss-security-token", "x-oss-date",
++    "x-oss-content-sha256", "Date"};
++
++// HeadersBase has no per-key erase; rebuild the header block without the
++// stale signature headers so a fresh sign() can insert updated values.
++// Host must be re-inserted first: reset_host() locates it by physical
++// offset 0 alone, while iteration order is sorted by header name.
++static int strip_signature_headers(photon::net::http::Headers& headers) {
++  std::vector<std::pair<std::string, std::string>> keep;
++  std::pair<std::string, std::string> host;
++  for (auto kv : headers) {
++    bool is_sig = false;
++    for (auto k : kSignatureHeaders) {
++      if (kv.first.size() == k.size() &&
++          strncasecmp(kv.first.data(), k.data(), k.size()) == 0) {
++        is_sig = true;
++        break;
++      }
++    }
++    if (is_sig) continue;
++    if (kv.first.size() == 4 &&
++        strncasecmp(kv.first.data(), "Host", 4) == 0) {
++      host.first = kv.first;
++      host.second = kv.second;
++      continue;
++    }
++    keep.emplace_back(kv.first, kv.second);
++  }
++  headers.reset();
++  if (!host.first.empty() && headers.insert(host.first, host.second) < 0)
++    LOG_ERROR_RETURN(0, -1, "failed to rebuild Host header");
++  for (auto& kv : keep)
++    if (headers.insert(kv.first, kv.second) < 0)
++      LOG_ERROR_RETURN(0, -1, "failed to rebuild header `", kv.first);
++  return 0;
++}
++
  static int do_http_call(HTTP_STACK_OP& op, const ClientOptions& options,
-                         std::string_view object) {
+                         std::string_view object,
+-                        RequestTrace* trace = nullptr) {
++                        RequestTrace* trace,
++                        Delegate<int> resign) {
    int ret = -1;
 +  FAULT_INJECTION(FI_OssError_Call_Timeout, [&]() {
 +    photon::thread_usleep(200'000);
@@ -41,7 +84,20 @@ index 1b8bf0c..1e290e7 100644
    auto retry_times = options.retry_times;
    auto retry_interval = options.retry_base_interval_us;
  
-@@ -214,6 +224,11 @@ __retry:
+   uint64_t qps_limit_retry_interval = 1000'000;
++  // Cap a single QPS-limit backoff sleep at 20s, aligned with the default
++  // MaxBackoff of aliyun OSS SDK v2 retry.Standard.
++  const uint64_t max_qps_retry_interval_us = 20ULL * 1000 * 1000;
+   auto qps_limit_total_retry_time =
+-      std::max(options.request_timeout_us, qps_limit_retry_interval);
++      std::max(options.qps_limit_total_retry_time_us
++                   ? options.qps_limit_total_retry_time_us
++                   : options.request_timeout_us,
++               qps_limit_retry_interval);
+ 
+   bool throttled = false;
+   DEFER(if (trace) fill_request_trace(op, *trace, throttled));
+@@ -244,6 +300,11 @@
    int __saved_errno = errno;
    {
      int r = 0;
@@ -53,7 +109,7 @@ index 1b8bf0c..1e290e7 100644
      auto start_time = std::chrono::steady_clock::now();
      LOG_DEBUG("Sending oss request ` ` Range[`]", verbstr[op.req.verb()],
                op.req.target(), op.req.headers["Range"]);
-@@ -228,6 +243,11 @@ __retry:
+@@ -258,6 +319,11 @@
          "Got oss response ` ` Range[`], code=` content_length=` latency_us=`",
          verbstr[op.req.verb()], op.req.target(), op.req.headers["Range"],
          op.resp.status_code(), op.resp.headers.content_length(), latency);
@@ -65,7 +121,7 @@ index 1b8bf0c..1e290e7 100644
      if (r < 0) {
        if (retry_times-- > 0) {
          photon::thread_usleep(retry_interval);
-@@ -237,6 +257,11 @@ __retry:
+@@ -267,6 +333,11 @@
          goto __retry;
        }
      }
@@ -77,7 +133,7 @@ index 1b8bf0c..1e290e7 100644
    }
  
    if (op.status_code != 200 && op.status_code != 206 && op.status_code != 204) {
-@@ -252,6 +277,9 @@ __retry:
+@@ -282,13 +353,22 @@
            error_res["EC"].to_string_view());
        // clang-format on
  
@@ -85,9 +141,75 @@ index 1b8bf0c..1e290e7 100644
 +                      [&]() { code_view = "TotalQpsLimitExceeded"; });
 +
        if (code_view.find("QpsLimitExceeded") != std::string::npos) {
+         throttled = true;
          if (qps_limit_retry_interval > 0) {
            photon::thread_usleep(qps_limit_retry_interval);
-@@ -538,6 +566,9 @@ int OssClient::walk_list_results(const SimpleDOM::Node& list_bucket_result,
+           qps_limit_total_retry_time -= qps_limit_retry_interval;
+-          qps_limit_retry_interval = std::min(qps_limit_retry_interval * 2,
+-                                              qps_limit_total_retry_time);
++          qps_limit_retry_interval =
++              std::min({qps_limit_retry_interval * 2,
++                        qps_limit_total_retry_time, max_qps_retry_interval_us});
++          // Re-sign so long retry windows do not outlive the OSS 15-minute
++          // request-time validity (RequestTimeTooSkewed).
++          if (resign() < 0)
++            LOG_ERROR_RETURN(0, -1, "failed to re-sign oss request ` `",
++                             verbstr[op.req.verb()], op.req.target());
+           LOG_ERROR("Retrying oss request ` `, ` us more to retry",
+                     verbstr[op.req.verb()], op.req.target(),
+                     qps_limit_total_retry_time);
+@@ -451,7 +531,8 @@
+                           photon::net::http::Headers& headers,
+                           const StringKV& query_params = {},
+                           bool invalidate_cache = false);
+-  void inject_custom_headers(photon::net::http::Headers& headers);
++  int inject_custom_headers(photon::net::http::Headers& headers,
++                            const Authenticator::SignParameters& params);
+   int sign_and_call(HTTP_STACK_OP& op, photon::net::http::Verb verb,
+                     const OssUrl& oss_url, const StringKV& query_params = {},
+                     bool invalidate_cache = false,
+@@ -610,14 +691,22 @@
+   params.invalidate_cache = invalidate_cache;
+ 
+   // inject custom headers before sign so x-oss-* headers participate in signing
+-  inject_custom_headers(headers);
++  if (inject_custom_headers(headers, params) < 0) return -1;
+   return m_authenticator->sign(headers, params);
+ }
+ 
+-void OssClient::inject_custom_headers(photon::net::http::Headers& headers) {
++int OssClient::inject_custom_headers(
++    photon::net::http::Headers& headers,
++    const Authenticator::SignParameters& params) {
+   for (const auto& kv : m_oss_options.custom_headers) {
+-    headers.insert(kv.first, kv.second);
++    int ret = headers.insert(kv.first, kv.second);
++    if (ret < 0 && ret != -EEXIST) {
++      // clang-format off
++      LOG_ERROR_RETURN(0, ret, "OSS header insert failed ` bucket=` object=` `", kv.first, params.bucket, params.object, ERRNO());
++      // clang-format on
++    }
+   }
++  return 0;
+ }
+ 
+ int OssClient::sign_and_call(HTTP_STACK_OP& op, photon::net::http::Verb verb,
+@@ -627,7 +716,13 @@
+   int r = append_auth_headers(verb, oss_url, op.req.headers, query_params,
+                               invalidate_cache);
+   if (r < 0) return r;
+-  return do_http_call(op, m_oss_options, oss_url.object(), trace);
++  auto resign = [&]() -> int {
++    int r = strip_signature_headers(op.req.headers);
++    if (r < 0) return r;
++    return append_auth_headers(verb, oss_url, op.req.headers, query_params,
++                               true);
++  };
++  return do_http_call(op, m_oss_options, oss_url.object(), trace, resign);
+ }
+ 
+ int OssClient::walk_list_results(const SimpleDOM::Node& list_bucket_result,
+@@ -638,6 +733,9 @@
      auto mtime = NodeStrValue(child["LastModified"]);
      auto etag = NodeStrValue(child["ETag"]);
      auto type = NodeStrValue(child["Type"]);
@@ -97,7 +219,22 @@ index 1b8bf0c..1e290e7 100644
  
      if (!key.has_value() || !size.has_value() || !mtime.has_value() ||
          !etag.has_value())
-@@ -754,6 +785,8 @@ retry:
+@@ -840,13 +938,10 @@
+   op.req.headers.insert(OSS_HEADER_KEY_CONTENT_MD5, md5);
+   op.req.headers.content_length(body_view.sum());
+   op.body_writer = {&body_view, &body_writer_cb};
+-  int r =
+-      append_auth_headers(Verb::POST, oss_url, op.req.headers, query_params);
+-  if (r < 0) return r;
+ 
+ retry:
+   size_t deleted_size = 0;
+-  r = do_http_call(op, m_oss_options, oss_url.object());
++  int r = sign_and_call(op, Verb::POST, oss_url, query_params);
+   if (r < 0) return r;
+ 
+   auto reader = get_xml_node(op);
+@@ -856,6 +951,8 @@
      if (key) deleted_size++;
    }
  
@@ -106,7 +243,16 @@ index 1b8bf0c..1e290e7 100644
    if (deleted_size != to_delete_size) {
      // Partial deletion happens when OSS server side is with pressure.
      // If this is the case , we just have another try. It's OK if some keys
-@@ -947,6 +980,7 @@ retry:
+@@ -866,6 +963,8 @@
+       LOG_WARN("Partial deletion. To delete ` deleted `. Retrying...",
+                to_delete_size, deleted_size);
+       photon::thread_usleep(retry_interval);
++      // Drop stale signature headers so the retry re-signs fresh.
++      if (strip_signature_headers(op.req.headers) < 0) return -1;
+       goto retry;
+     }
+     LOG_ERROR_RETURN(EIO, -1, "Partial deletion");
+@@ -1051,6 +1150,7 @@
  
    uint64_t content_length = op.resp.headers.content_length();
    auto ret = reader(&op.resp);
@@ -114,7 +260,7 @@ index 1b8bf0c..1e290e7 100644
    // we have encountered partial read issue because of the socket was
    // unexpectedly closed
    if (ret != static_cast<ssize_t>(content_length)) {
-@@ -1862,5 +1896,5 @@ Authenticator* new_cached_oss_authenticator(Authenticator* auth,
+@@ -2180,5 +2280,5 @@
    return auth;
  }
  
@@ -122,13 +268,11 @@ index 1b8bf0c..1e290e7 100644
 +}  // namespace objstore_from_photon
  }  // namespace photon
 diff --git a/ecosystem/oss.h b/ecosystem/oss_patched.h
-similarity index 99%
 rename from ecosystem/oss.h
 rename to ecosystem/oss_patched.h
-index a662454..7bb26f3 100644
 --- a/ecosystem/oss.h
 +++ b/ecosystem/oss_patched.h
-@@ -31,7 +31,7 @@ limitations under the License.
+@@ -31,7 +31,7 @@
  #include <vector>
  
  namespace photon {
@@ -137,7 +281,16 @@ index a662454..7bb26f3 100644
  
  using StringKV = ordered_string_kv;
  
-@@ -443,5 +443,5 @@ Authenticator* new_cached_oss_authenticator(Authenticator* auth,
+@@ -69,6 +69,8 @@
+   // For QPSLimit case, the policy is different. We will retry more
+   // times until we have waited the "request time out" period.
+   uint64_t retry_base_interval_us = 100'000;
++  // Total QPS-limit retry budget in us; 0 falls back to request_timeout_us.
++  uint64_t qps_limit_total_retry_time_us = 0;
+   std::vector<std::pair<std::string, std::string>> custom_headers;
+ 
+   IPVersion ip_version = IPVersion::kBoth;
+@@ -519,5 +521,5 @@
      auth_->set_credentials(std::move(credentials));
    }
  };*/

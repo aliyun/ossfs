@@ -209,7 +209,6 @@ int jdo_error_code_to_posix(int jdo_error_code) {
     case JDO_CLIENT_ERROR:
     case JDO_CLIENT_ILLEGAL_CONF_ERROR:
     case JDO_CLIENT_ILLEGAL_REQUEST_ERROR:
-    case JDO_CLIENT_CHECKSUM_ERROR:
     case JDO_JNI_OBJ_ALLOCATION_ERROR:
     case JDO_CONFIG_OPTION_ERROR:
     case JDO_CLIENT_NO_ENOUGHT_RESERVE_MEM_ERROR:
@@ -237,6 +236,7 @@ int jdo_error_code_to_posix(int jdo_error_code) {
     case JDO_RESOURCE_ERROR:
     case JDO_IO_ERROR:
     case JDO_CORRUPT_DATA_ERROR:
+    case JDO_CLIENT_CHECKSUM_ERROR:
       return -EIO;
 
     case JDO_FILE_NOT_FOUND_ERROR:
@@ -265,14 +265,20 @@ int jdo_error_code_to_posix(int jdo_error_code) {
     case JDO_NOT_SUPPORTED_ERROR:
       return -ENOTSUP;
 
-    case JDO_RENAME_DST_UNDER_SRC_ERROR:
-    case JDO_RENAME_DST_PARENT_NOT_FOUND_ERROR:
-    case JDO_RENAME_DST_PARENT_FILE_ERROR:
     case JDO_RENAME_SRC_NOT_FOUND_ERROR:
+    case JDO_RENAME_DST_PARENT_NOT_FOUND_ERROR:
+      return -ENOENT;
+
+    case JDO_RENAME_DST_PARENT_FILE_ERROR:
+      return -ENOTDIR;
+
     case JDO_RENAME_DST_EXIST_AS_FILE_ERROR:
+    case JDO_RENAME_DST_EXIST_ERROR:
+      return -EEXIST;
+
+    case JDO_RENAME_DST_UNDER_SRC_ERROR:
     case JDO_RENAME_SRC_EQ_DST_AS_DIRECTORY_ERROR:
     case JDO_RENAME_SRC_EQ_DST_AS_FILE_ERROR:
-    case JDO_RENAME_DST_EXIST_ERROR:
       return -EINVAL;
 
     case JDO_DELETE_NOT_ALLOW_ERROR:
@@ -307,7 +313,12 @@ int jdo_error_code_to_posix(int jdo_error_code) {
     case JDO_INVALID_ARGUMENT_ERROR:
       return -EINVAL;
 
+    // An expired HDFS write lease (e.g. the stream was invalidated by a
+    // concurrent truncate/reopen that took over the single writer holder)
+    // is not retriable, so report EIO.
     case JDO_LEASE_EXPIRED_ERROR:
+      return -EIO;
+
     case JDO_CONFLICT_LOCK_ERROR:
       return -EAGAIN;
 
@@ -743,8 +754,8 @@ int OssHdfsStore::do_list_dir(std::string_view path, ObjectList &results,
     uid_t uid = username_to_uid(user ? user : "");
     gid_t gid = groupname_to_gid(group ? group : "");
 
-    results.emplace_back(name, size, mtime_ts, type, "", perm, uid, gid,
-                         atime_ts);
+    results.emplace_back(name, size, mtime_ts, type, CompactEtag{}, perm, uid,
+                         gid, atime_ts);
 
     FAULT_INJECTION(FI_Readdir_list_Delay,
                     []() { photon::thread_usleep(1000 * 300); });
@@ -786,7 +797,7 @@ int OssHdfsStore::do_create_file(std::string_view path, mode_t mode) {
     LOG_ERROR("Failed to create empty HDFS file: `, ret: `", path, ret);
     return ret;
   }
-  int r = handle->close();
+  int r = handle->close(path);
   delete handle;
   if (r < 0) {
     LOG_ERROR("Failed to close after creating empty HDFS file: `, r: `", path,
@@ -925,26 +936,26 @@ IObjStore *new_oss_hdfs_store(const char *key, const char *key_secret,
 }
 
 OssHdfsStore::OssHdfsRawObjHandle::OssHdfsRawObjHandle(JdoStore_t store,
-
                                                        JdoIOContext_t io_ctx,
-                                                       std::string hdfs_path)
-    : store_(store), io_ctx_(io_ctx), path_(std::move(hdfs_path)) {}
+                                                       std::string uri)
+    : store_(store), io_ctx_(io_ctx), uri_(std::move(uri)) {}
 
 OssHdfsStore::OssHdfsRawObjHandle::~OssHdfsRawObjHandle() {
   if (io_ctx_) {
-    close();
+    close({});
   }
 }
 
-ssize_t OssHdfsStore::OssHdfsRawObjHandle::read(void *buffer, size_t length) {
+ssize_t OssHdfsStore::OssHdfsRawObjHandle::read(std::string_view path,
+                                                void *buffer, size_t length) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL2(store_, io_ctx_, "read", path_);
+  START_CALL2(store_, io_ctx_, "read", path);
   int64_t ret = JindoSDK::read(ctx, (char *)buffer, length, nullptr);
   END_CALL_NO_LOGS();
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to read HDFS stream: `, ec: `, msg: `", path_, error_code,
+    LOG_ERROR("Failed to read HDFS stream: `, ec: `, msg: `", path, error_code,
               error_msg);
     return jdo_error_code_to_posix(error_code);
   }
@@ -952,16 +963,17 @@ ssize_t OssHdfsStore::OssHdfsRawObjHandle::read(void *buffer, size_t length) {
   return ret;
 }
 
-ssize_t OssHdfsStore::OssHdfsRawObjHandle::pread(void *buffer, size_t length,
+ssize_t OssHdfsStore::OssHdfsRawObjHandle::pread(std::string_view path,
+                                                 void *buffer, size_t length,
                                                  off_t offset) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL2(store_, io_ctx_, "pread", path_);
+  START_CALL2(store_, io_ctx_, "pread", path);
   int64_t ret = JindoSDK::pread(ctx, (char *)buffer, length, offset, nullptr);
   END_CALL_NO_LOGS();
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to pread HDFS stream: `, offset: `, ec: `, msg: `", path_,
+    LOG_ERROR("Failed to pread HDFS stream: `, offset: `, ec: `, msg: `", path,
               offset, error_code, error_msg);
     return jdo_error_code_to_posix(error_code);
   }
@@ -970,49 +982,50 @@ ssize_t OssHdfsStore::OssHdfsRawObjHandle::pread(void *buffer, size_t length,
   return ret;
 }
 
-ssize_t OssHdfsStore::OssHdfsRawObjHandle::write(const void *buffer,
+ssize_t OssHdfsStore::OssHdfsRawObjHandle::write(std::string_view path,
+                                                 const void *buffer,
                                                  size_t length) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL2(store_, io_ctx_, "write", path_);
+  START_CALL2(store_, io_ctx_, "write", path);
   int64_t ret = JindoSDK::write(ctx, (const char *)buffer, length, nullptr);
   END_CALL_NO_LOGS();
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to write HDFS stream: `, ec: `, msg: `", path_,
-              error_code, error_msg);
+    LOG_ERROR("Failed to write HDFS stream: `, ec: `, msg: `", path, error_code,
+              error_msg);
     return jdo_error_code_to_posix(error_code);
   }
   return ret;
 }
 
-int OssHdfsStore::OssHdfsRawObjHandle::flush() {
+int OssHdfsStore::OssHdfsRawObjHandle::flush(std::string_view path) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL2(store_, io_ctx_, "flush", path_);
+  START_CALL2(store_, io_ctx_, "flush", path);
   JindoSDK::flush(ctx, nullptr);
   END_CALL();
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to flush HDFS stream: `, ec: `, msg: `", path_,
-              error_code, error_msg);
+    LOG_ERROR("Failed to flush HDFS stream: `, ec: `, msg: `", path, error_code,
+              error_msg);
     return jdo_error_code_to_posix(error_code);
   }
   return 0;
 }
 
-int OssHdfsStore::OssHdfsRawObjHandle::close() {
+int OssHdfsStore::OssHdfsRawObjHandle::close(std::string_view path) {
   if (closed_ || !io_ctx_) return 0;
 
-  START_CALL2(store_, io_ctx_, "close", path_);
+  START_CALL2(store_, io_ctx_, "close", path);
   JindoSDK::close(ctx, nullptr);
   END_CALL();
 
   closed_ = true;
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to close HDFS stream: `, ec: `, msg: `", path_,
-              error_code, error_msg);
+    LOG_ERROR("Failed to close HDFS stream: `, ec: `, msg: `", path, error_code,
+              error_msg);
     int r = jdo_error_code_to_posix(error_code);
     JindoSDK::freeIOContext(io_ctx_);
     io_ctx_ = nullptr;
@@ -1024,66 +1037,69 @@ int OssHdfsStore::OssHdfsRawObjHandle::close() {
   return 0;
 }
 
-ssize_t OssHdfsStore::OssHdfsRawObjHandle::get_length() {
+ssize_t OssHdfsStore::OssHdfsRawObjHandle::get_length(std::string_view path) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL2(store_, io_ctx_, "getFileLength", path_);
+  START_CALL2(store_, io_ctx_, "getFileLength", path);
   int64_t ret = JindoSDK::getFileLength(ctx, nullptr);
   END_CALL();
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to get HDFS file length: `, ec: `, msg: `", path_,
+    LOG_ERROR("Failed to get HDFS file length: `, ec: `, msg: `", path,
               error_code, error_msg);
     return jdo_error_code_to_posix(error_code);
   }
   return ret;
 }
 
-ssize_t OssHdfsStore::OssHdfsRawObjHandle::tell() {
+ssize_t OssHdfsStore::OssHdfsRawObjHandle::tell(std::string_view path) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL2(store_, io_ctx_, "tell", path_);
+  START_CALL2(store_, io_ctx_, "tell", path);
   int64_t ret = JindoSDK::tell(ctx, nullptr);
   END_CALL();
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to tell HDFS stream position: `, ec: `, msg: `", path_,
+    LOG_ERROR("Failed to tell HDFS stream position: `, ec: `, msg: `", path,
               error_code, error_msg);
     return jdo_error_code_to_posix(error_code);
   }
   return ret;
 }
 
-ssize_t OssHdfsStore::OssHdfsRawObjHandle::seek(off_t offset) {
+ssize_t OssHdfsStore::OssHdfsRawObjHandle::seek(std::string_view path,
+                                                off_t offset) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL2(store_, io_ctx_, "seek", path_);
+  START_CALL2(store_, io_ctx_, "seek", path);
   JindoSDK::seek(ctx, offset, nullptr);
   END_CALL();
 
   if (error_code != 0) {
-    LOG_ERROR("Failed to seek HDFS stream: `, offset: `, ec: `, msg: `", path_,
+    LOG_ERROR("Failed to seek HDFS stream: `, offset: `, ec: `, msg: `", path,
               offset, error_code, error_msg);
     return jdo_error_code_to_posix(error_code);
   }
   return 0;
 }
 
-int OssHdfsStore::OssHdfsRawObjHandle::fallocate(off_t offset, off_t length) {
+int OssHdfsStore::OssHdfsRawObjHandle::fallocate(std::string_view path,
+                                                 off_t offset, off_t length) {
   if (!io_ctx_) return -EINVAL;
 
-  START_CALL(store_, "fallocate", path_);
-  JindoSDK::fallocate(ctx, path_.c_str(), static_cast<int64_t>(offset),
+  START_CALL(store_, "fallocate", path);
+  estring hdfs_path = GET_HDFS_PATH(path);
+
+  JindoSDK::fallocate(ctx, hdfs_path.c_str(), static_cast<int64_t>(offset),
                       static_cast<int64_t>(length), 0, nullptr);
   END_CALL();
 
   if (error_code != 0) {
     LOG_ERROR(
         "Failed to fallocate HDFS file: `, offset: `, length: `, ec: `, msg: `",
-        path_, offset, length, error_code, error_msg);
+        path, offset, length, error_code, error_msg);
     return jdo_error_code_to_posix(error_code);
   }
-
   return 0;
 }
 
@@ -1152,7 +1168,7 @@ int OssHdfsStore::open_object(std::string_view path, int flags, mode_t mode,
     return jdo_error_code_to_posix(error_code);
   }
 
-  *out_handle = new OssHdfsRawObjHandle(jdo_store_, io_ctx, hdfs_path);
+  *out_handle = new OssHdfsRawObjHandle(jdo_store_, io_ctx, uri_);
   return 0;
 }
 
@@ -1354,6 +1370,8 @@ int OssHdfsStore::set_xattr(std::string_view path, const char *name,
     return -ERANGE;
   }
 
+  if (value == nullptr && size != 0) return -EINVAL;
+
   estring hdfs_path = GET_HDFS_PATH(path);
 
   JdoXAttrList_t existing = nullptr;
@@ -1380,7 +1398,7 @@ int OssHdfsStore::set_xattr(std::string_view path, const char *name,
   JdoXAttr_t xattr = JindoSDK::createXAttr();
   JindoSDK::setXAttrNamespace(xattr, JDO_XATTR_NAMESPACE_USER);
   JindoSDK::setXAttrName(xattr, name);
-  std::string val_copy(value, size);
+  std::string val_copy = value ? std::string(value, size) : std::string();
   JindoSDK::setXAttrValue(xattr, val_copy.c_str());
 
   START_CALL(jdo_store_, "setXAttr", path);

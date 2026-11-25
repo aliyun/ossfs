@@ -194,6 +194,60 @@ class Ossfs2BasicTest : public Ossfs2TestSuite {
     ASSERT_EQ(ret, st.st_size);
   }
 
+  void verify_qps_limit_retry_timeout() {
+    std::string filepath = "testfile_qps_retry";
+    {
+      uint64_t parent = get_test_dir_parent();
+      DEFER(fs_->forget(parent, 1));
+      auto parent_path = nodeid_to_path(parent);
+      std::string local_file = join_paths(test_path_, "local_file_qps");
+      create_random_file(local_file, 3);
+      int r = upload_file(local_file, join_paths(parent_path, filepath),
+                          FLAGS_oss_bucket_prefix);
+      ASSERT_EQ(r, 0);
+    }
+
+    // A 3s budget exhausts after sleeps of 1s + 2s. Pin the request timeout
+    // small so real I/O latency cannot blur the budget measurement.
+    const uint64_t budget_ms = 3000;
+    auto orig_budget = FLAGS_oss_qps_limit_retry_timeout_ms;
+    auto orig_timeout = FLAGS_oss_request_timeout_ms;
+    DEFER(FLAGS_oss_qps_limit_retry_timeout_ms = orig_budget);
+    DEFER(FLAGS_oss_request_timeout_ms = orig_timeout);
+    FLAGS_oss_qps_limit_retry_timeout_ms = budget_ms;
+    FLAGS_oss_request_timeout_ms = 2000;
+    remount();
+    ASSERT_EQ(oss_options_.qps_limit_total_retry_time_us, budget_ms * 1000);
+
+    struct stat st;
+    uint64_t parent = get_test_dir_parent();
+    DEFER(fs_->forget(parent, 1));
+    uint64_t nodeid = 0;
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_5xx);
+    g_fault_injector->set_injection(FaultInjectionId::FI_OssError_Qps_Limited);
+    // Bypass the real HTTP call so wall time is pure backoff, independent of
+    // network latency. Failed_Without_Call skips op.call; 5xx lifts the status
+    // into the QPS branch. The initial transport retries add a fixed ~300ms.
+    g_fault_injector->set_injection(
+        FaultInjectionId::FI_OssError_Failed_Without_Call);
+    auto before = std::chrono::steady_clock::now();
+    int r = fs_->lookup(parent, filepath.c_str(), &nodeid, &st);
+    ASSERT_NE(r, 0);
+    auto cost = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - before);
+    LOG_DEBUG("cost ` us for qps limit with budget ` ms", cost.count(),
+              budget_ms);
+    g_fault_injector->clear_all_injections();
+    // ~3s QPS backoff (1s + 2s) + ~300ms transport retries, no real I/O.
+    // Without the option the fallback would be the request timeout.
+    ASSERT_GE(cost.count(), (int64_t)budget_ms * 1000);
+    ASSERT_LT(cost.count(), (int64_t)budget_ms * 1000 + 2000000);
+
+    r = fs_->lookup(parent, filepath.c_str(), &nodeid, &st);
+    ASSERT_EQ(r, 0);
+    fs_->forget(nodeid, 1);
+  }
+
   void verify_init_prefetch_options() {
     // Test case 1: Default values (prefetch_chunks = 0)
     {
@@ -376,10 +430,24 @@ TEST_F(Ossfs2BasicTest, verify_oss_prefix_types) {
 TEST_F(Ossfs2BasicTest, verify_oss_retrying) {
   SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
+  // Pin the fallback budget so this case is independent of any externally
+  // configured oss_qps_limit_retry_timeout_ms.
+  auto orig_qps_budget = FLAGS_oss_qps_limit_retry_timeout_ms;
+  DEFER(FLAGS_oss_qps_limit_retry_timeout_ms = orig_qps_budget);
+  FLAGS_oss_qps_limit_retry_timeout_ms = 0;
   OssFsOptions opts;
   opts.prefetch_concurrency = 0;
   init(opts);
   verify_oss_retrying();
+}
+
+TEST_F(Ossfs2BasicTest, verify_qps_limit_retry_timeout) {
+  SET_TEST_MODE(kTestOss);
+  INIT_PHOTON();
+  OssFsOptions opts;
+  opts.prefetch_concurrency = 0;
+  init(opts);
+  verify_qps_limit_retry_timeout();
 }
 
 TEST_F(Ossfs2BasicTest, verify_bind_ips) {
